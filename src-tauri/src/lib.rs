@@ -11,15 +11,20 @@ use tauri_plugin_opener::OpenerExt;
 const FFMPEG_MISSING: &str = "FFmpeg was not found. Install FFmpeg and restart the app.";
 #[cfg(not(debug_assertions))]
 const FFMPEG_MISSING: &str =
-    "FFmpeg was not found in the application folder. Reinstall Aurevm Video Cleaner.";
+    "FFmpeg was not found in the application folder. Reinstall the application.";
+
+// Functional defaults. Deliberately brand-neutral: nothing here encodes who ships
+// the app, so a fork can keep every value as-is. Product identity lives in
+// `tauri.conf.json` (product name, identifier, publisher) and nowhere else.
+
+/// Starting file-name prefix. The user can change it and the choice is persisted.
+const DEFAULT_PREFIX: &str = "VIDEO";
+/// Marks an output that FFmpeg is still writing. Renamed into place on success.
+const TEMP_PREFIX: &str = ".video-cleaner-processing-";
 
 const SUPPORTED_EXTENSIONS: [&str; 2] = ["mp4", "mov"];
-const APP_DIR_NAME: &str = "Aurevm Video Cleaner";
-const DEFAULT_PREFIX: &str = "AUREVM";
 const MAX_PREFIX_LEN: usize = 64;
 const MAX_BATCH: usize = 100;
-/// Marks an output that FFmpeg is still writing. Renamed into place on success.
-const TEMP_PREFIX: &str = ".aurevm_processing_";
 
 // ---------------------------------------------------------------- FFmpeg ---
 
@@ -459,12 +464,13 @@ fn run_batch(
 
 // --------------------------------------------------------------- Commands ---
 
+/// The single place that decides where `settings.json` and `used-ids.txt` live.
+/// Resolved by Tauri from the bundle identifier in `tauri.conf.json`, so renaming
+/// or forking the product moves the folder without touching this code.
 fn app_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .data_dir()
-        .map_err(|e| format!("Could not locate the app data folder: {e}"))?;
-    Ok(base.join(APP_DIR_NAME))
+    app.path()
+        .app_config_dir()
+        .map_err(|e| format!("Could not locate the application data folder: {e}"))
 }
 
 /// `null` when FFmpeg is usable, otherwise the message to show. Returning the
@@ -558,7 +564,7 @@ mod tests {
 
     /// A throwaway directory under the OS temp dir.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aurevm-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("video-cleaner-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -587,7 +593,9 @@ mod tests {
 
     #[test]
     fn prefix_is_sanitized() {
-        assert_eq!(sanitize_prefix("  AUREVM  ").unwrap(), "AUREVM");
+        assert_eq!(sanitize_prefix("  CLIP  ").unwrap(), "CLIP");
+        // The shipped default must survive its own sanitiser.
+        assert_eq!(sanitize_prefix(DEFAULT_PREFIX).unwrap(), DEFAULT_PREFIX);
         assert_eq!(sanitize_prefix("my reels").unwrap(), "my reels");
         // Separators and dots are stripped, so a prefix can never walk the path.
         assert_eq!(sanitize_prefix("..\\..\\evil").unwrap(), "evil");
@@ -619,7 +627,7 @@ mod tests {
         let mut first = IdRegistry::open(&registry_path).unwrap();
         let mut issued = HashSet::new();
         for _ in 0..200 {
-            assert!(issued.insert(first.reserve(&out, "AUREVM", "mp4").unwrap()));
+            assert!(issued.insert(first.reserve(&out, "CLIP", "mp4").unwrap()));
         }
         drop(first);
 
@@ -627,7 +635,7 @@ mod tests {
         let mut reopened = IdRegistry::open(&registry_path).unwrap();
         assert_eq!(reopened.used.len(), 200);
         for _ in 0..200 {
-            let id = reopened.reserve(&out, "AUREVM", "mp4").unwrap();
+            let id = reopened.reserve(&out, "CLIP", "mp4").unwrap();
             assert!(!issued.contains(&id), "reused id {id} after restart");
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -641,20 +649,20 @@ mod tests {
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
 
         // Same name already on disk but unknown to the registry: still refused.
-        std::fs::write(out.join("AUREVM_0000000007.mp4"), b"x").unwrap();
-        assert!(!registry.is_free(&out, "AUREVM", "mp4", 7));
-        assert!(registry.is_free(&out, "AUREVM", "mp4", 8));
+        std::fs::write(out.join("CLIP_0000000007.mp4"), b"x").unwrap();
+        assert!(!registry.is_free(&out, "CLIP", "mp4", 7));
+        assert!(registry.is_free(&out, "CLIP", "mp4", 8));
 
         // A different extension is a different file name, so it stays free.
-        assert!(registry.is_free(&out, "AUREVM", "mov", 7));
+        assert!(registry.is_free(&out, "CLIP", "mov", 7));
         // ...and a different prefix likewise.
         assert!(registry.is_free(&out, "REELS", "mp4", 7));
 
         // Known to the registry but absent from disk: also refused.
-        let issued = registry.reserve(&out, "AUREVM", "mp4").unwrap();
-        std::fs::write(out.join(format!("AUREVM_{}.mp4", format_id(issued))), b"x").unwrap();
-        std::fs::remove_file(out.join(format!("AUREVM_{}.mp4", format_id(issued)))).unwrap();
-        assert!(!registry.is_free(&out, "AUREVM", "mp4", issued));
+        let issued = registry.reserve(&out, "CLIP", "mp4").unwrap();
+        std::fs::write(out.join(format!("CLIP_{}.mp4", format_id(issued))), b"x").unwrap();
+        std::fs::remove_file(out.join(format!("CLIP_{}.mp4", format_id(issued)))).unwrap();
+        assert!(!registry.is_free(&out, "CLIP", "mp4", issued));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -663,11 +671,11 @@ mod tests {
     fn batch_size_is_enforced_by_the_backend() {
         let dir = scratch("limit");
         let over: Vec<String> = (0..MAX_BATCH + 1).map(|i| format!("v{i}.mp4")).collect();
-        let err = run_batch(&over, "AUREVM", &dir, &dir, |_| {}).unwrap_err();
+        let err = run_batch(&over, "CLIP", &dir, &dir, |_| {}).unwrap_err();
         assert!(err.contains("101"), "unexpected message: {err}");
         assert!(err.contains(&MAX_BATCH.to_string()));
 
-        let err = run_batch(&[], "AUREVM", &dir, &dir, |_| {}).unwrap_err();
+        let err = run_batch(&[], "CLIP", &dir, &dir, |_| {}).unwrap_err();
         assert_eq!(err, "No videos selected");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -681,10 +689,17 @@ mod tests {
         let before = std::fs::read(&input).unwrap();
 
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-        let name = clean_one(&input, &out, "AUREVM", &mut registry).unwrap();
+        let name = clean_one(&input, &out, "CLIP", &mut registry).unwrap();
 
-        assert!(name.starts_with("AUREVM_") && name.ends_with(".mp4"));
-        let digits = &name["AUREVM_".len()..name.len() - 4];
+        assert!(name.starts_with("CLIP_") && name.ends_with(".mp4"));
+
+        // The shipped default produces the documented shape too.
+        let defaulted = clean_one(&input, &out, DEFAULT_PREFIX, &mut registry).unwrap();
+        assert!(defaulted.starts_with("VIDEO_") && defaulted.ends_with(".mp4"));
+        assert_eq!(defaulted.len(), "VIDEO_".len() + 10 + ".mp4".len());
+        assert!(out.join(&defaulted).is_file());
+
+        let digits = &name["CLIP_".len()..name.len() - 4];
         assert_eq!(digits.len(), 10);
         assert!(out.join(&name).is_file());
 
@@ -708,7 +723,7 @@ mod tests {
         std::fs::write(&broken, b"this is not a video").unwrap();
 
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-        assert!(clean_one(&broken, &out, "AUREVM", &mut registry).is_err());
+        assert!(clean_one(&broken, &out, "CLIP", &mut registry).is_err());
 
         assert_eq!(
             std::fs::read_dir(&out).unwrap().count(),
@@ -722,13 +737,13 @@ mod tests {
     fn stale_temp_files_are_cleared_but_real_outputs_are_kept() {
         let dir = scratch("stale");
         std::fs::write(dir.join(format!("{TEMP_PREFIX}0000000001.mp4")), b"partial").unwrap();
-        std::fs::write(dir.join("AUREVM_0000000002.mp4"), b"finished").unwrap();
+        std::fs::write(dir.join("CLIP_0000000002.mp4"), b"finished").unwrap();
         std::fs::write(dir.join("something-else.mp4"), b"user file").unwrap();
 
         remove_stale_temp_files(&dir);
 
         assert!(!dir.join(format!("{TEMP_PREFIX}0000000001.mp4")).exists());
-        assert!(dir.join("AUREVM_0000000002.mp4").exists());
+        assert!(dir.join("CLIP_0000000002.mp4").exists());
         assert!(dir.join("something-else.mp4").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -768,7 +783,7 @@ mod tests {
             .collect();
 
         let mut seen_processing = 0;
-        let summary = run_batch(&paths, "AUREVM", &out, &dir, |p| {
+        let summary = run_batch(&paths, "CLIP", &out, &dir, |p| {
             if p.status == "processing" {
                 seen_processing += 1;
             }
@@ -786,7 +801,7 @@ mod tests {
                 "completed" => {
                     let name = result.output_name.as_ref().unwrap();
                     let stem = name.rsplit_once('.').unwrap();
-                    let id = stem.0.strip_prefix("AUREVM_").expect("prefix missing");
+                    let id = stem.0.strip_prefix("CLIP_").expect("prefix missing");
                     assert_eq!(id.len(), 10, "{name}");
                     assert!(id.chars().all(|c| c.is_ascii_digit()), "{name}");
                     assert!(ids.insert(id.to_string()), "duplicate id in one batch: {name}");
@@ -811,7 +826,7 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(produced.len(), 6, "{produced:?}");
-        assert!(produced.iter().all(|n| n.starts_with("AUREVM_")), "{produced:?}");
+        assert!(produced.iter().all(|n| n.starts_with("CLIP_")), "{produced:?}");
 
         // Originals are untouched, byte for byte.
         for (path, original) in inputs.iter().zip(&before) {
@@ -858,6 +873,8 @@ mod tests {
         // Nothing stored yet.
         let fresh = load_settings(&dir);
         assert_eq!(fresh.prefix, DEFAULT_PREFIX);
+        // Product requirement: the out-of-the-box prefix is brand-neutral.
+        assert_eq!(DEFAULT_PREFIX, "VIDEO");
         assert!(fresh.output_directory.is_empty());
 
         let stored = Settings {

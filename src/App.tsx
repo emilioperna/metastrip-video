@@ -268,11 +268,16 @@ export default function App() {
         <div className="field">
           <span className="field-label">OUTPUT FOLDER</span>
           <div className="folder-row">
-            <span className={folderReady ? "folder-path" : "folder-path bad"}>
-              {settings?.outputDirectory
-                ? settings.outputDirectory
-                : "No folder chosen yet."}
-            </span>
+            {settings?.outputDirectory ? (
+              // Right-to-left keeps the tail of a long path visible; it is only
+              // safe on a real path, since it would also reorder trailing
+              // punctuation in ordinary prose.
+              <span className={folderReady ? "folder-path" : "folder-path bad"}>
+                {settings.outputDirectory}
+              </span>
+            ) : (
+              <span className="folder-empty">No folder chosen yet.</span>
+            )}
             <button className="btn secondary small" onClick={chooseOutputFolder} disabled={running}>
               Change
             </button>

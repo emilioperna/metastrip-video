@@ -1,4 +1,4 @@
-# Fetches the FFmpeg binary that Aurevm Video Cleaner bundles as a Tauri sidecar.
+# Fetches the FFmpeg binary that this app bundles as a Tauri sidecar.
 # The binary is not in git; run this once after cloning.
 #
 # Pinned to an immutable BtbN autobuild tag and checked by SHA-256, so every
@@ -26,7 +26,7 @@ if ((Test-Path $Target) -and (Sha256 $Target) -eq $FfmpegSha) {
 }
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-$work = Join-Path ([System.IO.Path]::GetTempPath()) ("aurevm-ffmpeg-" + [guid]::NewGuid())
+$work = Join-Path ([System.IO.Path]::GetTempPath()) ("ffmpeg-sidecar-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 try {

@@ -75,7 +75,7 @@ MP4/MOV files (or use **Select videos**), press **Clean N videos**, done. Files 
 processed one at a time; a failure on one file does not stop the rest.
 
 Every output is renamed to `<PREFIX>_<10 digits>.<original extension>`, for example
-`AUREVM_0917283645.mp4`. Leading zeros are kept, so the numeric part is always exactly
+`VIDEO_0917283645.mp4`. Leading zeros are kept, so the numeric part is always exactly
 ten characters. Originals are never modified or deleted.
 
 Per file, the app runs:
@@ -96,9 +96,9 @@ shell, no string concatenation.
 
 ### Atomic output
 
-FFmpeg writes to `.aurevm_processing_<id>.<ext>` inside the output folder, and the file
+FFmpeg writes to `.video-cleaner-processing-<id>.<ext>` inside the output folder, and the file
 is renamed to its final name only after FFmpeg exits successfully. A kill, a crash or a
-power cut can therefore leave a `.aurevm_processing_*` file behind, but never a
+power cut can therefore leave a `.video-cleaner-processing-*` file behind, but never a
 truncated video under a name that looks finished. Those leftovers are swept at the
 start of the next batch; nothing else in the folder is touched.
 
@@ -119,9 +119,13 @@ conversion burns its ID, which is irrelevant at ten billion combinations.
 ### Stored state
 
 ```
-%APPDATA%\Aurevm Video Cleaner\settings.json    prefix + output folder
-%APPDATA%\Aurevm Video Cleaner\used-ids.txt     one ID per line, append-only
+%APPDATA%\<bundle identifier>\settings.json    prefix + output folder
+%APPDATA%\<bundle identifier>\used-ids.txt     one ID per line, append-only
 ```
+
+The folder comes from `app_config_dir()`, which Tauri derives from `identifier` in
+`tauri.conf.json` — currently `com.aurevm.videocleaner`. Nothing in the Rust code
+hardcodes a product name, so renaming or forking the app moves this folder on its own.
 
 Plain files, no database. A missing or corrupt `settings.json` falls back to defaults
 instead of refusing to start. If the saved output folder has been deleted, the app says
