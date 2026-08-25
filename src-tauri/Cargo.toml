@@ -1,12 +1,12 @@
 [package]
-name = "aurevm-video-cleaner"
-version = "0.2.0"
-description = "Aurevm Video Cleaner"
-authors = ["Aurevm"]
+name = "metastrip-video"
+version = "0.2.1"
+description = "MetaStrip Video - Video Metadata Remover"
+authors = ["MetaStrip"]
 edition = "2021"
 
 [lib]
-name = "aurevm_video_cleaner_lib"
+name = "metastrip_video_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

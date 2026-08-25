@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    aurevm_video_cleaner_lib::run()
+    metastrip_video_lib::run()
 }

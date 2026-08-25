@@ -473,6 +473,37 @@ fn app_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("Could not locate the application data folder: {e}"))
 }
 
+/// Legacy config location used only to migrate installations <= v0.2.0.
+const LEGACY_CONFIG_DIR: &str = "com.aurevm.videocleaner";
+
+fn legacy_app_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .config_dir()
+        .ok()
+        .map(|base| base.join(LEGACY_CONFIG_DIR))
+}
+
+/// One-time, best-effort copy of the pre-rebrand settings into the new config
+/// folder. Per file rather than per folder, so a half-populated new folder still
+/// picks up what it is missing, and anything already present always wins.
+fn migrate_legacy_config(new_dir: &Path, legacy_dir: &Path) -> Result<(), String> {
+    if !legacy_dir.is_dir() {
+        return Ok(());
+    }
+    for name in ["settings.json", "used-ids.txt"] {
+        let from = legacy_dir.join(name);
+        let to = new_dir.join(name);
+        if !from.is_file() || to.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(new_dir)
+            .map_err(|e| format!("Could not create the config folder: {e}"))?;
+        std::fs::copy(&from, &to).map_err(|e| format!("Could not migrate {name}: {e}"))?;
+    }
+    // The old folder is left in place on purpose: copying is reversible, moving is not.
+    Ok(())
+}
+
 /// `null` when FFmpeg is usable, otherwise the message to show. Returning the
 /// text from here keeps the wording in one place, since it differs between a
 /// development build (PATH) and a packaged one (bundled sidecar).
@@ -545,6 +576,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            // Never fatal: if this fails the app simply starts on its defaults.
+            if let (Ok(new_dir), Some(legacy_dir)) =
+                (app_dir(app.handle()), legacy_app_dir(app.handle()))
+            {
+                if let Err(e) = migrate_legacy_config(&new_dir, &legacy_dir) {
+                    eprintln!("settings migration skipped: {e}");
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             check_ffmpeg,
             get_settings,
@@ -865,6 +907,63 @@ mod tests {
         assert!(!meta.contains("secret"), "metadata survived: {meta}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_settings_migrate_once_without_clobbering_newer_ones() {
+        let root = scratch("migration");
+        let legacy = root.join("com.aurevm.videocleaner");
+        let current = root.join("com.metastrip.video");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let stored = Settings {
+            prefix: "REEL".into(),
+            output_directory: root.to_string_lossy().into_owned(),
+        };
+        write_settings(&legacy, &stored).unwrap();
+        std::fs::write(legacy.join("used-ids.txt"), "2267423415
+0000000007
+").unwrap();
+
+        // Nothing on the new side yet: everything comes across.
+        migrate_legacy_config(&current, &legacy).unwrap();
+        let migrated = load_settings(&current);
+        assert_eq!(migrated.prefix, "REEL");
+        assert_eq!(migrated.output_directory, stored.output_directory);
+
+        let registry = IdRegistry::open(&current.join("used-ids.txt")).unwrap();
+        assert!(registry.used.contains(&2_267_423_415), "migrated id missing");
+        assert!(registry.used.contains(&7), "migrated id missing");
+        assert!(!registry.is_free(&current, "REEL", "mp4", 2_267_423_415));
+        drop(registry);
+
+        // The originals stay put; migration copies, it does not move.
+        assert!(legacy.join("settings.json").is_file());
+        assert!(legacy.join("used-ids.txt").is_file());
+
+        // Repeating it is a no-op and must not overwrite what is now current.
+        let newer = Settings {
+            prefix: "CLIP".into(),
+            output_directory: root.to_string_lossy().into_owned(),
+        };
+        write_settings(&current, &newer).unwrap();
+        std::fs::write(current.join("used-ids.txt"), "0000000042
+").unwrap();
+
+        migrate_legacy_config(&current, &legacy).unwrap();
+        migrate_legacy_config(&current, &legacy).unwrap();
+        assert_eq!(load_settings(&current).prefix, "CLIP");
+        assert_eq!(
+            std::fs::read_to_string(current.join("used-ids.txt")).unwrap().trim(),
+            "0000000042"
+        );
+
+        // No legacy folder at all is fine.
+        let untouched = root.join("com.example.fresh");
+        migrate_legacy_config(&untouched, &root.join("does-not-exist")).unwrap();
+        assert!(!untouched.exists(), "migration created a folder with nothing to migrate");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -54,6 +54,14 @@ body {
   font-size: 14px;
 }
 
+.header .subtitle {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
 /* Dropzone */
 
 .dropzone {

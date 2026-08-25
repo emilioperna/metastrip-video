@@ -233,8 +233,9 @@ export default function App() {
   return (
     <main className="app">
       <header className="header">
-        <h1>Aurevm Video Cleaner</h1>
-        <p>Clean metadata from your videos locally.</p>
+        <h1>MetaStrip Video</h1>
+        <p className="subtitle">Video Metadata Remover</p>
+        <p>Clean metadata from your videos locally without re-encoding.</p>
       </header>
 
       <section className="config">

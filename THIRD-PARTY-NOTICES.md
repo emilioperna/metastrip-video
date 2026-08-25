@@ -1,6 +1,6 @@
 # Third-party notices
 
-Aurevm Video Cleaner redistributes and reuses the components listed below.
+MetaStrip Video redistributes and reuses the components listed below.
 
 ---
 
@@ -8,7 +8,7 @@ Aurevm Video Cleaner redistributes and reuses the components listed below.
 
 `ffmpeg.exe` is shipped inside the application folder and is executed as a separate
 process, invoked with command-line arguments. It is not linked into
-`aurevm-video-cleaner.exe` in any form — no headers, no libraries, no shared address
+`metastrip-video.exe` in any form — no headers, no libraries, no shared address
 space.
 
 - **Project:** FFmpeg — https://ffmpeg.org
@@ -34,7 +34,7 @@ x265, xvid and friends) makes the resulting binary GPL. This build has `--enable
 off, so no GPL-only component is present.
 
 The choice is about keeping compliance simple, not about avoiding a licence that would
-otherwise be forced onto Aurevm Video Cleaner. FFmpeg runs here as a separate program
+otherwise be forced onto MetaStrip Video. FFmpeg runs here as a separate program
 communicating over `exec` and command-line arguments, which the GNU licence FAQ
 normally treats as separate programs rather than one combined work
 (https://www.gnu.org/licenses/gpl-faq.html#MereAggregation). Shipping a GPL build
@@ -44,7 +44,7 @@ with `-c copy`, so no encoder is needed.
 
 The shipped `ffmpeg.exe` is a static build — that describes how the FFmpeg project's
 own `libav*` libraries are linked into its own command-line tool, both sides being
-FFmpeg's LGPL code. It does not mean FFmpeg is statically linked into Aurevm. The
+FFmpeg's LGPL code. It does not mean FFmpeg is statically linked into MetaStrip Video. The
 practical obligation for redistribution is what is already satisfied above: state the
 version, keep the binary unmodified, ship the licence text, and point at the
 corresponding sources.
@@ -86,7 +86,7 @@ SOFTWARE.
 ```
 
 No source code from that project was copied; it is a Python/Tkinter application
-and this one is Rust/React. Aurevm Video Cleaner additionally passes
+and this one is Rust/React. MetaStrip Video additionally passes
 `-map_metadata:s -1` (stream-level metadata) and `-movflags +faststart`.
 
 ---

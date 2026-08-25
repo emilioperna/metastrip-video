@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Aurevm Video Cleaner",
-  "version": "0.2.0",
-  "identifier": "com.aurevm.videocleaner",
+  "productName": "MetaStrip Video",
+  "version": "0.2.1",
+  "identifier": "com.metastrip.video",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Aurevm Video Cleaner",
+        "title": "MetaStrip Video — Video Metadata Remover",
         "width": 900,
         "height": 720,
         "minWidth": 720,
@@ -43,7 +43,7 @@
     "resources": [
       "FFMPEG-LICENSE.txt"
     ],
-    "publisher": "Aurevm",
-    "shortDescription": "Clean metadata from your videos locally."
+    "publisher": "MetaStrip",
+    "shortDescription": "Fast, offline batch video metadata remover for MP4 and MOV."
   }
 }

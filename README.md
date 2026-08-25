@@ -1,10 +1,18 @@
-# Aurevm Video Cleaner
+# MetaStrip Video — Video Metadata Remover
 
-Desktop app (Tauri 2 + React + TypeScript + Rust) that strips metadata from MP4 and MOV
-files with FFmpeg, without re-encoding.
+Fast, offline batch video metadata remover for Windows.
+Strip metadata from MP4 and MOV files without re-encoding.
 
-FFmpeg is **bundled with the app** — an installed copy does not need FFmpeg on the
-system PATH.
+- Batch process up to 100 videos
+- No re-encoding
+- Original audio/video quality preserved
+- Local and offline
+- Persistent output folder
+- Automatic unique filenames
+- FFmpeg bundled
+
+Desktop app built with Tauri 2, React, TypeScript and Rust. An installed copy does not
+need FFmpeg on the system PATH.
 
 ## Build requirements
 
@@ -33,10 +41,10 @@ npm run tauri build
 Output:
 
 ```
-src-tauri/target/release/bundle/nsis/Aurevm Video Cleaner_0.2.0_x64-setup.exe
+src-tauri/target/release/bundle/nsis/MetaStrip Video_0.2.1_x64-setup.exe
 ```
 
-The unpacked app (`aurevm-video-cleaner.exe` plus `ffmpeg.exe`) is in
+The unpacked app (`metastrip-video.exe` plus `ffmpeg.exe`) is in
 `src-tauri/target/release/`. That setup exe is the only thing an end user needs;
 they never have to know FFmpeg is involved.
 
@@ -124,8 +132,15 @@ conversion burns its ID, which is irrelevant at ten billion combinations.
 ```
 
 The folder comes from `app_config_dir()`, which Tauri derives from `identifier` in
-`tauri.conf.json` — currently `com.aurevm.videocleaner`. Nothing in the Rust code
+`tauri.conf.json` — currently `com.metastrip.video`. Nothing in the Rust code
 hardcodes a product name, so renaming or forking the app moves this folder on its own.
+
+Installations from v0.2.0 and earlier stored the same two files under the previous
+identifier, `com.aurevm.videocleaner`. On startup the app copies them across once if
+the current folder does not already have them; the old folder is left untouched, and a
+failed copy is ignored rather than blocking startup. `LEGACY_CONFIG_DIR` in
+`src-tauri/src/lib.rs` exists only for that, and can be deleted once no pre-rebrand
+install is left.
 
 Plain files, no database. A missing or corrupt `settings.json` falls back to defaults
 instead of refusing to start. If the saved output folder has been deleted, the app says
