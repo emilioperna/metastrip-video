@@ -44,6 +44,18 @@
       "FFMPEG-LICENSE.txt"
     ],
     "publisher": "MetaStrip",
-    "shortDescription": "Fast, offline batch video metadata remover for MP4 and MOV."
+    "shortDescription": "Fast, offline batch video metadata remover for MP4 and MOV.",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM4MkMyMDdCMDU5Q0JCRUEKUldUcXU1d0ZleUFzeUh4MEIzdkNRRkxYZ1NXWDE0ZDUvRlVlaHp3aFkvRi9mL2ZpV0ErUzU5L04K",
+      "endpoints": [
+        "https://github.com/emilioperna/metastrip-video/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

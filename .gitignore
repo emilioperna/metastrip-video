@@ -26,3 +26,8 @@ dist-ssr
 # Bundled FFmpeg sidecar - fetched by `npm run setup:ffmpeg`, never committed
 src-tauri/binaries/*.exe
 src-tauri/binaries/*.dll
+
+# Updater signing keys - the private key lives outside this repo entirely.
+# This is belt and braces in case one is ever generated in the working tree.
+*.key
+*.key.pub

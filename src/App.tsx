@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { useUpdater } from "./useUpdater";
+import { statusText } from "./updater";
 
 const MAX_FILES = 100;
 
@@ -224,6 +226,8 @@ export default function App() {
   }
 
   const running = phase === "running";
+  const updateStatus = useUpdater(running);
+  const updateText = statusText(updateStatus, running);
   const total = files.length;
   const percent = total > 0 ? (done / total) * 100 : 0;
   const prefixValid = prefixDraft.trim().length > 0;
@@ -351,6 +355,8 @@ export default function App() {
           </ul>
         </section>
       )}
+
+      {updateText && <p className="update-status">{updateText}</p>}
 
       {notice && <p className="notice">{notice}</p>}
       {error && <p className="error-box">{error}</p>}

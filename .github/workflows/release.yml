@@ -1,0 +1,79 @@
+name: release
+
+# Cutting a release is pushing a tag. Everything below is what turns that tag
+# into a signed installer plus the latest.json the app polls.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Windows x86_64 only: the app is Windows-only and the bundled FFmpeg sidecar is
+# a Windows binary. Adding another target means adding a sidecar for it first.
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - run: npm ci
+
+      # The tag is the single source of truth for the release; refuse to build
+      # if the three version files disagree with it, rather than shipping an
+      # installer whose version the updater will compare wrongly.
+      - name: Check version matches the tag
+        run: node scripts/check-version.mjs ${{ github.ref_name }}
+
+      # ffmpeg.exe is not in git. This fetches the pinned build and verifies its
+      # SHA-256 before Tauri looks for the sidecar.
+      - name: Fetch the bundled FFmpeg
+        run: npm run setup:ffmpeg
+
+      - name: Verify the sidecar is in place
+        shell: pwsh
+        run: |
+          $sidecar = "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
+          if (-not (Test-Path $sidecar)) { throw "missing sidecar: $sidecar" }
+          "$sidecar $((Get-Item $sidecar).Length) bytes"
+
+      - run: npm run build
+
+      - run: npm test
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+      # Builds, signs the updater artifacts, creates the release and uploads the
+      # installer, the .sig and latest.json. Left as a draft so a human presses
+      # publish.
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: MetaStrip Video v__VERSION__
+          releaseBody: Signed Windows installer. Existing installs update themselves.
+          releaseDraft: true
+          prerelease: false
+          # latest.json is generated and uploaded by the action itself; the app
+          # reads it from the release's /latest/download/ URL.
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          updaterJsonPreferNsis: true
+          args: --target x86_64-pc-windows-msvc

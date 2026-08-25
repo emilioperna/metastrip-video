@@ -152,6 +152,49 @@ Plain files, no database. A missing or corrupt `settings.json` falls back to def
 instead of refusing to start. If the saved output folder has been deleted, the app says
 so and disables cleaning until a new one is chosen.
 
+## Updates
+
+MetaStrip checks GitHub Releases for a newer version when it starts, and once an
+hour after that. A newer version is downloaded in the background and installed on
+its own; no account, no sign-in, nothing to click.
+
+Every update is signed. The app carries the matching public key and refuses
+anything whose signature does not verify, so a tampered or unsigned installer is
+never run.
+
+An update never interrupts work: if a batch is being processed the download still
+happens, but the installer waits until the last video is done. If GitHub cannot be
+reached the check is skipped silently and the app carries on offline, which is how
+it runs the rest of the time anyway.
+
+Your settings survive an update. The prefix, the output folder and the used-ID
+registry live in `%APPDATA%\com.metastrip.video\` and are never touched by an
+install.
+
+## Publishing a release
+
+1. Bump the version in `package.json`, `src-tauri/Cargo.toml` and
+   `src-tauri/tauri.conf.json` (all three must agree; `node scripts/check-version.mjs`
+   checks this and CI refuses to build otherwise).
+2. Commit.
+3. Tag it: `git tag v0.3.1`.
+4. Push the tag: `git push origin v0.3.1`.
+5. `.github/workflows/release.yml` builds, signs, and opens a draft release with the
+   installer, its `.sig` and `latest.json`. Publish the draft when it looks right —
+   installed copies pick it up from there.
+
+The workflow needs two repository secrets, under
+**Settings -> Secrets and variables -> Actions**:
+
+| Secret | Value |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY` | the contents of the updater private key file |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | empty, unless the key was generated with a password |
+
+The private key is not in this repository and must never be. It lives outside the
+working tree; keep an offline copy, because losing it means existing installs can no
+longer be updated — they would have to be reinstalled by hand.
+
 ## Licenses and attribution
 
 This app redistributes **FFmpeg** (LGPL v3+, unmodified upstream binary, run as a
