@@ -18,7 +18,28 @@ $BinDir  = Join-Path $Root "src-tauri\binaries"
 $Target  = Join-Path $BinDir "ffmpeg-x86_64-pc-windows-msvc.exe"
 $License = Join-Path $Root "src-tauri\FFMPEG-LICENSE.txt"
 
-function Sha256($path) { (Get-FileHash -Algorithm SHA256 -Path $path).Hash }
+# Hashing and unzipping go straight to .NET rather than through Get-FileHash and
+# Expand-Archive. Those live in modules that have to be autoloaded, and on the
+# GitHub runner npm launches this under powershell.exe from a pwsh 7 parent, which
+# leaves PSModulePath pointing at PowerShell 7's module directories; Windows
+# PowerShell then cannot find its own modules and Get-FileHash is simply missing.
+# The .NET types are part of the framework and need no module at all.
+function Sha256($path) {
+  $stream = [System.IO.File]::OpenRead($path)
+  try {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return [System.BitConverter]::ToString($sha.ComputeHash($stream)).Replace("-", "")
+    }
+    finally { $sha.Dispose() }
+  }
+  finally { $stream.Dispose() }
+}
+
+function Expand-Zip($zipPath, $destination) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $destination)
+}
 
 if ((Test-Path $Target) -and (Sha256 $Target) -eq $FfmpegSha) {
   Write-Host "ffmpeg $Version already present and verified."
@@ -42,7 +63,7 @@ try {
   }
   Write-Host "Archive checksum OK."
 
-  Expand-Archive -Path $zip -DestinationPath $work -Force
+  Expand-Zip $zip $work
   $src = Get-ChildItem -Path $work -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
   if (-not $src) { throw "ffmpeg.exe not found inside $Asset" }
 
