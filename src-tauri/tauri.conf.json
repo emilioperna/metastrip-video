@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Aurevm Video Cleaner",
+  "version": "0.1.0",
+  "identifier": "com.aurevm.videocleaner",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Aurevm Video Cleaner",
+        "width": 900,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 560,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/ffmpeg"
+    ],
+    "resources": [
+      "FFMPEG-LICENSE.txt"
+    ],
+    "publisher": "Aurevm",
+    "shortDescription": "Clean metadata from your videos locally."
+  }
+}
