@@ -92,10 +92,16 @@ Per file, the app runs:
 ffmpeg -n -i INPUT \
   -map 0 -c copy \
   -map_metadata -1 -map_metadata:s -1 -map_chapters -1 \
+  -dn \
   -fflags +bitexact \
   -movflags +faststart \
   OUTPUT
 ```
+
+`-dn` drops data tracks. `-map 0` would otherwise copy them, and a data track is
+metadata in its own right: GoPro `gpmd` telemetry, iPhone `mebx`, the text track a
+chapter list rides on. Stripping the tags around such a track leaves the track
+itself, payload included, so the cleaned file still carries whatever it recorded.
 
 `-c copy` means the audio and video bitstreams are byte-identical to the source.
 If the container rejects `+faststart`, the file is retried once without it rather

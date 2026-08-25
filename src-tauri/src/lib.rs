@@ -281,6 +281,10 @@ fn ffmpeg_args(input: &Path, output: &Path, faststart: bool) -> Vec<String> {
         "-1".into(),
         "-map_chapters".into(),
         "-1".into(),
+        // `-map 0` copies data tracks too, and those carry metadata of their own:
+        // GoPro `gpmd` telemetry, iPhone `mebx`, chapter text. Dropped, payload
+        // and all.
+        "-dn".into(),
         "-fflags".into(),
         "+bitexact".into(),
     ];
@@ -633,6 +637,98 @@ mod tests {
         path
     }
 
+    /// Payload planted in the fixture's data track. Its absence from an output is
+    /// the proof that the track itself is gone, not merely its tags.
+    const DATA_CANARY: &[u8] = b"DATA_TRACK_CANARY";
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A sample that really carries a data stream, which is what `-dn` has to drop.
+    ///
+    /// The mp4 muxer refuses a bare `bin_data` track, so the only way to get one out
+    /// of a stock LGPL FFmpeg is to let `-map_chapters` build a chapter text track.
+    /// The demuxer hands those samples back only when the chapters stop short of the
+    /// media, hence a 7 s clip whose chapters end at 7000 ms: flush against the end
+    /// the track reads back empty and the fixture would prove nothing. The test
+    /// asserts the payload is present in the input for exactly that reason.
+    fn sample_video_with_data_track(dir: &Path, name: &str) -> PathBuf {
+        let base = dir.join("base-for-data-track.mp4");
+        let built = ffmpeg()
+            .args([
+                "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=7",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=7",
+                "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            ])
+            .arg(&base)
+            .output()
+            .expect("ffmpeg must be available for these tests");
+        assert!(
+            built.status.success(),
+            "could not build the base clip: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        let chapters = dir.join("chapters.ffmetadata");
+        let script = [
+            ";FFMETADATA1",
+            "[CHAPTER]",
+            "TIMEBASE=1/1000",
+            "START=0",
+            "END=3000",
+            "title=opening",
+            "[CHAPTER]",
+            "TIMEBASE=1/1000",
+            "START=3000",
+            "END=7000",
+            "title=DATA_TRACK_CANARY",
+        ]
+        .join("\n");
+        std::fs::write(&chapters, script).unwrap();
+
+        let path = dir.join(name);
+        let built = ffmpeg()
+            .args(["-y", "-i"])
+            .arg(&base)
+            .arg("-i")
+            .arg(&chapters)
+            .args([
+                "-map", "0", "-map_chapters", "1", "-c", "copy",
+                "-metadata", "title=SECRET",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg must be available for these tests");
+        assert!(
+            built.status.success(),
+            "could not build the fixture: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        path
+    }
+
+    /// The stream kinds FFmpeg reports for a file, in order, e.g. `["Video", "Audio"]`.
+    fn stream_kinds(path: &Path) -> Vec<String> {
+        // No output file, so FFmpeg exits non-zero after printing the input report.
+        let probe = ffmpeg()
+            .arg("-i")
+            .arg(path)
+            .output()
+            .expect("ffmpeg must be available for these tests");
+        String::from_utf8_lossy(&probe.stderr)
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("Stream #0:"))
+            .filter_map(|line| {
+                ["Video", "Audio", "Data", "Subtitle", "Attachment"]
+                    .into_iter()
+                    .find(|kind| line.contains(&format!(": {kind}: ")))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
     #[test]
     fn prefix_is_sanitized() {
         assert_eq!(sanitize_prefix("  CLIP  ").unwrap(), "CLIP");
@@ -753,6 +849,80 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp file survived a success");
         assert_eq!(std::fs::read(&input).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression: `-map 0` copies data tracks as well, so timed-metadata streams
+    /// (GoPro `gpmd`, iPhone `mebx`, chapter text tracks) used to reach the output
+    /// with their payload intact even though every tag around them was stripped.
+    /// `-dn` drops them. Remove `-dn` from `ffmpeg_args` and this test fails on the
+    /// canary.
+    #[test]
+    fn data_streams_are_dropped_while_video_and_audio_survive() {
+        let dir = scratch("data-streams");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = sample_video_with_data_track(&dir, "reel.mp4");
+        let before = std::fs::read(&input).unwrap();
+
+        // The fixture is worth nothing unless it really carries a data stream whose
+        // payload is findable in the bytes.
+        let kinds = stream_kinds(&input);
+        assert_eq!(kinds, ["Video", "Audio", "Data"], "unexpected fixture: {kinds:?}");
+        assert!(
+            contains(&before, DATA_CANARY),
+            "the fixture lost its data payload; the test would prove nothing"
+        );
+
+        let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
+        let name = clean_one(&input, &out, "CLIP", &mut registry).unwrap();
+        let cleaned = out.join(&name);
+
+        // The data track is gone; video and audio are not.
+        let kinds = stream_kinds(&cleaned);
+        assert_eq!(kinds, ["Video", "Audio"], "data stream survived: {kinds:?}");
+
+        // And so is what it carried.
+        assert!(
+            !contains(&std::fs::read(&cleaned).unwrap(), DATA_CANARY),
+            "the data payload is still recoverable from the cleaned file"
+        );
+
+        // Still lossless: the streams that remain are byte-identical to the source.
+        let hash = |path: &Path, stream: &str| -> String {
+            let probe = ffmpeg()
+                .args(["-v", "error", "-i"])
+                .arg(path)
+                .args(["-map", stream, "-c", "copy", "-f", "md5", "-"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&probe.stdout).trim().to_string()
+        };
+        let video = hash(&input, "0:v:0");
+        let audio = hash(&input, "0:a:0");
+        assert!(!video.is_empty() && !audio.is_empty(), "could not hash the source");
+        assert_eq!(video, hash(&cleaned, "0:v:0"), "video was not copied verbatim");
+        assert_eq!(audio, hash(&cleaned, "0:a:0"), "audio was not copied verbatim");
+
+        // Tags and chapters are still stripped.
+        let probe = ffmpeg()
+            .args(["-v", "error", "-i"])
+            .arg(&cleaned)
+            .args(["-f", "ffmetadata", "-"])
+            .output()
+            .unwrap();
+        let meta = String::from_utf8_lossy(&probe.stdout).to_lowercase();
+        assert!(!meta.contains("secret"), "metadata survived: {meta}");
+        assert!(!meta.contains("[chapter]"), "chapters survived: {meta}");
+
+        // The original is untouched and nothing half-written is left behind.
+        assert_eq!(std::fs::read(&input).unwrap(), before, "the original changed");
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file survived a success");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
