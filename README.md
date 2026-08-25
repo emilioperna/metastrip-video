@@ -47,10 +47,18 @@ and looks exactly like the original.
 
 ## Download
 
-> The Windows installer will be published under GitHub Releases with the first public
-> release. Until then, see [Building from source](#building-from-source).
+**[Download MetaStrip Video for Windows](https://github.com/emilioperna/metastrip-video/releases/latest)**
 
-Once released, the installer is the only thing you need — FFmpeg comes with it.
+Grab the `x64-setup.exe` from the latest release and run it. That installer is the only
+thing you need: **FFmpeg is bundled**, so there is nothing else to install and nothing to
+configure.
+
+- **Windows x86_64**
+- Published on **GitHub Releases**, and **signed** — the app verifies the signature of
+  every update it installs
+- Updates itself from then on
+
+Prefer to build it yourself? See [Building from source](#building-from-source).
 
 ## How to use
 

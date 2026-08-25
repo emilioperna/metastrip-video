@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "metastrip-video"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "rand",
  "serde",
