@@ -1,0 +1,12 @@
+# Canonical line endings, so a checkout on any platform stops showing files as
+# modified when nothing about them changed.
+
+* text=auto eol=lf
+
+# Binaries: never touched, never diffed as text.
+*.png binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.bundle binary
