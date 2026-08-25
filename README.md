@@ -3,17 +3,30 @@
 > Fast, offline video metadata remover for Windows.
 > Strip metadata, chapters and data tracks from MP4 and MOV files without re-encoding.
 
+[![Latest release](https://img.shields.io/github/v/release/emilioperna/metastrip-video?label=latest&color=2ea043)](https://github.com/emilioperna/metastrip-video/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%20x64-0078D4.svg)](#download)
 [![Built with Tauri 2](https://img.shields.io/badge/Built%20with-Tauri%202-24C8DB.svg)](https://tauri.app)
 [![Rust](https://img.shields.io/badge/Rust-stable-B7410E.svg)](https://www.rust-lang.org)
 [![FFmpeg LGPL](https://img.shields.io/badge/FFmpeg-LGPL%20v3%2B-007808.svg)](THIRD-PARTY-NOTICES.md)
 
+**[Download MetaStrip Video for Windows →](https://github.com/emilioperna/metastrip-video/releases/latest)**
+Windows x86_64 · signed installer · FFmpeg bundled · no account
+
 ![MetaStrip Video cleaning MP4 and MOV files on Windows](docs/assets/metastrip-video.png)
 
-Drop up to 100 videos, press one button, get clean copies. Your originals are never
-touched, the picture and sound are copied across untouched, and nothing leaves your
-computer.
+<!-- Demo GIF goes here once recorded:
+     ![Cleaning five videos with MetaStrip Video](docs/assets/demo.gif) -->
+
+Drop up to 100 videos, press one button, get clean copies.
+
+- **Your videos never leave your computer.** No upload, no cloud, no server.
+- **No account**, no sign-in.
+- **No telemetry**, no analytics, no crash reporting.
+- **No video or audio re-encoding.** The streams are copied, bit for bit.
+- **Your originals are never modified** or deleted.
+- **Signed automatic updates**, verified against a key compiled into the app.
+- **FFmpeg is bundled** — nothing else to install.
 
 ## Why MetaStrip?
 
@@ -21,15 +34,14 @@ Every video you export carries more than picture and sound. A phone stamps in th
 camera model and the time. An editor leaves its name. A GoPro writes a whole GPS
 telemetry track. Publish the file and you publish all of it.
 
-Most tools that strip this re-encode the video to do it, which costs quality and
-minutes per file. MetaStrip copies the media streams across bit for bit and rebuilds
-the container without the metadata, so a clean copy takes about as long as a file copy
-and looks exactly like the original.
+Most tools that strip this re-encode the video to do it, which costs quality and time.
+MetaStrip copies the media streams across bit for bit and rebuilds the container without
+the metadata. Because the streams are copied rather than transcoded, cleaning is
+typically much faster than re-encoding, and the result looks exactly like the original.
 
-- **Small.** One window, one button. No project files, no timeline, no settings page.
-- **Local.** Videos are processed on your machine and never uploaded.
-- **Transparent.** The exact FFmpeg command is [in this README](#how-it-works), and the
-  source is here to read.
+It is deliberately small: one window, one button, no project files and no settings page.
+And it is inspectable — the exact FFmpeg command it runs is
+[further down this page](#how-it-works), and the source is here to read.
 
 ## Features
 
@@ -233,6 +245,11 @@ update check.
 **Which formats?** MP4 and MOV.
 
 **Does it update itself?** Yes, through signed updates from GitHub Releases.
+
+---
+
+If MetaStrip is useful to you, consider starring the repository — it helps other people
+discover it.
 
 ## License
 
