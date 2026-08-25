@@ -93,6 +93,14 @@ and this one is Rust/React. Aurevm Video Cleaner additionally passes
 
 ## Application dependencies
 
-Tauri, React and the Rust crates in `src-tauri/Cargo.lock` ship under their own
-permissive licenses (MIT / Apache-2.0). Run `cargo license` or
-`npm run license-checker` if you need a full machine-readable inventory.
+A full transitive licence inventory has **not** been generated yet, so no claim is
+made here about what every dependency ships under. Before making this repository or
+a binary public, produce one and check it:
+
+```
+cargo install cargo-license && cargo license --manifest-path src-tauri/Cargo.toml
+npx license-checker-rspack --production --summary
+```
+
+The direct dependencies are Tauri 2, its dialog and opener plugins, `serde`,
+`serde_json`, `rand`, React and Vite.

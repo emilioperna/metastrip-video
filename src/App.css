@@ -216,6 +216,91 @@ body {
   color: var(--accent);
 }
 
+/* Config: prefix + output folder */
+
+.config {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.field-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field-hint.bad,
+.bad {
+  color: var(--bad);
+}
+
+.prefix-input {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  width: 260px;
+}
+
+.prefix-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.prefix-input:disabled {
+  opacity: 0.6;
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.folder-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.btn.small {
+  padding: 7px 14px;
+  font-size: 13px;
+}
+
+.renamed {
+  color: var(--muted);
+}
+
+.row.completed .renamed {
+  color: var(--ok);
+}
+
 /* Messages */
 
 .notice,
