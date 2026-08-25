@@ -32,3 +32,9 @@ src-tauri/binaries/*.dll
 *.key
 *.key.pub
 *.password.txt
+
+# Environment files. Nothing in this project needs one, which is exactly why an
+# accidental one must not be committed.
+.env
+.env.*
+!.env.example

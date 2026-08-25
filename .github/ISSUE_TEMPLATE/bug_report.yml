@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in MetaStrip Video does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not upload private or personal videos to this issue.** Anything you attach
+        here is public. If a specific file is needed to reproduce the problem, say so
+        and we will work out another way.
+
+        For a security vulnerability, do not use this form — see
+        [SECURITY.md](https://github.com/emilioperna/metastrip-video/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: MetaStrip Video version
+      placeholder: "0.2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: File type
+      options:
+        - MP4
+        - MOV
+        - Both
+        - Not file-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Chose an output folder
+        2. Dropped 3 MP4 files
+        3. Pressed Clean
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: Include the exact error message if there was one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >
+        Any error text the app showed. If you built from source, the console output.
+        Check it for personal folder names before pasting.
+      render: text
+    validations:
+      required: false

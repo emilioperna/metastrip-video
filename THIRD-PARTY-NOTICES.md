@@ -55,8 +55,9 @@ corresponding sources.
 
 ## Simple-Metadata-Remover
 
-The FFmpeg argument pipeline used by this app (`-map 0 -c copy -map_metadata -1
--map_chapters -1 -fflags +bitexact`) was taken as a technical reference from:
+The core of the FFmpeg argument pipeline used by this app (`-map 0 -c copy
+-map_metadata -1 -map_chapters -1 -fflags +bitexact`) was taken as a technical
+reference from:
 
 - **Project:** Simple-Metadata-Remover — https://github.com/ozp3/Simple-Metadata-Remover
 - **License:** MIT
@@ -87,20 +88,33 @@ SOFTWARE.
 
 No source code from that project was copied; it is a Python/Tkinter application
 and this one is Rust/React. MetaStrip Video additionally passes
-`-map_metadata:s -1` (stream-level metadata) and `-movflags +faststart`.
+`-map_metadata:s -1` (stream-level metadata), `-dn` (drop data tracks) and
+`-movflags +faststart`.
 
 ---
 
 ## Application dependencies
 
-A full transitive licence inventory has **not** been generated yet, so no claim is
-made here about what every dependency ships under. Before making this repository or
-a binary public, produce one and check it:
+MetaStrip Video's own direct dependencies are Tauri 2 with its dialog, opener and
+updater plugins, `serde`, `serde_json` and `rand` on the Rust side, and React with Vite
+on the front end.
+
+A licence survey of the full dependency graph was run against `src-tauri/Cargo.lock` and
+the npm production tree on 2026-08-25:
+
+- **Rust:** 522 crates in the lock file, 463 of which resolved to a licence from the
+  local registry. Every one is permissive — MIT, Apache-2.0 or a dual/multi licence
+  including one of them — apart from five crates under **MPL-2.0** (`cssparser`,
+  `cssparser-macros`, `dtoa-short`, `option-ext`, `selectors`), a file-level copyleft
+  that is satisfied by using them unmodified. No GPL-licensed crate is present. The 59
+  unresolved crates are platform-specific packages that are not compiled into the
+  Windows build and were therefore not in the local registry cache.
+- **npm (production):** 6 packages in total, all MIT or `Apache-2.0 OR MIT`.
+
+This survey is a snapshot, not a generated manifest, and it does not reproduce each
+licence text. To regenerate it:
 
 ```
 cargo install cargo-license && cargo license --manifest-path src-tauri/Cargo.toml
 npx license-checker-rspack --production --summary
 ```
-
-The direct dependencies are Tauri 2, its dialog and opener plugins, `serde`,
-`serde_json`, `rand`, React and Vite.

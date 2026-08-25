@@ -1,0 +1,49 @@
+name: ci
+
+# Every push and pull request on main. No signing, no artifacts, no release: this
+# workflow only answers "does it still build and pass its tests".
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Windows x86_64 only, matching the only platform the app ships on.
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - run: npm ci
+
+      - name: Check the three version files agree
+        run: node scripts/check-version.mjs
+
+      # ffmpeg.exe is not in git, and the Rust tests build real fixtures with it.
+      - name: Fetch the bundled FFmpeg
+        run: npm run setup:ffmpeg
+
+      - run: npm run build
+
+      - run: npm test
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --all-targets
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
