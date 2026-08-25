@@ -189,7 +189,7 @@ The workflow needs two repository secrets, under
 | Secret | Value |
 | --- | --- |
 | `TAURI_SIGNING_PRIVATE_KEY` | the contents of the updater private key file |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | empty, unless the key was generated with a password |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | the password that key was generated with |
 
 The private key is not in this repository and must never be. It lives outside the
 working tree; keep an offline copy, because losing it means existing installs can no

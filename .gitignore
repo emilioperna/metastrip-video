@@ -31,3 +31,4 @@ src-tauri/binaries/*.dll
 # This is belt and braces in case one is ever generated in the working tree.
 *.key
 *.key.pub
+*.password.txt

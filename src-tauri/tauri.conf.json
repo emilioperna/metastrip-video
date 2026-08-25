@@ -49,7 +49,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM4MkMyMDdCMDU5Q0JCRUEKUldUcXU1d0ZleUFzeUh4MEIzdkNRRkxYZ1NXWDE0ZDUvRlVlaHp3aFkvRi9mL2ZpV0ErUzU5L04K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFGMzBBM0QwNTAyMjNDODUKUldTRlBDSlEwS013cjdKTUhhSlFvbDR5b1M3NmRXV2ZTSEZ6S2JGR01ySS91OFJoc0NMMXhDVE8K",
       "endpoints": [
         "https://github.com/emilioperna/metastrip-video/releases/latest/download/latest.json"
       ],

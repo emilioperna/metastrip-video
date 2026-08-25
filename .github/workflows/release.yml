@@ -60,7 +60,8 @@ jobs:
       # Builds, signs the updater artifacts, creates the release and uploads the
       # installer, the .sig and latest.json. Left as a draft so a human presses
       # publish.
-      - uses: tauri-apps/tauri-action@v1
+      # tauri-action v1.0.0 — pinned because this step receives the updater signing key
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

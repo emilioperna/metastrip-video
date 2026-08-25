@@ -34,6 +34,28 @@ describe("install gating", () => {
   });
 });
 
+describe("installing is terminal", () => {
+  // On Windows `update.install()` hands the installer to the shell and ends the
+  // process, so this state is the last thing that happens in the session. It has
+  // to stay put until the process goes away: nothing may start a second install,
+  // start another check, or quietly drop back to idle behind the installer.
+  const installing = { kind: "installing", version: "0.3.1" } as const;
+
+  it("starts no second install, whatever the batch is doing", () => {
+    expect(canInstall(installing, false)).toBe(false);
+    expect(canInstall(installing, true)).toBe(false);
+  });
+
+  it("starts no further check", () => {
+    expect(shouldCheck(installing)).toBe(false);
+  });
+
+  it("is never reported as idle, so the status line does not go blank", () => {
+    expect(statusText(installing, false)).toBe("Installing MetaStrip Video v0.3.1…");
+    expect(statusText(installing, true)).toBe("Installing MetaStrip Video v0.3.1…");
+  });
+});
+
 describe("checking", () => {
   it("only starts a check when nothing else is in flight", () => {
     expect(shouldCheck(IDLE)).toBe(true);
