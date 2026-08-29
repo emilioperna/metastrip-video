@@ -3,26 +3,29 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useUpdater } from "./useUpdater";
-import { statusText } from "./updater";
+import {
+  CompletionSummary,
+  DropZone,
+  FileQueue,
+  InlineMessage,
+  OutputSettings,
+  ProductHeader,
+  type Phase,
+  type Settings,
+  type Status,
+  type Summary,
+  type VideoFile,
+} from "./components/Workflow";
 import {
   fileExtension,
   partitionSupported,
   supportedFormatLabels,
   type SupportedFormat,
 } from "./formats";
+import { statusText } from "./updater";
+import { useUpdater } from "./useUpdater";
 
 const MAX_FILES = 100;
-
-type Status = "ready" | "processing" | "completed" | "error";
-
-type VideoFile = {
-  path: string;
-  name: string;
-  status: Status;
-  outputName?: string;
-  message?: string;
-};
 
 type Progress = {
   index: number;
@@ -33,26 +36,12 @@ type Progress = {
   message: string | null;
 };
 
-type Summary = {
-  outputDir: string;
-  completed: number;
-  errors: number;
-};
-
-type Settings = {
-  prefix: string;
-  outputDirectory: string;
-  outputDirectoryValid: boolean;
-};
-
-type Phase = "idle" | "running" | "done";
-
 function baseName(path: string) {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
 }
 
-/// Illustration only — the real ID is assigned by the backend at processing time.
+// Illustration only. The backend reserves the real ID when processing starts.
 function demoId() {
   return String(Math.floor(Math.random() * 10_000_000_000)).padStart(10, "0");
 }
@@ -66,13 +55,11 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [supportedFormats, setSupportedFormats] = useState<SupportedFormat[]>([]);
-
   const [settings, setSettings] = useState<Settings | null>(null);
   const [prefixDraft, setPrefixDraft] = useState("");
   const [previewId] = useState(demoId);
 
-  // The drop handler is registered once, so it reads the phase through a ref
-  // instead of a stale closure value.
+  // Native listeners are registered once and read changing values through refs.
   const phaseRef = useRef<Phase>("idle");
   phaseRef.current = phase;
   const supportedFormatsRef = useRef<SupportedFormat[]>([]);
@@ -84,35 +71,39 @@ export default function App() {
       setNotice("Supported formats are still loading. Try again in a moment.");
       return;
     }
-    const { accepted, rejected } = partitionSupported(paths, formats);
 
-    setFiles((prev) => {
-      const known = new Set(prev.map((f) => f.path));
+    const { accepted, rejected } = partitionSupported(paths, formats);
+    setFiles((previous) => {
+      const known = new Set(previous.map((file) => file.path));
       const fresh = accepted
-        .filter((p) => !known.has(p))
-        .map((p) => ({ path: p, name: baseName(p), status: "ready" as Status }));
-      const merged = [...prev, ...fresh].map((f) => ({
-        ...f,
+        .filter((path) => !known.has(path))
+        .map((path) => ({ path, name: baseName(path), status: "ready" as Status }));
+      const reset = previous.map((file) => ({
+        path: file.path,
+        name: file.name,
         status: "ready" as Status,
-        outputName: undefined,
-        message: undefined,
       }));
+      const merged = [...reset, ...fresh];
       const capped = merged.slice(0, MAX_FILES);
-      const dropped = merged.length - capped.length;
-      const messages = [];
+      const overLimit = merged.length - capped.length;
+      const messages: string[] = [];
+
       if (rejected.length > 0) {
+        const noun = rejected.length === 1 ? "file was" : "files were";
         messages.push(
-          rejected.length +
-            " file(s) skipped - unsupported file type. Supported: " +
-            supportedFormatLabels(formats) +
-            ".",
+          `${rejected.length} unsupported ${noun} skipped. Supported: ${supportedFormatLabels(formats)}.`,
         );
       }
-      if (dropped > 0) messages.push(dropped + " file(s) skipped - limit is " + MAX_FILES + ".");
+      if (overLimit > 0) {
+        const noun = overLimit === 1 ? "file was" : "files were";
+        messages.push(`${overLimit} ${noun} skipped. Batches are limited to ${MAX_FILES} videos.`);
+      }
       setNotice(messages.length > 0 ? messages.join(" ") : null);
       return capped;
     });
+
     setPhase("idle");
+    setDone(0);
     setSummary(null);
     setError(null);
   }
@@ -132,33 +123,33 @@ export default function App() {
           setDragging(false);
         }
       })
-      .then((un) => {
-        unlistenDrag = un;
+      .then((unlisten) => {
+        unlistenDrag = unlisten;
       });
 
     listen<Progress>("clean-progress", ({ payload }) => {
-      setFiles((prev) =>
-        prev.map((f, i) =>
-          i === payload.index
+      setFiles((previous) =>
+        previous.map((file, index) =>
+          index === payload.index
             ? {
-                ...f,
+                ...file,
                 status: payload.status,
                 outputName: payload.outputName ?? undefined,
                 message: payload.message ?? undefined,
               }
-            : f,
+            : file,
         ),
       );
-      if (payload.status !== "processing") {
-        setDone(payload.index + 1);
-      }
-    }).then((un) => {
-      unlistenProgress = un;
+      if (payload.status !== "processing") setDone(payload.index + 1);
+    }).then((unlisten) => {
+      unlistenProgress = unlisten;
     });
 
-    invoke<string | null>("check_ffmpeg").then((problem) => {
-      if (problem) setError(problem);
-    });
+    invoke<string | null>("check_ffmpeg")
+      .then((problem) => {
+        if (problem) setError(problem);
+      })
+      .catch((reason) => setError(String(reason)));
 
     invoke<SupportedFormat[]>("get_supported_formats")
       .then((formats) => {
@@ -166,12 +157,14 @@ export default function App() {
         supportedFormatsRef.current = formats;
         setSupportedFormats(formats);
       })
-      .catch((e) => setError("Could not load the supported formats: " + String(e)));
+      .catch((reason) => setError(`Could not load the supported formats: ${String(reason)}`));
 
-    invoke<Settings>("get_settings").then((loaded) => {
-      setSettings(loaded);
-      setPrefixDraft(loaded.prefix);
-    });
+    invoke<Settings>("get_settings")
+      .then((loaded) => {
+        setSettings(loaded);
+        setPrefixDraft(loaded.prefix);
+      })
+      .catch((reason) => setError(String(reason)));
 
     return () => {
       unlistenDrag?.();
@@ -185,25 +178,22 @@ export default function App() {
       setSettings(saved);
       setPrefixDraft(saved.prefix);
       setError(null);
-    } catch (e) {
-      setError(String(e));
+    } catch (reason) {
+      setError(String(reason));
     }
   }
 
   async function chooseOutputFolder() {
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked === "string") {
-      // Fall back to the saved prefix so an empty text box cannot make picking a
-      // folder fail.
       const prefix = prefixDraft.trim() || settings?.prefix || "";
       await persist(prefix, picked);
     }
   }
 
   function commitPrefix() {
-    if (!settings) return;
-    if (prefixDraft.trim() === settings.prefix) return;
-    persist(prefixDraft, settings.outputDirectory);
+    if (!settings || prefixDraft.trim() === settings.prefix) return;
+    void persist(prefixDraft, settings.outputDirectory);
   }
 
   async function selectVideos() {
@@ -227,26 +217,31 @@ export default function App() {
     setError(null);
     setNotice(null);
     setSummary(null);
-    setFiles((prev) =>
-      prev.map((f) => ({ ...f, status: "ready", outputName: undefined, message: undefined })),
+    setFiles((previous) =>
+      previous.map((file) => ({
+        path: file.path,
+        name: file.name,
+        status: "ready",
+      })),
     );
+
     try {
       const result = await invoke<Summary>("clean_videos", {
-        paths: files.map((f) => f.path),
+        paths: files.map((file) => file.path),
       });
       setSummary(result);
       setPhase("done");
-    } catch (e) {
-      setError(String(e));
+    } catch (reason) {
+      setError(String(reason));
       setPhase("idle");
-      // The folder may have vanished since startup; re-read so the UI reflects it.
-      invoke<Settings>("get_settings").then(setSettings);
+      invoke<Settings>("get_settings").then(setSettings).catch(() => undefined);
     }
   }
 
   function reset() {
     setFiles([]);
     setPhase("idle");
+    setDragging(false);
     setDone(0);
     setSummary(null);
     setError(null);
@@ -257,174 +252,96 @@ export default function App() {
   const updateStatus = useUpdater(running);
   const updateText = statusText(updateStatus, running);
   const total = files.length;
-  const percent = total > 0 ? (done / total) * 100 : 0;
   const prefixValid = prefixDraft.trim().length > 0;
   const folderReady = settings?.outputDirectoryValid === true;
   const canClean = total > 0 && !running && folderReady && prefixValid;
-  const formatLabels = supportedFormatLabels(supportedFormats);
-  const selectedExtension = files.length > 0 ? fileExtension(files[0].name) : null;
-  const previewName = selectedExtension
-    ? `${prefixDraft.trim()}_${previewId}.${selectedExtension}`
-    : `${prefixDraft.trim()}_${previewId}.[format]`;
+  const selectedExtension = total > 0 ? fileExtension(files[0].name) : null;
+  const previewName = prefixValid
+    ? `${prefixDraft.trim()}_${previewId}.${selectedExtension ?? "[format]"}`
+    : "Enter a prefix";
+  const processingIndex = files.findIndex((file) => file.status === "processing");
+  const processingPosition = processingIndex >= 0 ? processingIndex + 1 : Math.min(done + 1, total);
+  const actionNote = !folderReady
+    ? "Choose an available output folder to continue."
+    : !prefixValid
+      ? "Enter a file name prefix to continue."
+      : "Metadata is removed locally. Video and audio streams are copied unchanged.";
 
   return (
-    <main className="app">
-      <header className="header">
-        <h1>MetaStrip Video</h1>
-        <p className="subtitle">Video Metadata Remover</p>
-        <p>Clean metadata from your videos locally without re-encoding.</p>
-      </header>
+    <main className={`app-shell app-shell--${phase}`} aria-busy={running}>
+      <ProductHeader />
 
-      <section className="config">
-        <div className="field">
-          <label className="field-label" htmlFor="prefix">
-            FILE NAME
-          </label>
-          <input
-            id="prefix"
-            className="prefix-input"
-            value={prefixDraft}
-            disabled={running}
-            spellCheck={false}
-            onChange={(e) => setPrefixDraft(e.target.value)}
-            onBlur={commitPrefix}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") e.currentTarget.blur();
-            }}
+      <div className="workflow-stage">
+        {total === 0 ? (
+          <DropZone dragging={dragging} formats={supportedFormats} onChoose={selectVideos} />
+        ) : (
+          <FileQueue
+            files={files}
+            phase={phase}
+            done={done}
+            dragging={dragging}
+            onAdd={selectVideos}
+            onClear={reset}
           />
-          <p className="field-hint">
-            {prefixValid ? (
-              <>
-                Preview: {previewName}
-              </>
-            ) : (
-              <span className="bad">The file name prefix cannot be empty.</span>
-            )}
-          </p>
-        </div>
+        )}
+      </div>
 
-        <div className="field">
-          <span className="field-label">OUTPUT FOLDER</span>
-          <div className="folder-row">
-            {settings?.outputDirectory ? (
-              // Right-to-left keeps the tail of a long path visible; it is only
-              // safe on a real path, since it would also reorder trailing
-              // punctuation in ordinary prose.
-              <span className={folderReady ? "folder-path" : "folder-path bad"}>
-                {settings.outputDirectory}
-              </span>
-            ) : (
-              <span className="folder-empty">No folder chosen yet.</span>
-            )}
-            <button className="btn secondary small" onClick={chooseOutputFolder} disabled={running}>
-              Change
-            </button>
-          </div>
-          {settings && !folderReady && settings.outputDirectory && (
-            <p className="field-hint bad">
-              This folder no longer exists. Choose a new one.
-            </p>
-          )}
+      {(notice || error) && (
+        <div className="message-stack">
+          {notice ? <InlineMessage tone="notice">{notice}</InlineMessage> : null}
+          {error ? <InlineMessage tone="error">{error}</InlineMessage> : null}
         </div>
-      </section>
+      )}
 
-      {total === 0 ? (
-        <section className={dragging ? "dropzone dragging" : "dropzone"}>
-          <p className="drop-title">DROP VIDEOS HERE</p>
-          <p className="drop-sub">{formatLabels || "Loading supported formats..."}</p>
-          <p className="drop-sub">Up to {MAX_FILES} videos</p>
-          <button
-            className="btn secondary"
-            onClick={selectVideos}
-            disabled={supportedFormats.length === 0}
-          >
-            Select videos
-          </button>
-        </section>
+      {summary && phase === "done" ? (
+        <CompletionSummary
+          summary={summary}
+          onOpenFolder={() => {
+            void invoke("open_folder", { path: summary.outputDir }).catch((reason) =>
+              setError(String(reason)),
+            );
+          }}
+          onReset={reset}
+        />
       ) : (
-        <section className={dragging ? "panel dragging" : "panel"}>
-          <div className="panel-head">
-            <span className="count">
-              {phase === "done"
-                ? "Cleaning complete"
-                : running
-                  ? "Cleaning videos..."
-                  : total + (total === 1 ? " video selected" : " videos selected")}
-            </span>
-            {!running && (
-              <div className="panel-actions">
-                <button className="link" onClick={selectVideos}>
-                  Add more
-                </button>
-                <button className="link" onClick={reset}>
-                  Clear
-                </button>
-              </div>
-            )}
-          </div>
+        <>
+          <OutputSettings
+            settings={settings}
+            prefixDraft={prefixDraft}
+            previewName={previewName}
+            prefixValid={prefixValid}
+            running={running}
+            onChooseFolder={chooseOutputFolder}
+            onPrefixChange={setPrefixDraft}
+            onPrefixCommit={commitPrefix}
+          />
 
-          {running && (
-            <div className="progress">
-              <div className="bar">
-                <div className="fill" style={{ width: percent + "%" }} />
-              </div>
-              <span className="progress-text">
-                {done} / {total}
-              </span>
+          {total > 0 ? (
+            <div className="primary-action-row">
+              <p className={canClean || running ? "action-note" : "action-note action-note--warning"}>
+                {actionNote}
+              </p>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={cleanVideos}
+                disabled={!canClean}
+              >
+                {running
+                  ? `Cleaning ${processingPosition} of ${total}`
+                  : `Clean ${total} ${total === 1 ? "video" : "videos"}`}
+              </button>
             </div>
-          )}
-
-          <ul className="list">
-            {files.map((f) => (
-              <li key={f.path} className={"row " + f.status}>
-                <span className="name" title={f.path}>
-                  {f.name}
-                  {f.outputName && <span className="renamed"> → {f.outputName}</span>}
-                </span>
-                <span className="status" title={f.message ?? ""}>
-                  {f.status === "ready" && "Ready"}
-                  {f.status === "processing" && "Processing..."}
-                  {f.status === "completed" && "✓"}
-                  {f.status === "error" && (f.message ?? "Error")}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
+          ) : null}
+        </>
       )}
 
-      {updateText && <p className="update-status">{updateText}</p>}
-
-      {notice && <p className="notice">{notice}</p>}
-      {error && <p className="error-box">{error}</p>}
-
-      {summary && phase === "done" && (
-        <div className="summary">
-          <p className="ok">{summary.completed} completed</p>
-          <p className={summary.errors > 0 ? "bad" : "muted"}>
-            {summary.errors} {summary.errors === 1 ? "error" : "errors"}
-          </p>
-          <div className="summary-actions">
-            <button
-              className="btn secondary"
-              onClick={() => invoke("open_folder", { path: summary.outputDir })}
-            >
-              Open output folder
-            </button>
-            <button className="link" onClick={reset}>
-              Start over
-            </button>
-          </div>
-        </div>
-      )}
-
-      {total > 0 && phase !== "done" && (
-        <button className="btn primary" onClick={cleanVideos} disabled={!canClean}>
-          {running
-            ? "Cleaning " + done + " / " + total
-            : "Clean " + total + (total === 1 ? " video" : " videos")}
-        </button>
-      )}
+      {updateText ? (
+        <p className="update-status" role="status">
+          <span className="update-dot" aria-hidden="true" />
+          {updateText}
+        </p>
+      ) : null}
     </main>
   );
 }
