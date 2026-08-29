@@ -5,6 +5,12 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useUpdater } from "./useUpdater";
 import { statusText } from "./updater";
+import {
+  fileExtension,
+  partitionSupported,
+  supportedFormatLabels,
+  type SupportedFormat,
+} from "./formats";
 
 const MAX_FILES = 100;
 
@@ -41,11 +47,6 @@ type Settings = {
 
 type Phase = "idle" | "running" | "done";
 
-function isSupported(path: string) {
-  const lower = path.toLowerCase();
-  return lower.endsWith(".mp4") || lower.endsWith(".mov");
-}
-
 function baseName(path: string) {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
@@ -64,6 +65,7 @@ export default function App() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [supportedFormats, setSupportedFormats] = useState<SupportedFormat[]>([]);
 
   const [settings, setSettings] = useState<Settings | null>(null);
   const [prefixDraft, setPrefixDraft] = useState("");
@@ -73,11 +75,16 @@ export default function App() {
   // instead of a stale closure value.
   const phaseRef = useRef<Phase>("idle");
   phaseRef.current = phase;
+  const supportedFormatsRef = useRef<SupportedFormat[]>([]);
 
   function addPaths(paths: string[]) {
     if (phaseRef.current === "running") return;
-    const accepted = paths.filter(isSupported);
-    const rejected = paths.length - accepted.length;
+    const formats = supportedFormatsRef.current;
+    if (formats.length === 0) {
+      setNotice("Supported formats are still loading. Try again in a moment.");
+      return;
+    }
+    const { accepted, rejected } = partitionSupported(paths, formats);
 
     setFiles((prev) => {
       const known = new Set(prev.map((f) => f.path));
@@ -93,7 +100,14 @@ export default function App() {
       const capped = merged.slice(0, MAX_FILES);
       const dropped = merged.length - capped.length;
       const messages = [];
-      if (rejected > 0) messages.push(rejected + " file(s) skipped - MP4 or MOV only.");
+      if (rejected.length > 0) {
+        messages.push(
+          rejected.length +
+            " file(s) skipped - unsupported file type. Supported: " +
+            supportedFormatLabels(formats) +
+            ".",
+        );
+      }
       if (dropped > 0) messages.push(dropped + " file(s) skipped - limit is " + MAX_FILES + ".");
       setNotice(messages.length > 0 ? messages.join(" ") : null);
       return capped;
@@ -146,6 +160,14 @@ export default function App() {
       if (problem) setError(problem);
     });
 
+    invoke<SupportedFormat[]>("get_supported_formats")
+      .then((formats) => {
+        if (formats.length === 0) throw new Error("The backend returned no supported formats.");
+        supportedFormatsRef.current = formats;
+        setSupportedFormats(formats);
+      })
+      .catch((e) => setError("Could not load the supported formats: " + String(e)));
+
     invoke<Settings>("get_settings").then((loaded) => {
       setSettings(loaded);
       setPrefixDraft(loaded.prefix);
@@ -185,9 +207,15 @@ export default function App() {
   }
 
   async function selectVideos() {
+    if (supportedFormats.length === 0) return;
     const picked = await open({
       multiple: true,
-      filters: [{ name: "Videos", extensions: ["mp4", "mov"] }],
+      filters: [
+        {
+          name: "Videos",
+          extensions: supportedFormats.map((format) => format.extension),
+        },
+      ],
     });
     if (Array.isArray(picked)) addPaths(picked);
     else if (typeof picked === "string") addPaths([picked]);
@@ -233,6 +261,11 @@ export default function App() {
   const prefixValid = prefixDraft.trim().length > 0;
   const folderReady = settings?.outputDirectoryValid === true;
   const canClean = total > 0 && !running && folderReady && prefixValid;
+  const formatLabels = supportedFormatLabels(supportedFormats);
+  const selectedExtension = files.length > 0 ? fileExtension(files[0].name) : null;
+  const previewName = selectedExtension
+    ? `${prefixDraft.trim()}_${previewId}.${selectedExtension}`
+    : `${prefixDraft.trim()}_${previewId}.[format]`;
 
   return (
     <main className="app">
@@ -262,7 +295,7 @@ export default function App() {
           <p className="field-hint">
             {prefixValid ? (
               <>
-                Preview: {prefixDraft.trim()}_{previewId}.mp4
+                Preview: {previewName}
               </>
             ) : (
               <span className="bad">The file name prefix cannot be empty.</span>
@@ -298,9 +331,13 @@ export default function App() {
       {total === 0 ? (
         <section className={dragging ? "dropzone dragging" : "dropzone"}>
           <p className="drop-title">DROP VIDEOS HERE</p>
-          <p className="drop-sub">MP4 or MOV</p>
+          <p className="drop-sub">{formatLabels || "Loading supported formats..."}</p>
           <p className="drop-sub">Up to {MAX_FILES} videos</p>
-          <button className="btn secondary" onClick={selectVideos}>
+          <button
+            className="btn secondary"
+            onClick={selectVideos}
+            disabled={supportedFormats.length === 0}
+          >
             Select videos
           </button>
         </section>

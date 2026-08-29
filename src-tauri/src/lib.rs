@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -22,7 +22,157 @@ const DEFAULT_PREFIX: &str = "VIDEO";
 /// Marks an output that FFmpeg is still writing. Renamed into place on success.
 const TEMP_PREFIX: &str = ".video-cleaner-processing-";
 
-const SUPPORTED_EXTENSIONS: [&str; 2] = ["mp4", "mov"];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerProfile {
+    IsoBmff,
+    Matroska,
+    WebM,
+    Avi,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MuxAttempt {
+    FastStart,
+    Standard,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FormatProfile {
+    extension: &'static str,
+    label: &'static str,
+    container: ContainerProfile,
+    /// Explicit rather than inferred from the temporary file name. In particular,
+    /// FFmpeg maps `.m4v` to its raw MPEG-4 video muxer unless we select MP4 here.
+    output_muxer: &'static str,
+}
+
+const ISO_BMFF_ATTEMPTS: [MuxAttempt; 2] = [MuxAttempt::FastStart, MuxAttempt::Standard];
+const STANDARD_ATTEMPTS: [MuxAttempt; 1] = [MuxAttempt::Standard];
+
+impl FormatProfile {
+    fn mux_attempts(self) -> &'static [MuxAttempt] {
+        match self.container {
+            ContainerProfile::IsoBmff => &ISO_BMFF_ATTEMPTS,
+            ContainerProfile::Matroska | ContainerProfile::WebM | ContainerProfile::Avi => {
+                &STANDARD_ATTEMPTS
+            }
+        }
+    }
+}
+
+/// The product support contract. FFmpeg may understand many more extensions, but
+/// only profiles represented here are accepted by either side of the application.
+const FORMAT_PROFILES: [FormatProfile; 6] = [
+    FormatProfile {
+        extension: "mp4",
+        label: "MP4",
+        container: ContainerProfile::IsoBmff,
+        output_muxer: "mp4",
+    },
+    FormatProfile {
+        extension: "mov",
+        label: "MOV",
+        container: ContainerProfile::IsoBmff,
+        output_muxer: "mov",
+    },
+    FormatProfile {
+        extension: "m4v",
+        label: "M4V",
+        container: ContainerProfile::IsoBmff,
+        output_muxer: "mp4",
+    },
+    FormatProfile {
+        extension: "mkv",
+        label: "MKV",
+        container: ContainerProfile::Matroska,
+        output_muxer: "matroska",
+    },
+    FormatProfile {
+        extension: "webm",
+        label: "WebM",
+        container: ContainerProfile::WebM,
+        output_muxer: "webm",
+    },
+    FormatProfile {
+        extension: "avi",
+        label: "AVI",
+        container: ContainerProfile::Avi,
+        output_muxer: "avi",
+    },
+];
+
+fn format_profile(extension: &str) -> Option<FormatProfile> {
+    FORMAT_PROFILES
+        .iter()
+        .copied()
+        .find(|profile| profile.extension == extension)
+}
+
+fn supported_format_labels() -> String {
+    FORMAT_PROFILES
+        .iter()
+        .map(|profile| profile.label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `.m4v` is ambiguous in FFmpeg: it may be an ISO-BMFF file or a raw MPEG-4
+/// elementary stream. Tier 1 deliberately covers the former only. Walk the first
+/// top-level boxes instead of looking for an arbitrary `ftyp` byte sequence inside
+/// media payload.
+fn is_iso_bmff(path: &Path) -> Result<bool, String> {
+    const MAX_HEADER_SCAN: u64 = 1024 * 1024;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("Could not inspect the M4V container: {e}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("Could not inspect the M4V container: {e}"))?
+        .len();
+    let scan_limit = file_len.min(MAX_HEADER_SCAN);
+    let mut offset = 0u64;
+
+    while offset + 8 <= scan_limit {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Could not inspect the M4V container: {e}"))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)
+            .map_err(|e| format!("Could not inspect the M4V container: {e}"))?;
+
+        let size32 = u32::from_be_bytes(header[0..4].try_into().unwrap()) as u64;
+        let box_type = &header[4..8];
+        let (box_size, header_size) = if size32 == 1 {
+            if offset + 16 > scan_limit {
+                return Ok(false);
+            }
+            let mut extended = [0u8; 8];
+            file.read_exact(&mut extended)
+                .map_err(|e| format!("Could not inspect the M4V container: {e}"))?;
+            (u64::from_be_bytes(extended), 16u64)
+        } else if size32 == 0 {
+            (file_len - offset, 8u64)
+        } else {
+            (size32, 8u64)
+        };
+
+        let Some(next_offset) = offset.checked_add(box_size) else {
+            return Ok(false);
+        };
+        if box_size < header_size || next_offset > file_len {
+            return Ok(false);
+        }
+        if box_type == b"ftyp" {
+            return Ok(true);
+        }
+        if size32 == 0 || next_offset > scan_limit {
+            return Ok(false);
+        }
+        offset = next_offset;
+    }
+
+    Ok(false)
+}
+
 const MAX_PREFIX_LEN: usize = 64;
 const MAX_BATCH: usize = 100;
 
@@ -40,7 +190,10 @@ fn ffmpeg_program() -> &'static PathBuf {
         if let Some(dir) = &dir {
             // Installed layout first, then the target-triple name the Tauri CLI
             // uses in the target dir during development.
-            let names = ["ffmpeg.exe", concat!("ffmpeg-", env!("TARGET_TRIPLE"), ".exe")];
+            let names = [
+                "ffmpeg.exe",
+                concat!("ffmpeg-", env!("TARGET_TRIPLE"), ".exe"),
+            ];
             if let Some(found) = names.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
                 return found;
             }
@@ -151,7 +304,12 @@ fn sanitize_prefix(raw: &str) -> Result<String, String> {
     let cleaned: String = raw
         .trim()
         .chars()
-        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '.'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '.'
+            )
+        })
         .filter(|c| !c.is_control())
         .take(MAX_PREFIX_LEN)
         .collect();
@@ -263,11 +421,24 @@ struct CleanSummary {
     results: Vec<FileResult>,
 }
 
-fn ffmpeg_args(input: &Path, output: &Path, faststart: bool) -> Vec<String> {
+fn ffmpeg_args(
+    input: &Path,
+    output: &Path,
+    format: FormatProfile,
+    attempt: MuxAttempt,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         // -n, not -y: we already guarantee the target is free, so an existing file
         // means something is wrong and must not be overwritten.
         "-n".into(),
+    ];
+    if format.container == ContainerProfile::Avi {
+        // AVI can carry streams that FFmpeg demuxes as `Unknown: none`. `-dn`
+        // cannot classify those, so allow the explicit `-map 0` to skip them
+        // rather than failing or copying their payload.
+        args.push("-ignore_unknown".into());
+    }
+    args.extend([
         "-i".into(),
         input.to_string_lossy().into_owned(),
         "-map".into(),
@@ -287,11 +458,14 @@ fn ffmpeg_args(input: &Path, output: &Path, faststart: bool) -> Vec<String> {
         "-dn".into(),
         "-fflags".into(),
         "+bitexact".into(),
-    ];
-    if faststart {
+    ]);
+    if attempt == MuxAttempt::FastStart {
+        debug_assert_eq!(format.container, ContainerProfile::IsoBmff);
         args.push("-movflags".into());
         args.push("+faststart".into());
     }
+    args.push("-f".into());
+    args.push(format.output_muxer.into());
     args.push(output.to_string_lossy().into_owned());
     args
 }
@@ -335,23 +509,35 @@ fn clean_one(
     if !input.is_file() {
         return Err("File is no longer available".into());
     }
-    let ext = input
+    let original_ext = input
         .extension()
         .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    if !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
-        return Err("Unsupported file type (MP4 or MOV only)".into());
+    let normalized_ext = original_ext.to_ascii_lowercase();
+    let format = format_profile(&normalized_ext).ok_or_else(|| {
+        format!(
+            "Unsupported file type. Supported: {}.",
+            supported_format_labels()
+        )
+    })?;
+    if normalized_ext == "m4v" && !is_iso_bmff(input)? {
+        return Err(
+            "Unsupported M4V variant. Supported M4V files must use an ISO-BMFF container; raw MPEG-4 video streams are not accepted."
+                .into(),
+        );
     }
 
-    let id = format_id(registry.reserve(output_dir, prefix, &ext)?);
-    let final_name = format!("{prefix}_{id}.{ext}");
+    // Preserve the source spelling too (`.MOV` stays `.MOV`), while lookup above is
+    // case-insensitive. Every accepted value is one of the safe ASCII extensions in
+    // FORMAT_PROFILES.
+    let id = format_id(registry.reserve(output_dir, prefix, original_ext)?);
+    let final_name = format!("{prefix}_{id}.{original_ext}");
     let final_path = output_dir.join(&final_name);
-    let temp_path = output_dir.join(format!("{TEMP_PREFIX}{id}.{ext}"));
+    let temp_path = output_dir.join(format!("{TEMP_PREFIX}{id}.{original_ext}"));
 
-    let run = |faststart: bool| {
+    let run = |attempt: MuxAttempt| {
         ffmpeg()
-            .args(ffmpeg_args(input, &temp_path, faststart))
+            .args(ffmpeg_args(input, &temp_path, format, attempt))
             .output()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -362,25 +548,36 @@ fn clean_one(
             })
     };
 
-    // faststart is the preferred path; if this container rejects it, retry without
-    // it. The temp file must go first or `-n` would refuse to write.
-    let mut result = run(true)?;
-    if !result.status.success() {
+    let mut last_error = "FFmpeg failed".to_string();
+    for attempt in format.mux_attempts() {
+        let result = match run(*attempt) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
+
+        if result.status.success() {
+            // The finished name only appears once the bytes are all there.
+            std::fs::rename(&temp_path, &final_path).map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                format!("Could not move the cleaned file into place: {e}")
+            })?;
+            return Ok(final_name);
+        }
+
+        last_error = last_ffmpeg_error(&result.stderr);
+        // ISO-BMFF gets one retry without faststart. Other profiles have exactly
+        // one attempt. Removing the partial output is required because `-n` must
+        // keep protecting every invocation from overwrites.
         let _ = std::fs::remove_file(&temp_path);
-        result = run(false)?;
-    }
-    if !result.status.success() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(last_ffmpeg_error(&result.stderr));
     }
 
-    // The finished name only appears once the bytes are all there.
-    std::fs::rename(&temp_path, &final_path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
-        format!("Could not move the cleaned file into place: {e}")
-    })?;
-
-    Ok(final_name)
+    Err(format!(
+        "Stream copy failed for this {} file: {last_error}. No video or audio re-encoding was attempted.",
+        format.label
+    ))
 }
 
 /// The whole batch, with progress pushed through a callback so this stays
@@ -431,16 +628,17 @@ fn run_batch(
             message: None,
         });
 
-        let (status, output_name, message) = match clean_one(&input, output_dir, prefix, &mut registry) {
-            Ok(name) => {
-                completed += 1;
-                ("completed", Some(name), None)
-            }
-            Err(e) => {
-                errors += 1;
-                ("error", None, Some(e))
-            }
-        };
+        let (status, output_name, message) =
+            match clean_one(&input, output_dir, prefix, &mut registry) {
+                Ok(name) => {
+                    completed += 1;
+                    ("completed", Some(name), None)
+                }
+                Err(e) => {
+                    errors += 1;
+                    ("error", None, Some(e))
+                }
+            };
 
         on_progress(Progress {
             index,
@@ -506,6 +704,26 @@ fn migrate_legacy_config(new_dir: &Path, legacy_dir: &Path) -> Result<(), String
     }
     // The old folder is left in place on purpose: copying is reversible, moving is not.
     Ok(())
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SupportedFormatView {
+    extension: String,
+    label: String,
+}
+
+/// Runtime single source of truth for the file picker, drag/drop validation and
+/// user-facing supported-format copy in the React frontend.
+#[tauri::command]
+fn get_supported_formats() -> Vec<SupportedFormatView> {
+    FORMAT_PROFILES
+        .iter()
+        .map(|profile| SupportedFormatView {
+            extension: profile.extension.to_string(),
+            label: profile.label.to_string(),
+        })
+        .collect()
 }
 
 /// `null` when FFmpeg is usable, otherwise the message to show. Returning the
@@ -594,6 +812,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             check_ffmpeg,
+            get_supported_formats,
             get_settings,
             save_settings,
             clean_videos,
@@ -611,7 +830,8 @@ mod tests {
 
     /// A throwaway directory under the OS temp dir.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("video-cleaner-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("video-cleaner-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -622,10 +842,23 @@ mod tests {
         let path = dir.join(name);
         let status = ffmpeg()
             .args([
-                "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=1",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-                "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "aac",
-                "-metadata", "title=SECRET",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-metadata",
+                "title=SECRET",
             ])
             .arg(&path)
             .output()
@@ -658,9 +891,21 @@ mod tests {
         let base = dir.join("base-for-data-track.mp4");
         let built = ffmpeg()
             .args([
-                "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=7",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=7",
-                "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=7",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=7",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
             ])
             .arg(&base)
             .output()
@@ -695,8 +940,14 @@ mod tests {
             .arg("-i")
             .arg(&chapters)
             .args([
-                "-map", "0", "-map_chapters", "1", "-c", "copy",
-                "-metadata", "title=SECRET",
+                "-map",
+                "0",
+                "-map_chapters",
+                "1",
+                "-c",
+                "copy",
+                "-metadata",
+                "title=SECRET",
             ])
             .arg(&path)
             .output()
@@ -722,12 +973,500 @@ mod tests {
             .map(str::trim)
             .filter(|line| line.starts_with("Stream #0:"))
             .filter_map(|line| {
-                ["Video", "Audio", "Data", "Subtitle", "Attachment"]
-                    .into_iter()
-                    .find(|kind| line.contains(&format!(": {kind}: ")))
-                    .map(str::to_string)
+                [
+                    "Video",
+                    "Audio",
+                    "Data",
+                    "Unknown",
+                    "Subtitle",
+                    "Attachment",
+                ]
+                .into_iter()
+                .find(|kind| line.contains(&format!(": {kind}: ")))
+                .map(str::to_string)
             })
             .collect()
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixtureCapabilities {
+        video_codec: &'static str,
+        audio_codec: &'static str,
+        chapters: bool,
+        data_stream_kind: Option<&'static str>,
+    }
+
+    fn fixture_capabilities(extension: &str) -> FixtureCapabilities {
+        match extension {
+            "mp4" | "mov" | "m4v" => FixtureCapabilities {
+                video_codec: "mpeg4",
+                audio_codec: "aac",
+                chapters: true,
+                // FFmpeg represents ISO-BMFF chapters with a timed text/data track.
+                data_stream_kind: Some("Data"),
+            },
+            "mkv" => FixtureCapabilities {
+                video_codec: "mpeg4",
+                audio_codec: "aac",
+                chapters: true,
+                data_stream_kind: None,
+            },
+            "webm" => FixtureCapabilities {
+                video_codec: "libvpx",
+                audio_codec: "libopus",
+                chapters: true,
+                data_stream_kind: None,
+            },
+            "avi" => FixtureCapabilities {
+                video_codec: "mpeg4",
+                audio_codec: "libmp3lame",
+                // FFmpeg's AVI muxer does not write chapters. It can carry a data
+                // stream, but reports it as `Unknown: none` when demuxing.
+                chapters: false,
+                data_stream_kind: Some("Unknown"),
+            },
+            other => panic!("missing fixture capabilities for {other}"),
+        }
+    }
+
+    /// Builds a real, container-appropriate fixture with global metadata and,
+    /// wherever the muxer supports them, chapters. Encoding only happens here to
+    /// create synthetic input; the production cleaning path is always stream copy.
+    fn sample_for_format(dir: &Path, extension: &str) -> PathBuf {
+        let profile = format_profile(extension).expect("fixture requested for unsupported format");
+        let capabilities = fixture_capabilities(extension);
+        let metadata_path = dir.join(format!("fixture-{extension}.ffmetadata"));
+        let mut metadata =
+            String::from(";FFMETADATA1\ntitle=GLOBAL_SECRET\ncomment=SENSITIVE_COMMENT\n");
+        if capabilities.chapters {
+            metadata
+                .push_str("[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1200\ntitle=CHAPTER_SECRET\n");
+        }
+        std::fs::write(&metadata_path, metadata).unwrap();
+        let data_path = dir.join("avi-data-canary.bin");
+        if extension == "avi" {
+            std::fs::write(&data_path, DATA_CANARY).unwrap();
+        }
+
+        let path = dir.join(format!("fixture.{extension}"));
+        let mut command = ffmpeg();
+        command
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-f",
+                "ffmetadata",
+                "-i",
+            ])
+            .arg(&metadata_path);
+        if extension == "avi" {
+            command.args(["-f", "data", "-i"]).arg(&data_path);
+        }
+        command.args(["-map", "0:v:0", "-map", "1:a:0", "-map_metadata", "2"]);
+        if extension == "avi" {
+            command.args(["-map", "3:0"]);
+        }
+        if capabilities.chapters {
+            command.args(["-map_chapters", "2"]);
+        } else {
+            command.args(["-map_chapters", "-1"]);
+        }
+        command.args([
+            "-metadata:s:v:0",
+            "title=STREAM_SECRET",
+            "-t",
+            "2",
+            "-c:v",
+            capabilities.video_codec,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            capabilities.audio_codec,
+        ]);
+        if extension == "avi" {
+            command.args(["-c:d", "copy"]);
+        }
+        if extension == "webm" {
+            command.args(["-deadline", "realtime", "-cpu-used", "8"]);
+        }
+        let built = command
+            .args(["-f", profile.output_muxer])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg must be available for these tests");
+        assert!(
+            built.status.success(),
+            "could not build the {extension} fixture: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        path
+    }
+
+    fn ffmetadata(path: &Path) -> String {
+        let probe = ffmpeg()
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-f", "ffmetadata", "-"])
+            .output()
+            .expect("ffmpeg must be available for these tests");
+        assert!(
+            probe.status.success(),
+            "could not inspect metadata in {path:?}: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        String::from_utf8_lossy(&probe.stdout).to_lowercase()
+    }
+
+    fn assert_ffmpeg_can_read(path: &Path) {
+        let probe = ffmpeg()
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args([
+                "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-f", "null", "-",
+            ])
+            .output()
+            .expect("ffmpeg must be available for these tests");
+        assert!(
+            probe.status.success(),
+            "FFmpeg could not read {path:?}: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+    }
+
+    fn stream_payload_hash(path: &Path, stream: &str) -> String {
+        let hash = ffmpeg()
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", stream, "-c", "copy", "-f", "md5", "-"])
+            .output()
+            .expect("ffmpeg must be available for these tests");
+        assert!(
+            hash.status.success(),
+            "could not hash {stream} in {path:?}: {}",
+            String::from_utf8_lossy(&hash.stderr)
+        );
+        let value = String::from_utf8_lossy(&hash.stdout).trim().to_string();
+        assert!(!value.is_empty(), "empty {stream} hash for {path:?}");
+        value
+    }
+
+    fn temp_files(output_dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(output_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    fn assert_format_cleaning(extension: &str) {
+        let dir = scratch(&format!("format-{extension}"));
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = sample_for_format(&dir, extension);
+        let capabilities = fixture_capabilities(extension);
+        let before = std::fs::read(&input).unwrap();
+
+        // A/B: the fixture is valid and demonstrably contains sensitive metadata.
+        if extension == "m4v" {
+            assert!(is_iso_bmff(&input).unwrap(), "M4V fixture is not ISO-BMFF");
+        }
+        assert_ffmpeg_can_read(&input);
+        let input_metadata = ffmetadata(&input);
+        assert!(
+            input_metadata.contains("global_secret"),
+            "{extension} fixture lacks its metadata: {input_metadata}"
+        );
+        if capabilities.chapters {
+            assert!(
+                input_metadata.contains("[chapter]") && input_metadata.contains("chapter_secret"),
+                "{extension} fixture lacks chapters: {input_metadata}"
+            );
+        }
+        let input_kinds = stream_kinds(&input);
+        assert!(input_kinds.contains(&"Video".to_string()));
+        assert!(input_kinds.contains(&"Audio".to_string()));
+        if let Some(data_stream_kind) = capabilities.data_stream_kind {
+            assert!(
+                input_kinds.contains(&data_stream_kind.to_string()),
+                "{extension} fixture lacks its expected data stream: {input_kinds:?}"
+            );
+        }
+        if extension == "avi" {
+            assert!(
+                contains(&before, DATA_CANARY),
+                "AVI fixture lacks its data payload canary"
+            );
+        }
+
+        let source_video_hash = stream_payload_hash(&input, "0:v:0");
+        let source_audio_hash = stream_payload_hash(&input, "0:a:0");
+        let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
+        let output_name = clean_one(&input, &out, "CLIP", &mut registry).unwrap();
+        let cleaned = out.join(&output_name);
+
+        // C/D/J: a finished, readable output exists with the same extension.
+        assert!(cleaned.is_file(), "{extension} output was not created");
+        assert_eq!(
+            cleaned.extension().and_then(|value| value.to_str()),
+            input.extension().and_then(|value| value.to_str())
+        );
+        assert_ffmpeg_can_read(&cleaned);
+        if extension == "m4v" {
+            assert!(is_iso_bmff(&cleaned).unwrap(), "M4V output is not ISO-BMFF");
+        }
+
+        // E/F/G: sensitive global metadata, chapters and data streams are gone.
+        let output_metadata = ffmetadata(&cleaned);
+        assert!(
+            !output_metadata.contains("global_secret")
+                && !output_metadata.contains("sensitive_comment"),
+            "{extension} metadata survived: {output_metadata}"
+        );
+        if capabilities.chapters {
+            assert!(
+                !output_metadata.contains("[chapter]")
+                    && !output_metadata.contains("chapter_secret"),
+                "{extension} chapters survived: {output_metadata}"
+            );
+        }
+        let output_kinds = stream_kinds(&cleaned);
+        assert!(!output_kinds.contains(&"Data".to_string()));
+        assert!(
+            !output_kinds.contains(&"Unknown".to_string()),
+            "{extension} output still has an unknown/data stream"
+        );
+        if extension == "avi" {
+            assert!(
+                !contains(&std::fs::read(&cleaned).unwrap(), DATA_CANARY),
+                "AVI data payload survived"
+            );
+        }
+
+        // H: the encoded video and audio packet payloads are byte-identical.
+        assert_eq!(
+            source_video_hash,
+            stream_payload_hash(&cleaned, "0:v:0"),
+            "{extension} video payload changed"
+        );
+        assert_eq!(
+            source_audio_hash,
+            stream_payload_hash(&cleaned, "0:a:0"),
+            "{extension} audio payload changed"
+        );
+
+        // I/K: production never touched the source and published no temp artifact.
+        assert_eq!(
+            std::fs::read(&input).unwrap(),
+            before,
+            "{extension} source changed"
+        );
+        assert!(temp_files(&out).is_empty(), "{extension} left a temp file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn support_matrix_has_explicit_unique_profiles() {
+        let expected = [
+            ("mp4", "MP4", ContainerProfile::IsoBmff, "mp4", 2),
+            ("mov", "MOV", ContainerProfile::IsoBmff, "mov", 2),
+            ("m4v", "M4V", ContainerProfile::IsoBmff, "mp4", 2),
+            ("mkv", "MKV", ContainerProfile::Matroska, "matroska", 1),
+            ("webm", "WebM", ContainerProfile::WebM, "webm", 1),
+            ("avi", "AVI", ContainerProfile::Avi, "avi", 1),
+        ];
+        let mut extensions = HashSet::new();
+        for (extension, label, container, muxer, attempts) in expected {
+            let profile = format_profile(extension).unwrap();
+            assert!(extensions.insert(profile.extension));
+            assert_eq!(profile.label, label);
+            assert_eq!(profile.container, container);
+            assert_eq!(profile.output_muxer, muxer);
+            assert_eq!(profile.mux_attempts().len(), attempts);
+        }
+        assert_eq!(extensions.len(), FORMAT_PROFILES.len());
+        assert_eq!(
+            get_supported_formats(),
+            FORMAT_PROFILES
+                .iter()
+                .map(|profile| SupportedFormatView {
+                    extension: profile.extension.to_string(),
+                    label: profile.label.to_string(),
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ffmpeg_options_are_container_specific_and_never_transcode() {
+        for profile in FORMAT_PROFILES {
+            for attempt in profile.mux_attempts() {
+                let args = ffmpeg_args(
+                    Path::new("input.video"),
+                    Path::new("output.video"),
+                    profile,
+                    *attempt,
+                );
+                let movflags = args.iter().position(|arg| arg == "-movflags");
+                assert_eq!(
+                    movflags.is_some(),
+                    *attempt == MuxAttempt::FastStart,
+                    "unexpected MOV flags for {} {attempt:?}",
+                    profile.extension
+                );
+                assert_eq!(
+                    args.iter().any(|arg| arg == "-ignore_unknown"),
+                    profile.container == ContainerProfile::Avi,
+                    "unexpected unknown-stream policy for {}",
+                    profile.extension
+                );
+                let codec = args.iter().position(|arg| arg == "-c").unwrap();
+                assert_eq!(args[codec + 1], "copy");
+                let muxer = args.iter().position(|arg| arg == "-f").unwrap();
+                assert_eq!(args[muxer + 1], profile.output_muxer);
+                assert!(!args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "libx264" | "libx265" | "libvpx" | "libopus" | "aac"
+                    )
+                }));
+            }
+        }
+        assert_eq!(format_profile("m4v").unwrap().output_muxer, "mp4");
+    }
+
+    #[test]
+    fn unsupported_error_is_generated_from_the_real_matrix() {
+        let dir = scratch("unsupported");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = dir.join("clip.flv");
+        std::fs::write(&input, b"not inspected because the extension is rejected").unwrap();
+        let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
+
+        let error = clean_one(&input, &out, "CLIP", &mut registry).unwrap_err();
+
+        assert_eq!(
+            error,
+            "Unsupported file type. Supported: MP4, MOV, M4V, MKV, WebM, AVI."
+        );
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn incompatible_stream_copy_fails_without_transcoding_or_partial_output() {
+        let dir = scratch("incompatible-webm");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // A valid Matroska file carrying MPEG-4/AAC, deliberately given a .webm
+        // extension. FFmpeg can read it, but the WebM muxer must reject those
+        // codecs. The production path must report that incompatibility, never
+        // make it pass by encoding VP8/VP9 + Opus/Vorbis.
+        let matroska = sample_for_format(&dir, "mkv");
+        let input = dir.join("incompatible.webm");
+        std::fs::copy(&matroska, &input).unwrap();
+        assert_ffmpeg_can_read(&input);
+        let before = std::fs::read(&input).unwrap();
+
+        let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
+        let error = clean_one(&input, &out, "CLIP", &mut registry).unwrap_err();
+
+        assert!(
+            error.contains("Stream copy failed for this WebM file"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("No video or audio re-encoding was attempted"),
+            "no no-transcode guarantee in error: {error}"
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+        assert!(temp_files(&out).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raw_mpeg4_m4v_is_not_misrepresented_as_iso_bmff() {
+        let dir = scratch("raw-m4v");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = dir.join("raw.m4v");
+        let built = ffmpeg()
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=1",
+                "-an",
+                "-c:v",
+                "mpeg4",
+                "-f",
+                "m4v",
+            ])
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "could not build raw M4V: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        assert_ffmpeg_can_read(&input);
+        assert!(!is_iso_bmff(&input).unwrap());
+        let before = std::fs::read(&input).unwrap();
+        let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
+
+        let error = clean_one(&input, &out, "CLIP", &mut registry).unwrap_err();
+
+        assert!(
+            error.contains("Unsupported M4V variant"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("raw MPEG-4 video streams are not accepted"));
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+        assert!(registry.used.is_empty(), "invalid M4V burned an output ID");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mp4_format_regression() {
+        assert_format_cleaning("mp4");
+    }
+
+    #[test]
+    fn mov_format_regression() {
+        assert_format_cleaning("mov");
+    }
+
+    #[test]
+    fn m4v_iso_bmff_format_regression() {
+        assert_format_cleaning("m4v");
+    }
+
+    #[test]
+    fn mkv_format_regression() {
+        assert_format_cleaning("mkv");
+    }
+
+    #[test]
+    fn webm_format_regression() {
+        assert_format_cleaning("webm");
+    }
+
+    #[test]
+    fn avi_format_regression() {
+        assert_format_cleaning("avi");
     }
 
     #[test]
@@ -741,7 +1480,10 @@ mod tests {
         assert_eq!(sanitize_prefix("C:/x").unwrap(), "Cx");
         assert!(sanitize_prefix("   ").is_err());
         assert!(sanitize_prefix("/\\..").is_err());
-        assert_eq!(sanitize_prefix(&"A".repeat(200)).unwrap().len(), MAX_PREFIX_LEN);
+        assert_eq!(
+            sanitize_prefix(&"A".repeat(200)).unwrap().len(),
+            MAX_PREFIX_LEN
+        );
     }
 
     #[test]
@@ -869,7 +1611,11 @@ mod tests {
         // The fixture is worth nothing unless it really carries a data stream whose
         // payload is findable in the bytes.
         let kinds = stream_kinds(&input);
-        assert_eq!(kinds, ["Video", "Audio", "Data"], "unexpected fixture: {kinds:?}");
+        assert_eq!(
+            kinds,
+            ["Video", "Audio", "Data"],
+            "unexpected fixture: {kinds:?}"
+        );
         assert!(
             contains(&before, DATA_CANARY),
             "the fixture lost its data payload; the test would prove nothing"
@@ -901,9 +1647,20 @@ mod tests {
         };
         let video = hash(&input, "0:v:0");
         let audio = hash(&input, "0:a:0");
-        assert!(!video.is_empty() && !audio.is_empty(), "could not hash the source");
-        assert_eq!(video, hash(&cleaned, "0:v:0"), "video was not copied verbatim");
-        assert_eq!(audio, hash(&cleaned, "0:a:0"), "audio was not copied verbatim");
+        assert!(
+            !video.is_empty() && !audio.is_empty(),
+            "could not hash the source"
+        );
+        assert_eq!(
+            video,
+            hash(&cleaned, "0:v:0"),
+            "video was not copied verbatim"
+        );
+        assert_eq!(
+            audio,
+            hash(&cleaned, "0:a:0"),
+            "audio was not copied verbatim"
+        );
 
         // Tags and chapters are still stripped.
         let probe = ffmpeg()
@@ -917,7 +1674,11 @@ mod tests {
         assert!(!meta.contains("[chapter]"), "chapters survived: {meta}");
 
         // The original is untouched and nothing half-written is left behind.
-        assert_eq!(std::fs::read(&input).unwrap(), before, "the original changed");
+        assert_eq!(
+            std::fs::read(&input).unwrap(),
+            before,
+            "the original changed"
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&out)
             .unwrap()
             .flatten()
@@ -1017,10 +1778,16 @@ mod tests {
                     let id = stem.0.strip_prefix("CLIP_").expect("prefix missing");
                     assert_eq!(id.len(), 10, "{name}");
                     assert!(id.chars().all(|c| c.is_ascii_digit()), "{name}");
-                    assert!(ids.insert(id.to_string()), "duplicate id in one batch: {name}");
+                    assert!(
+                        ids.insert(id.to_string()),
+                        "duplicate id in one batch: {name}"
+                    );
                     assert!(out.join(name).is_file());
-                    let expected_ext =
-                        if result.input_name.ends_with(".mov") { "mov" } else { "mp4" };
+                    let expected_ext = if result.input_name.ends_with(".mov") {
+                        "mov"
+                    } else {
+                        "mp4"
+                    };
                     assert_eq!(stem.1, expected_ext, "{name}");
                 }
                 "error" => {
@@ -1039,7 +1806,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(produced.len(), 6, "{produced:?}");
-        assert!(produced.iter().all(|n| n.starts_with("CLIP_")), "{produced:?}");
+        assert!(
+            produced.iter().all(|n| n.starts_with("CLIP_")),
+            "{produced:?}"
+        );
 
         // Originals are untouched, byte for byte.
         for (path, original) in inputs.iter().zip(&before) {
@@ -1059,7 +1829,17 @@ mod tests {
             let out = ffmpeg()
                 .args(["-v", "error", "-i"])
                 .arg(p)
-                .args(["-map", "0", "-c", "copy", "-f", "streamhash", "-hash", "md5", "-"])
+                .args([
+                    "-map",
+                    "0",
+                    "-c",
+                    "copy",
+                    "-f",
+                    "streamhash",
+                    "-hash",
+                    "md5",
+                    "-",
+                ])
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -1092,9 +1872,13 @@ mod tests {
             output_directory: root.to_string_lossy().into_owned(),
         };
         write_settings(&legacy, &stored).unwrap();
-        std::fs::write(legacy.join("used-ids.txt"), "2267423415
+        std::fs::write(
+            legacy.join("used-ids.txt"),
+            "2267423415
 0000000007
-").unwrap();
+",
+        )
+        .unwrap();
 
         // Nothing on the new side yet: everything comes across.
         migrate_legacy_config(&current, &legacy).unwrap();
@@ -1103,7 +1887,10 @@ mod tests {
         assert_eq!(migrated.output_directory, stored.output_directory);
 
         let registry = IdRegistry::open(&current.join("used-ids.txt")).unwrap();
-        assert!(registry.used.contains(&2_267_423_415), "migrated id missing");
+        assert!(
+            registry.used.contains(&2_267_423_415),
+            "migrated id missing"
+        );
         assert!(registry.used.contains(&7), "migrated id missing");
         assert!(!registry.is_free(&current, "REEL", "mp4", 2_267_423_415));
         drop(registry);
@@ -1118,21 +1905,30 @@ mod tests {
             output_directory: root.to_string_lossy().into_owned(),
         };
         write_settings(&current, &newer).unwrap();
-        std::fs::write(current.join("used-ids.txt"), "0000000042
-").unwrap();
+        std::fs::write(
+            current.join("used-ids.txt"),
+            "0000000042
+",
+        )
+        .unwrap();
 
         migrate_legacy_config(&current, &legacy).unwrap();
         migrate_legacy_config(&current, &legacy).unwrap();
         assert_eq!(load_settings(&current).prefix, "CLIP");
         assert_eq!(
-            std::fs::read_to_string(current.join("used-ids.txt")).unwrap().trim(),
+            std::fs::read_to_string(current.join("used-ids.txt"))
+                .unwrap()
+                .trim(),
             "0000000042"
         );
 
         // No legacy folder at all is fine.
         let untouched = root.join("com.example.fresh");
         migrate_legacy_config(&untouched, &root.join("does-not-exist")).unwrap();
-        assert!(!untouched.exists(), "migration created a folder with nothing to migrate");
+        assert!(
+            !untouched.exists(),
+            "migration created a folder with nothing to migrate"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1171,4 +1967,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
-
