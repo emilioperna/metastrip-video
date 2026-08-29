@@ -256,9 +256,11 @@ export default function App() {
   const folderReady = settings?.outputDirectoryValid === true;
   const canClean = total > 0 && !running && folderReady && prefixValid;
   const selectedExtension = total > 0 ? fileExtension(files[0].name) : null;
-  const previewName = prefixValid
-    ? `${prefixDraft.trim()}_${previewId}.${selectedExtension ?? "[format]"}`
-    : "Enter a prefix";
+  const previewName = !prefixValid
+    ? "Enter a prefix"
+    : selectedExtension
+      ? `${prefixDraft.trim()}_${previewId}.${selectedExtension}`
+      : `${prefixDraft.trim()}_${previewId}`;
   const actionNote = !folderReady
     ? "Choose an available output folder to continue."
     : !prefixValid
