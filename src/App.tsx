@@ -259,8 +259,6 @@ export default function App() {
   const previewName = prefixValid
     ? `${prefixDraft.trim()}_${previewId}.${selectedExtension ?? "[format]"}`
     : "Enter a prefix";
-  const processingIndex = files.findIndex((file) => file.status === "processing");
-  const processingPosition = processingIndex >= 0 ? processingIndex + 1 : Math.min(done + 1, total);
   const actionNote = !folderReady
     ? "Choose an available output folder to continue."
     : !prefixValid
@@ -271,7 +269,7 @@ export default function App() {
     <main className={`app-shell app-shell--${phase}`} aria-busy={running}>
       <ProductHeader />
 
-      <div className="workflow-stage">
+      <div className={`workflow-stage${total === 0 ? " workflow-stage--empty" : ""}`}>
         {total === 0 ? (
           <DropZone dragging={dragging} formats={supportedFormats} onChoose={selectVideos} />
         ) : (
@@ -316,9 +314,9 @@ export default function App() {
             onPrefixCommit={commitPrefix}
           />
 
-          {total > 0 ? (
+          {total > 0 && !running ? (
             <div className="primary-action-row">
-              <p className={canClean || running ? "action-note" : "action-note action-note--warning"}>
+              <p className={canClean ? "action-note" : "action-note action-note--warning"}>
                 {actionNote}
               </p>
               <button
@@ -327,9 +325,7 @@ export default function App() {
                 onClick={cleanVideos}
                 disabled={!canClean}
               >
-                {running
-                  ? `Cleaning ${processingPosition} of ${total}`
-                  : `Clean ${total} ${total === 1 ? "video" : "videos"}`}
+                {`Clean ${total} ${total === 1 ? "video" : "videos"}`}
               </button>
             </div>
           ) : null}
