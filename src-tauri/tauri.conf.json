@@ -44,7 +44,7 @@
       "FFMPEG-LICENSE.txt"
     ],
     "publisher": "MetaStrip",
-    "shortDescription": "Fast, offline batch video metadata remover for MP4 and MOV.",
+    "shortDescription": "Fast, offline batch video metadata remover without re-encoding.",
     "createUpdaterArtifacts": true
   },
   "plugins": {

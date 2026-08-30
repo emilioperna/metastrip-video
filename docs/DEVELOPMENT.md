@@ -21,15 +21,15 @@ it once after cloning; it is a no-op if the right binary is already in place.
 ## Tests
 
 ```
-npm test                      # updater state logic (vitest)
-cd src-tauri && cargo test    # cleaning pipeline, ID registry, settings (12 tests)
+npm test                      # updater + frontend format logic (vitest)
+cd src-tauri && cargo test    # format matrix, cleaning pipeline, ID registry, settings
 ```
 
-The Rust tests build real MP4 fixtures with the bundled FFmpeg and run the actual
-cleaning path, so `npm run setup:ffmpeg` has to have run first. They cover the things
-that would be expensive to get wrong: that a success renames the temp file and leaves
-the original alone, that a failure publishes nothing, that IDs are never reused, that
-data tracks really are dropped, and that a legacy settings folder migrates exactly once.
+The Rust tests build real synthetic, container-specific fixtures with the bundled
+FFmpeg and run the actual cleaning path, so `npm run setup:ffmpeg` has to have run first.
+They cover the things that would be expensive to get wrong: metadata and chapter
+removal, encoded-stream identity, data-track removal, atomic output, ID reuse, and
+legacy settings migration.
 
 ## Building the installer
 
@@ -91,9 +91,21 @@ used and why.
 
 ## The cleaning pipeline
 
-The FFmpeg arguments are in `ffmpeg_args()`. They are documented in the
-[README](../README.md#how-it-works) and are effectively frozen: changing them changes
-what the product does, and every one of them is there for a reason a test enforces.
+`FORMAT_PROFILES` is the support contract: each accepted extension maps to an explicit
+container family and output muxer. `get_supported_formats()` exposes that same matrix
+to the frontend, so drag/drop validation, picker filters and user-facing copy do not
+carry a second extension list.
+
+The common FFmpeg arguments are in `ffmpeg_args()` and are effectively frozen: changing
+them changes what the product does, and every one of them is there for a reason a test
+enforces. ISO-BMFF profiles add faststart on the first attempt and may retry once
+without it. Other profiles never receive MOV options. AVI adds `-ignore_unknown`
+because FFmpeg exposes AVI data tracks as unknown streams; `-dn` still handles streams
+classified as data. M4V output explicitly selects the MP4 muxer because FFmpeg
+otherwise maps the `.m4v` suffix to a raw MPEG-4 video muxer; a bounded ISO-BMFF box
+check rejects raw M4V elementary streams before processing. No fallback ever replaces
+`-c copy` with an encoder.
+
 Arguments are passed straight to the process — no shell, no string concatenation.
 
 ### Atomic output

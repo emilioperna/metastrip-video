@@ -24,7 +24,7 @@ cd src-tauri && cargo check --all-targets && cargo test
 ```
 
 All of it should be green. The Rust tests need `npm run setup:ffmpeg` to have run, since
-they build real MP4 fixtures with the bundled FFmpeg.
+they build real container-specific fixtures with the bundled FFmpeg.
 
 ## What makes a good pull request
 
@@ -39,13 +39,18 @@ they build real MP4 fixtures with the bundled FFmpeg.
 
 ```
 -map 0 -c copy -map_metadata -1 -map_metadata:s -1 -map_chapters -1 -dn
--fflags +bitexact -movflags +faststart
+-fflags +bitexact
 ```
 
 Every one of those arguments is there for a reason, and a test enforces it. Changing
 them changes what the product does and what its output can be trusted to contain. If you
 believe one should change, open an issue first and make the case — with a file that
 demonstrates the problem, if you can share one safely.
+
+Container-specific options are equally deliberate. ISO-BMFF profiles first add
+`-movflags +faststart` and may retry once without it; other muxers never receive MOV
+options. AVI adds `-ignore_unknown` so AVI data tracks reported as unknown are dropped.
+No fallback is allowed to replace `-c copy` with an encoder.
 
 The same goes for the ID registry, the atomic-output logic, and the batch sequencing.
 
