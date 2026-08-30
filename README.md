@@ -1,7 +1,9 @@
 # MetaStrip Video — Video Metadata Remover
 
 > Fast, offline video metadata remover for Windows.
-> Strip metadata, chapters and data tracks from MP4 and MOV files without re-encoding.
+> Strip metadata, chapters and data tracks without re-encoding.
+>
+> **Supported:** MP4 · MOV · M4V · MKV · WebM · AVI
 
 [![Latest release](https://img.shields.io/github/v/release/emilioperna/metastrip-video?label=latest&color=2ea043)](https://github.com/emilioperna/metastrip-video/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -13,7 +15,7 @@
 **[Download MetaStrip Video for Windows →](https://github.com/emilioperna/metastrip-video/releases/latest)**
 Windows x86_64 · signed installer · FFmpeg bundled · no account
 
-![MetaStrip Video cleaning MP4 and MOV files on Windows](docs/assets/metastrip-video.png)
+![MetaStrip Video ready to clean MP4, MOV, M4V, MKV, WebM and AVI files](docs/assets/metastrip-video.png)
 
 <!-- Demo GIF goes here once recorded:
      ![Cleaning five videos with MetaStrip Video](docs/assets/demo.gif) -->
@@ -40,22 +42,24 @@ the metadata. Because the streams are copied rather than transcoded, cleaning is
 typically much faster than re-encoding, and the result looks exactly like the original.
 
 It is deliberately small: one window, one button, no project files and no settings page.
-And it is inspectable — the exact FFmpeg command it runs is
-[further down this page](#how-it-works), and the source is here to read.
+And it is inspectable — the FFmpeg strategy is documented
+[in this README](#how-it-works) and in
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and the source is here to read.
 
 ## Features
 
 - Batch up to **100 videos** at a time
-- **MP4 and MOV**
-- Removes global metadata, per-stream metadata, chapters and data tracks
-- **No video re-encoding**, no audio re-encoding
-- Original files are never modified or deleted
-- Automatic unique output names, so nothing overwrites anything
-- Output folder and file-name prefix are remembered between runs
-- Atomic writes: a crash can never leave a half-written file under a finished name
-- Works offline; **FFmpeg is bundled**, nothing to install separately
+- **MP4, MOV, M4V, MKV, WebM and AVI**
+- Removes global metadata
+- Removes per-stream metadata
+- Removes chapters where the container exposes them
+- Removes data and unknown metadata streams where the container exposes them
+- **No video re-encoding**
+- **No audio re-encoding**
+- Original files are left untouched
+- Atomic outputs: a failed run never leaves a partial file under a finished name
+- **FFmpeg is bundled**, nothing to install separately
 - **Signed automatic updates** through GitHub Releases
-- Single Windows installer
 
 ## Download
 
@@ -80,11 +84,15 @@ Prefer to build it yourself? See [Building from source](#building-from-source).
 4. Press **Clean**.
 5. The cleaned copies are in the folder you chose.
 
-Every output is named `PREFIX_##########.mp4`, where the ten digits are a random ID
-that is never reused — for example `VIDEO_0917283645.mp4`. The originals keep their
-own names, in their own folder, unchanged.
+Every output is named `PREFIX_##########.<original-extension>`, where the ten digits
+are a random ID that is never reused — for example `VIDEO_0917283645.mkv`. The output
+keeps the input extension, and the originals keep their own names in their own folder,
+unchanged.
 
 ## What gets removed?
+
+MetaStrip removes supported metadata structures exposed by each container profile.
+Not every container or input carries every structure listed below.
 
 | Removed | Examples |
 | --- | --- |
@@ -96,7 +104,8 @@ own names, in their own folder, unchanged.
 | Data tracks | GoPro `gpmd` telemetry, iPhone `mebx`, other timed-metadata streams |
 
 Data tracks are worth calling out: stripping the tags around such a track leaves the
-track itself, payload and all. MetaStrip drops the tracks too.
+track itself, payload and all. MetaStrip drops those tracks when the container exposes
+them as data or unknown metadata streams.
 
 ## What stays untouched?
 
@@ -138,23 +147,33 @@ Your settings survive updates — the prefix, output folder and used-ID registry
 
 ## Supported formats
 
-| | |
+| Format | Container strategy |
 | --- | --- |
-| Input | MP4, MOV |
-| Output | Same container as the input |
-| Platform | Windows 10/11, x86_64 |
+| MP4 | ISO-BMFF, stream copy |
+| MOV | QuickTime/MOV, stream copy |
+| M4V | ISO-BMFF M4V only, stream copy |
+| MKV | Matroska, stream copy |
+| WebM | WebM-compatible codecs, stream copy |
+| AVI | AVI, stream copy |
+
+Supported format does not mean arbitrary codecs can be remuxed into that container.
+If stream-copy is incompatible, MetaStrip fails that file rather than re-encoding it.
+
+The current build targets Windows 10/11 on x86_64.
 
 ## How it works
 
-Per file, the app runs the bundled FFmpeg once:
+For each file, MetaStrip invokes the bundled FFmpeg with this common stream-copy core:
 
 ```
 ffmpeg -n -i INPUT \
   -map 0 -c copy \
-  -map_metadata -1 -map_metadata:s -1 -map_chapters -1 \
+  -map_metadata -1 \
+  -map_metadata:s -1 \
+  -map_chapters -1 \
   -dn \
   -fflags +bitexact \
-  -movflags +faststart \
+  ...container-specific options... \
   OUTPUT
 ```
 
@@ -165,9 +184,18 @@ ffmpeg -n -i INPUT \
 - `-dn` drops data tracks. `-map 0` would otherwise copy them, and a data track is
   metadata in its own right.
 - `-fflags +bitexact` keeps FFmpeg from stamping its own version into the output.
-- `-movflags +faststart` moves the index to the front so the file starts playing
-  immediately when streamed. If a container rejects it, the file is retried once
-  without it rather than failing.
+
+Container-specific behaviour is explicit:
+
+- **MP4, MOV and M4V:** select the appropriate muxer, add `-movflags +faststart`, and
+  retry once without faststart if that first stream-copy attempt fails.
+- **MKV:** select the Matroska muxer; no MOV flags are passed.
+- **WebM:** select the WebM muxer; no MOV flags are passed. A codec that WebM cannot
+  stream-copy fails that file and is never transcoded.
+- **AVI:** select the AVI muxer and add the unknown-stream handling needed when AVI
+  exposes metadata streams that `-dn` cannot classify; no MOV flags are passed.
+- **M4V validation:** only ISO-BMFF M4V files are accepted. Raw MPEG-4 elementary
+  streams using the `.m4v` extension are rejected before processing.
 
 FFmpeg writes to a temporary name, and the file is renamed into place only after it
 exits successfully. An interrupted run can therefore leave a leftover temporary file,
@@ -180,18 +208,23 @@ More detail — the FFmpeg sidecar, the ID registry, stored state — is in
 ## Limitations
 
 - **Windows x86_64 only** today. The bundled FFmpeg is a Windows binary.
-- **MP4 and MOV only.**
-- MetaStrip removes what the pipeline above removes. It is **not a forensic
+- Supported containers are **MP4, MOV, M4V, MKV, WebM and AVI**.
+- A supported container does not guarantee arbitrary codec compatibility.
+- There is no transcoding fallback: incompatible stream-copy fails that file.
+- Raw MPEG-4 elementary streams using the `.m4v` extension are rejected; M4V support
+  is limited to ISO-BMFF files.
+- MetaStrip is **not a forensic
   anonymisation tool**, and makes no claim that a cleaned file is unidentifiable:
   encoder characteristics, frame content and the container structure all remain.
 - The output container is rewritten, so the file is not byte-identical to the input.
+- When processing succeeds, video and audio streams remain encoded as-is.
 
 ## Roadmap
 
 Nothing is promised, but these are the realistic next steps:
 
-- More container formats
-- An evaluation of macOS and Linux builds, which need their own FFmpeg sidecar
+- Additional formats only when they can meet the same regression standard
+- Evaluate macOS and Linux builds, which need their own FFmpeg sidecars
 
 ## Building from source
 
@@ -242,7 +275,7 @@ update check.
 
 **Do I need FFmpeg installed?** No, it is bundled with the app.
 
-**Which formats?** MP4 and MOV.
+**Which formats?** MP4, MOV, M4V, MKV, WebM and AVI.
 
 **Does it update itself?** Yes, through signed updates from GitHub Releases.
 
