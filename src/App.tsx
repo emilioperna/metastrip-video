@@ -22,6 +22,7 @@ import {
   supportedFormatLabels,
   type SupportedFormat,
 } from "./formats";
+import type { ScanView, VerificationReport } from "./privacy";
 import { statusText } from "./updater";
 import { useUpdater } from "./useUpdater";
 
@@ -34,7 +35,34 @@ type Progress = {
   outputName: string | null;
   status: Status;
   message: string | null;
+  verification: VerificationReport | null;
 };
+
+type ScanProgress = {
+  index: number;
+  total: number;
+  view: ScanView;
+};
+
+/** A placeholder result for a file whose scan never produced one. */
+function emptyScan(path: string, name: string): ScanView {
+  return {
+    path,
+    name,
+    ok: false,
+    error: null,
+    summary: { total: 0, high: 0, medium: 0, low: 0 },
+    findings: [],
+    container: null,
+    durationSeconds: null,
+    videoStreams: 0,
+    audioStreams: 0,
+    otherStreams: 0,
+    chapterCount: 0,
+    fieldCount: 0,
+    plan: null,
+  };
+}
 
 function baseName(path: string) {
   const parts = path.split(/[\\/]/);
@@ -58,11 +86,16 @@ export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [prefixDraft, setPrefixDraft] = useState("");
   const [previewId] = useState(demoId);
+  // At most one row is open at a time. With a hundred files, letting every row
+  // expand at once is what turns a usable list into an unreadable wall.
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   // Native listeners are registered once and read changing values through refs.
   const phaseRef = useRef<Phase>("idle");
   phaseRef.current = phase;
   const supportedFormatsRef = useRef<SupportedFormat[]>([]);
+  // Paths already sent to the scanner, so re-adding a file does not re-probe it.
+  const scannedPaths = useRef<Set<string>>(new Set());
 
   function addPaths(paths: string[]) {
     if (phaseRef.current === "running") return;
@@ -77,11 +110,20 @@ export default function App() {
       const known = new Set(previous.map((file) => file.path));
       const fresh = accepted
         .filter((path) => !known.has(path))
-        .map((path) => ({ path, name: baseName(path), status: "ready" as Status }));
+        .map((path) => ({
+          path,
+          name: baseName(path),
+          status: "ready" as Status,
+          scanState: "pending" as const,
+        }));
+      // Re-adding clears any previous run's result but keeps the scan already
+      // paid for: the file on disk has not changed just because the queue did.
       const reset = previous.map((file) => ({
         path: file.path,
         name: file.name,
         status: "ready" as Status,
+        scanState: file.scanState,
+        scan: file.scan,
       }));
       const merged = [...reset, ...fresh];
       const capped = merged.slice(0, MAX_FILES);
@@ -106,11 +148,51 @@ export default function App() {
     setDone(0);
     setSummary(null);
     setError(null);
+    setExpanded(null);
+
+    const fresh = accepted.filter((path) => !scannedPaths.current.has(path));
+    if (fresh.length > 0) void scanPaths(fresh.slice(0, MAX_FILES));
+  }
+
+  /**
+   * Inspect newly added files. Results stream back through `scan-progress`, so
+   * rows fill in as they land rather than all at the end.
+   *
+   * A scan never blocks cleaning: a file that cannot be inspected is marked and
+   * the batch carries on.
+   */
+  async function scanPaths(paths: string[]) {
+    for (const path of paths) scannedPaths.current.add(path);
+    setFiles((previous) =>
+      previous.map((file) =>
+        paths.includes(file.path) ? { ...file, scanState: "scanning" as const } : file,
+      ),
+    );
+    try {
+      await invoke<ScanView[]>("scan_videos", { paths });
+    } catch (reason) {
+      // The whole scan failed (no ffprobe, batch too large). Mark exactly the
+      // files this call owned, so an earlier successful scan is not discarded.
+      const message = String(reason);
+      for (const path of paths) scannedPaths.current.delete(path);
+      setFiles((previous) =>
+        previous.map((file) =>
+          paths.includes(file.path)
+            ? {
+                ...file,
+                scanState: "failed" as const,
+                scan: { ...emptyScan(file.path, file.name), error: message },
+              }
+            : file,
+        ),
+      );
+    }
   }
 
   useEffect(() => {
     let unlistenDrag: (() => void) | undefined;
     let unlistenProgress: (() => void) | undefined;
+    let unlistenScan: (() => void) | undefined;
 
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -136,6 +218,7 @@ export default function App() {
                 status: payload.status,
                 outputName: payload.outputName ?? undefined,
                 message: payload.message ?? undefined,
+                verification: payload.verification ?? undefined,
               }
             : file,
         ),
@@ -143,6 +226,23 @@ export default function App() {
       if (payload.status !== "processing") setDone(payload.index + 1);
     }).then((unlisten) => {
       unlistenProgress = unlisten;
+    });
+
+    listen<ScanProgress>("scan-progress", ({ payload }) => {
+      // Matched by path, not index: the queue can change while a scan runs.
+      setFiles((previous) =>
+        previous.map((file) =>
+          file.path === payload.view.path
+            ? {
+                ...file,
+                scanState: payload.view.ok ? ("done" as const) : ("failed" as const),
+                scan: payload.view,
+              }
+            : file,
+        ),
+      );
+    }).then((unlisten) => {
+      unlistenScan = unlisten;
     });
 
     invoke<string | null>("check_ffmpeg")
@@ -169,6 +269,7 @@ export default function App() {
     return () => {
       unlistenDrag?.();
       unlistenProgress?.();
+      unlistenScan?.();
     };
   }, []);
 
@@ -217,11 +318,15 @@ export default function App() {
     setError(null);
     setNotice(null);
     setSummary(null);
+    setExpanded(null);
     setFiles((previous) =>
       previous.map((file) => ({
         path: file.path,
         name: file.name,
-        status: "ready",
+        status: "ready" as Status,
+        // The scan is still valid; only the previous run's outcome is dropped.
+        scanState: file.scanState,
+        scan: file.scan,
       })),
     );
 
@@ -246,6 +351,8 @@ export default function App() {
     setSummary(null);
     setError(null);
     setNotice(null);
+    setExpanded(null);
+    scannedPaths.current.clear();
   }
 
   const running = phase === "running";
@@ -280,6 +387,8 @@ export default function App() {
             phase={phase}
             done={done}
             dragging={dragging}
+            expanded={expanded}
+            onToggle={(path) => setExpanded((current) => (current === path ? null : path))}
             onAdd={selectVideos}
             onClear={reset}
           />
