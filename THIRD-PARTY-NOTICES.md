@@ -6,23 +6,28 @@ MetaStrip Video redistributes and reuses the components listed below.
 
 ## FFmpeg
 
-`ffmpeg.exe` is shipped inside the application folder and is executed as a separate
-process, invoked with command-line arguments. It is not linked into
-`metastrip-video.exe` in any form — no headers, no libraries, no shared address
-space.
+`ffmpeg.exe` and `ffprobe.exe` are shipped inside the application folder and are
+executed as separate processes, invoked with command-line arguments. Neither is
+linked into `metastrip-video.exe` in any form — no headers, no libraries, no shared
+address space.
 
 - **Project:** FFmpeg — https://ffmpeg.org
-- **Version shipped:** `n8.1.2-44-g7c533d0f86` (x86_64, Windows)
+- **Version shipped:** `n8.1.2-50-g1a748fe2cd` (x86_64, Windows)
 - **License:** GNU Lesser General Public License, version 3 or later (LGPL v3+).
   Full text: `FFMPEG-LICENSE.txt`, installed next to the application.
-- **Build used:** the prebuilt `win64-lgpl` binary from the BtbN/FFmpeg-Builds
+- **Build used:** the prebuilt `win64-lgpl` binaries from the BtbN/FFmpeg-Builds
   project, pinned to an immutable release tag:
-  https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-24-13-10
-  (`ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-8.1.zip`)
+  https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-31-13-27
+  (`ffmpeg-n8.1.2-50-g1a748fe2cd-win64-lgpl-8.1.zip`)
+- **SHA-256 of the pinned archive:**
+  `f6274bbd9c247f9e90c1bbed066b03ed4a3907cece2fb91be6dd352393936365`
 - **SHA-256 of the shipped `ffmpeg.exe`:**
-  `5346a1daac36a23b4797e33e5c15e0d477e88cbd24b947f288c8607df89cb850`
-  — verified by `scripts/setup-ffmpeg.ps1` on every fetch.
-- **Modifications:** none. The executable is redistributed byte-for-byte as published
+  `9c60da6c0b083110d59084ea39f60ae149aa3e031c3b4bb4f573fafa1c1e7cea`
+- **SHA-256 of the shipped `ffprobe.exe`:**
+  `67176fa62f89f94c3bcd379fd05677a25651569a2eb8880ec2194e62c82be412`
+  — all three verified by `scripts/setup-ffmpeg.ps1` on every fetch. Both executables
+  come out of that one archive, so they are always the same FFmpeg build.
+- **Modifications:** none. The executables are redistributed byte-for-byte as published
   upstream.
 - **Source code:** https://github.com/FFmpeg/FFmpeg at the tag matching the version
   above, and https://ffmpeg.org/download.html
@@ -42,11 +47,11 @@ alongside the app would not by itself make the app GPL. The LGPL build simply av
 having to make that argument at all, and costs nothing: the app only ever runs FFmpeg
 with `-c copy`, so no encoder is needed.
 
-The shipped `ffmpeg.exe` is a static build — that describes how the FFmpeg project's
-own `libav*` libraries are linked into its own command-line tool, both sides being
+The shipped executables are static builds — that describes how the FFmpeg project's
+own `libav*` libraries are linked into its own command-line tools, both sides being
 FFmpeg's LGPL code. It does not mean FFmpeg is statically linked into MetaStrip Video. The
 practical obligation for redistribution is what is already satisfied above: state the
-version, keep the binary unmodified, ship the licence text, and point at the
+version, keep the binaries unmodified, ship the licence text, and point at the
 corresponding sources.
 
 *None of this is legal advice.*

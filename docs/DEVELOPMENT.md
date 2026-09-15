@@ -63,14 +63,21 @@ splitting it would cost more in navigation than it saves.
 
 ## Bundled FFmpeg
 
-`ffmpeg.exe` is declared as a Tauri `externalBin` sidecar in `src-tauri/tauri.conf.json`,
-so the bundler copies it next to the app executable in the install directory.
+`ffmpeg.exe` and `ffprobe.exe` are declared as Tauri `externalBin` sidecars in
+`src-tauri/tauri.conf.json`, so the bundler copies both next to the app executable in
+the install directory.
 
-The binary itself is **not committed** — `src-tauri/binaries/*.exe` is gitignored.
-`scripts/setup-ffmpeg.ps1` fetches it from a pinned, immutable BtbN release tag and
-verifies the SHA-256 of both the archive and the extracted executable, so every machine
-and every release build gets byte-identical FFmpeg. To move to another version, update
-the constants at the top of that script.
+The binaries themselves are **not committed** — `src-tauri/binaries/*.exe` is gitignored.
+`scripts/setup-ffmpeg.ps1` fetches them from a pinned, immutable BtbN release tag and
+verifies the SHA-256 of the archive and of each extracted executable, so every machine
+and every release build gets byte-identical FFmpeg tools. Both come out of the same
+archive, which is what keeps them from drifting to different FFmpeg builds. To move to
+another version, update the constants and the `$Sidecars` table at the top of that
+script.
+
+Pin an **end-of-month** autobuild tag. BtbN keeps daily builds for roughly two weeks and
+one build per month after that, so a mid-month tag stops resolving within weeks and every
+clean clone and CI run then fails at `npm run setup:ffmpeg`.
 
 At runtime `ffmpeg_program()` in `src-tauri/src/lib.rs` resolves FFmpeg in this order:
 
@@ -85,9 +92,10 @@ At runtime `ffmpeg_program()` in `src-tauri/src/lib.rs` resolves FFmpeg in this 
 A release build never falls back to the PATH: if its own sidecar is missing that means
 a broken install, and the app says so rather than silently using some other FFmpeg.
 
-Only `ffmpeg` is bundled. `ffprobe` is not used by the app and is deliberately not
-shipped. See [`../THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md) for which build is
-used and why.
+`ffprobe.exe` is bundled by the same `externalBin` mechanism and lands in the same
+folder, but nothing in the Rust code resolves or runs it yet — it ships ahead of the
+inspection work that will use it. See
+[`../THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md) for which build is used and why.
 
 ## The cleaning pipeline
 

@@ -37,17 +37,19 @@ jobs:
       - name: Check version matches the tag
         run: node scripts/check-version.mjs ${{ github.ref_name }}
 
-      # ffmpeg.exe is not in git. This fetches the pinned build and verifies its
-      # SHA-256 before Tauri looks for the sidecar.
+      # The sidecars are not in git. This fetches the pinned build and verifies
+      # the SHA-256 of each executable before Tauri looks for them.
       - name: Fetch the bundled FFmpeg
         run: npm run setup:ffmpeg
 
-      - name: Verify the sidecar is in place
+      - name: Verify the sidecars are in place
         shell: pwsh
         run: |
-          $sidecar = "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
-          if (-not (Test-Path $sidecar)) { throw "missing sidecar: $sidecar" }
-          "$sidecar $((Get-Item $sidecar).Length) bytes"
+          foreach ($name in "ffmpeg", "ffprobe") {
+            $sidecar = "src-tauri/binaries/$name-x86_64-pc-windows-msvc.exe"
+            if (-not (Test-Path $sidecar)) { throw "missing sidecar: $sidecar" }
+            "$sidecar $((Get-Item $sidecar).Length) bytes"
+          }
 
       - run: npm run build
 
