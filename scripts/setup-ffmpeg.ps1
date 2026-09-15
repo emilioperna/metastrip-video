@@ -1,22 +1,43 @@
-# Fetches the FFmpeg binary that this app bundles as a Tauri sidecar.
-# The binary is not in git; run this once after cloning.
+# Fetches the FFmpeg binaries that this app bundles as Tauri sidecars.
+# They are not in git; run this once after cloning.
 #
 # Pinned to an immutable BtbN autobuild tag and checked by SHA-256, so every
-# machine and every release build ships byte-identical FFmpeg.
+# machine and every release build ships byte-identical binaries. `ffmpeg.exe` and
+# `ffprobe.exe` are extracted from the same archive, so the two can never drift
+# to different FFmpeg builds.
+#
+# BtbN keeps daily autobuilds for about two weeks and one build per month after
+# that. Pin an end-of-month tag: a mid-month one is pruned upstream within weeks
+# and every clean clone and CI run then fails to fetch it.
 
 $ErrorActionPreference = "Stop"
 
-$Version   = "n8.1.2-44-g7c533d0f86"
-$Tag       = "autobuild-2026-08-24-13-10"
-$Asset     = "ffmpeg-$Version-win64-lgpl-8.1.zip"
-$Url       = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$Tag/$Asset"
-$ZipSha    = "5CA909AC2A46635BA4F21E5C04861825132FCF8B8C263B20793D79933E2DA5D1"
-$FfmpegSha = "5346A1DAAC36A23B4797E33E5C15E0D477E88CBD24B947F288C8607DF89CB850"
+$Version = "n8.1.2-50-g1a748fe2cd"
+$Tag     = "autobuild-2026-08-31-13-27"
+$Asset   = "ffmpeg-$Version-win64-lgpl-8.1.zip"
+$Url     = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$Tag/$Asset"
+$ZipSha  = "F6274BBD9C247F9E90C1BBED066B03ED4A3907CECE2FB91BE6DD352393936365"
 
 $Root    = Split-Path -Parent $PSScriptRoot
 $BinDir  = Join-Path $Root "src-tauri\binaries"
-$Target  = Join-Path $BinDir "ffmpeg-x86_64-pc-windows-msvc.exe"
 $License = Join-Path $Root "src-tauri\FFMPEG-LICENSE.txt"
+
+# Every sidecar bundled by `externalBin` in src-tauri/tauri.conf.json, with the
+# SHA-256 of that executable as published inside the pinned archive. Tauri
+# resolves an `externalBin` entry by appending the target triple, which is what
+# the installed names carry.
+$Sidecars = @(
+  @{
+    Name   = "ffmpeg.exe"
+    Target = "ffmpeg-x86_64-pc-windows-msvc.exe"
+    Sha    = "9C60DA6C0B083110D59084EA39F60AE149AA3E031C3B4BB4F573FAFA1C1E7CEA"
+  },
+  @{
+    Name   = "ffprobe.exe"
+    Target = "ffprobe-x86_64-pc-windows-msvc.exe"
+    Sha    = "67176FA62F89F94C3BCD379FD05677A25651569A2EB8880EC2194E62C82BE412"
+  }
+)
 
 # Hashing and unzipping go straight to .NET rather than through Get-FileHash and
 # Expand-Archive. Those live in modules that have to be autoloaded, and on the
@@ -41,8 +62,13 @@ function Expand-Zip($zipPath, $destination) {
   [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $destination)
 }
 
-if ((Test-Path $Target) -and (Sha256 $Target) -eq $FfmpegSha) {
-  Write-Host "ffmpeg $Version already present and verified."
+function Test-Sidecar($sidecar) {
+  $path = Join-Path $BinDir $sidecar.Target
+  return (Test-Path $path) -and (Sha256 $path) -eq $sidecar.Sha
+}
+
+if (@($Sidecars | Where-Object { -not (Test-Sidecar $_) }).Count -eq 0) {
+  Write-Host "ffmpeg $Version already present and verified ($($Sidecars.Count) sidecars)."
   exit 0
 }
 
@@ -64,20 +90,24 @@ try {
   Write-Host "Archive checksum OK."
 
   Expand-Zip $zip $work
-  $src = Get-ChildItem -Path $work -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
-  if (-not $src) { throw "ffmpeg.exe not found inside $Asset" }
 
-  $got = Sha256 $src.FullName
-  if ($got -ne $FfmpegSha) {
-    throw "SHA-256 mismatch for ffmpeg.exe: expected $FfmpegSha, got $got"
+  # Each executable is verified against its own pinned hash before it is copied,
+  # so a correct archive containing an unexpected binary still fails here.
+  foreach ($sidecar in $Sidecars) {
+    $src = Get-ChildItem -Path $work -Recurse -Filter $sidecar.Name | Select-Object -First 1
+    if (-not $src) { throw "$($sidecar.Name) not found inside $Asset" }
+
+    $got = Sha256 $src.FullName
+    if ($got -ne $sidecar.Sha) {
+      throw "SHA-256 mismatch for $($sidecar.Name): expected $($sidecar.Sha), got $got"
+    }
+
+    Copy-Item $src.FullName (Join-Path $BinDir $sidecar.Target) -Force
+    Write-Host "Installed $($sidecar.Name) $Version -> $($sidecar.Target)"
   }
-
-  Copy-Item $src.FullName $Target -Force
 
   $lic = Get-ChildItem -Path $work -Recurse -Filter "LICENSE.txt" | Select-Object -First 1
   if ($lic) { Copy-Item $lic.FullName $License -Force }
-
-  Write-Host "Installed ffmpeg $Version -> $Target"
 }
 finally {
   Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue

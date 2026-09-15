@@ -237,7 +237,7 @@ npm run tauri dev
 ```
 
 You need Node.js, npm and a Rust toolchain (MSVC, x86_64). `npm run setup:ffmpeg`
-fetches the pinned FFmpeg binary that gets bundled into the app; it is not stored in
+fetches the pinned FFmpeg binaries that get bundled into the app; they are not stored in
 git. To build the installer:
 
 ```
