@@ -35,7 +35,7 @@ use std::path::Path;
 
 use crate::inspect::{inspect, MetadataReport, StreamKind};
 use crate::plan::CleaningPlan;
-use crate::privacy::{classify, PrivacyFinding, Severity};
+use crate::privacy::{classify, is_technical_field, PrivacyFinding, Severity};
 
 /// One named check with its outcome. Sent to the UI as-is so a failure can say
 /// exactly which promise was not kept.
@@ -53,7 +53,12 @@ pub struct VerificationReport {
     pub verified: bool,
     pub checks: Vec<VerificationCheck>,
     /// Counts the completion screen shows, all measured rather than predicted.
+    /// `fields_removed` is every metadata field; the two below split it into
+    /// privacy fields and technical (structural) fields, each measured on its
+    /// own, so container bookkeeping is never reported as privacy removed.
     pub fields_removed: usize,
+    pub privacy_fields_removed: usize,
+    pub technical_fields_removed: usize,
     pub chapters_removed: usize,
     pub data_streams_removed: usize,
     /// Findings that survived into the output, if any. Empty on a pass except
@@ -73,6 +78,8 @@ pub struct BeforeAfterRow {
     pub before: &'static str,
     pub after: &'static str,
     pub removed: bool,
+    /// Structural rows are technical metadata, shown apart from privacy rows.
+    pub technical: bool,
 }
 
 /// Facts about the original captured before cleaning, so "the original was not
@@ -133,6 +140,7 @@ fn before_after(before: &[PrivacyFinding], after: &[PrivacyFinding]) -> Vec<Befo
             before: "Present",
             after: if survived { "Present" } else { "Removed" },
             removed: !survived,
+            technical: finding.category.is_structural(),
         });
     }
     rows
@@ -181,6 +189,8 @@ pub fn verify(
             verified: false,
             checks,
             fields_removed: 0,
+            privacy_fields_removed: 0,
+            technical_fields_removed: 0,
             chapters_removed: 0,
             data_streams_removed: 0,
             residual: Vec::new(),
@@ -381,11 +391,24 @@ pub fn verify(
     ));
 
     let fields_removed = before.fields.len().saturating_sub(after.fields.len());
+    let technical_count = |report: &MetadataReport| {
+        report
+            .fields
+            .iter()
+            .filter(|f| is_technical_field(f))
+            .count()
+    };
+    let (before_technical, after_technical) = (technical_count(before), technical_count(&after));
+    let privacy_fields_removed = (before.fields.len() - before_technical)
+        .saturating_sub(after.fields.len() - after_technical);
+    let technical_fields_removed = before_technical.saturating_sub(after_technical);
 
     VerificationReport {
         verified: checks.iter().all(|c| c.passed),
         checks,
         fields_removed,
+        privacy_fields_removed,
+        technical_fields_removed,
         chapters_removed,
         data_streams_removed: data_removed,
         residual: survivors,

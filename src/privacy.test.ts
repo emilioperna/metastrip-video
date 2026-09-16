@@ -7,7 +7,10 @@ import {
   findingsLabel,
   formatDuration,
   groupFindings,
+  isTechnical,
+  partitionFindings,
   summarise,
+  technicalLabel,
   topSeverity,
   type PrivacyFinding,
   type ScanView,
@@ -33,6 +36,18 @@ function finding(
   };
 }
 
+/** The summary the backend sends: `PrivacySummary::of` in `privacy.rs`. */
+function backendSummary(findings: PrivacyFinding[]) {
+  const privacy = findings.filter((f) => f.category !== "structural");
+  return {
+    total: privacy.length,
+    high: privacy.filter((f) => f.severity === "high").length,
+    medium: privacy.filter((f) => f.severity === "medium").length,
+    low: privacy.filter((f) => f.severity === "low").length,
+    technical: findings.length - privacy.length,
+  };
+}
+
 function scan(overrides: Partial<ScanView> = {}): ScanView {
   const findings = overrides.findings ?? [];
   return {
@@ -40,12 +55,7 @@ function scan(overrides: Partial<ScanView> = {}): ScanView {
     name: "v.mp4",
     ok: true,
     error: null,
-    summary: {
-      total: findings.length,
-      high: findings.filter((f) => f.severity === "high").length,
-      medium: findings.filter((f) => f.severity === "medium").length,
-      low: findings.filter((f) => f.severity === "low").length,
-    },
+    summary: backendSummary(findings),
     findings,
     container: "mov,mp4",
     durationSeconds: 12,
@@ -91,24 +101,137 @@ describe("summarise", () => {
 
   it("handles an empty batch", () => {
     const batch = summarise([]);
-    expect(batch).toEqual({ total: 0, high: 0, medium: 0, low: 0, scanned: 0, failed: 0, filesWithHigh: 0 });
+    expect(batch).toEqual({
+      total: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      technical: 0,
+      scanned: 0,
+      failed: 0,
+      filesWithHigh: 0,
+    });
+  });
+
+  it("keeps structural fields out of the batch privacy totals", () => {
+    const structural = (key: string) => finding("Structural", "low", key, key);
+    const batch = summarise([
+      scan({
+        findings: [
+          finding("Timestamp", "medium", "creation_time"),
+          finding("Software", "low", "encoder"),
+          structural("major_brand"),
+          structural("minor_version"),
+          structural("handler_name"),
+          structural("language"),
+        ],
+      }),
+      scan({ findings: [structural("major_brand"), structural("handler_name")] }),
+    ]);
+
+    expect(batch.total).toBe(2);
+    expect(batch.medium).toBe(1);
+    expect(batch.low).toBe(1);
+    expect(batch.high + batch.medium + batch.low).toBe(batch.total);
+    expect(batch.technical).toBe(6);
+  });
+});
+
+describe("technical metadata", () => {
+  const structural = (key: string) => finding("Structural", "low", key, key);
+
+  it("recognises only the structural category as technical", () => {
+    expect(isTechnical(structural("major_brand"))).toBe(true);
+    for (const label of [
+      "Location",
+      "Device",
+      "Timestamp",
+      "Software",
+      "CreatorIdentity",
+      "Telemetry",
+      "Identifier",
+      "Copyright",
+      "Unknown",
+    ]) {
+      expect(isTechnical(finding(label, "low"))).toBe(false);
+    }
+  });
+
+  it("excludes structural fields from the single-file privacy summary", () => {
+    const view = scan({
+      findings: [
+        finding("Timestamp", "medium", "creation_time"),
+        finding("Device", "medium", "make"),
+        finding("Identifier", "medium", "uuid"),
+        finding("Software", "low", "encoder"),
+        structural("handler_name"),
+        structural("language"),
+        structural("major_brand"),
+        structural("minor_version"),
+        structural("compatible_brands"),
+        structural("vendor_id"),
+        structural("duration"),
+      ],
+    });
+
+    expect(view.summary).toEqual({ total: 4, high: 0, medium: 3, low: 1, technical: 7 });
+    expect(findingsLabel(view.summary)).toBe("4 privacy findings");
+    expect(technicalLabel(view.summary.technical)).toBe("7 technical fields");
+    expect(topSeverity(view.summary)).toBe("medium");
+  });
+
+  it("shows zero privacy findings for a file with only structural metadata", () => {
+    const view = scan({ findings: [structural("major_brand"), structural("handler_name")] });
+
+    expect(view.summary.total).toBe(0);
+    expect(topSeverity(view.summary)).toBeNull();
+    expect(findingsLabel(view.summary)).toBe("No privacy findings");
+    expect(technicalLabel(view.summary.technical)).toBe("2 technical fields");
+  });
+
+  it("keeps structural metadata visible in the expanded details", () => {
+    const findings = [
+      finding("Location", "high", "location"),
+      structural("handler_name"),
+      finding("Software", "low", "encoder"),
+      structural("language"),
+    ];
+    const { privacy, technical } = partitionFindings(findings);
+
+    expect(privacy.map((f) => f.categoryLabel)).toEqual(["Location", "Software"]);
+    expect(technical.map((f) => f.sourceKey)).toEqual(["handler_name", "language"]);
+    expect(privacy.length + technical.length).toBe(findings.length);
+    const groups = groupFindings(technical);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].items).toHaveLength(2);
+  });
+
+  it("labels technical counts only when there are some", () => {
+    expect(technicalLabel(0)).toBeNull();
+    expect(technicalLabel(1)).toBe("1 technical field");
   });
 });
 
 describe("topSeverity", () => {
   it("reports the worst severity present", () => {
-    expect(topSeverity({ total: 3, high: 1, medium: 1, low: 1 })).toBe("high");
-    expect(topSeverity({ total: 2, high: 0, medium: 1, low: 1 })).toBe("medium");
-    expect(topSeverity({ total: 1, high: 0, medium: 0, low: 1 })).toBe("low");
-    expect(topSeverity({ total: 0, high: 0, medium: 0, low: 0 })).toBeNull();
+    expect(topSeverity({ total: 3, high: 1, medium: 1, low: 1, technical: 0 })).toBe("high");
+    expect(topSeverity({ total: 2, high: 0, medium: 1, low: 1, technical: 0 })).toBe("medium");
+    expect(topSeverity({ total: 1, high: 0, medium: 0, low: 1, technical: 0 })).toBe("low");
+    expect(topSeverity({ total: 0, high: 0, medium: 0, low: 0, technical: 0 })).toBeNull();
+    // Technical fields never raise the severity.
+    expect(topSeverity({ total: 0, high: 0, medium: 0, low: 0, technical: 9 })).toBeNull();
   });
 });
 
 describe("findingsLabel", () => {
   it("is singular, plural or explicit about finding nothing", () => {
-    expect(findingsLabel({ total: 0, high: 0, medium: 0, low: 0 })).toBe("No metadata found");
-    expect(findingsLabel({ total: 1, high: 1, medium: 0, low: 0 })).toBe("1 finding");
-    expect(findingsLabel({ total: 6, high: 1, medium: 2, low: 3 })).toBe("6 findings");
+    const empty = { total: 0, high: 0, medium: 0, low: 0, technical: 0 };
+    expect(findingsLabel(empty)).toBe("No metadata found");
+    expect(findingsLabel({ ...empty, technical: 3 })).toBe("No privacy findings");
+    expect(findingsLabel({ ...empty, total: 1, high: 1 })).toBe("1 privacy finding");
+    expect(findingsLabel({ ...empty, total: 6, high: 1, medium: 2, low: 3 })).toBe(
+      "6 privacy findings",
+    );
   });
 });
 

@@ -219,6 +219,16 @@ Timestamp, Software, CreatorIdentity, Telemetry, Identifier, Copyright,
 Structural and Unknown; severity is LOW / MEDIUM / HIGH and comes from the rule
 that matched, so every finding can be explained by pointing at one line.
 
+**Structural is technical metadata, not a privacy finding.** Container
+bookkeeping (`major_brand`, `minor_version`, `compatible_brands`, `handler_name`,
+`language`, `vendor_id`, …) keeps its rule and stays in the finding list, but
+`PrivacySummary` counts it only in `technical`: it never contributes to the
+privacy `total` or to the HIGH / MEDIUM / LOW figures, per file or per batch.
+The UI shows it in a separate, lower-emphasis "Technical metadata" section with a
+neutral `TECHNICAL` tag instead of a severity, and the completion screen reports
+privacy fields removed and technical fields removed separately. Unknown keeps
+its current semantics and still counts as a privacy finding.
+
 Matching is layered rather than substring, and the most specific match wins:
 
 | Kind | Matches | Why |

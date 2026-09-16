@@ -23,11 +23,18 @@ export type PrivacyFinding = {
   sourceKey: string;
 };
 
+/**
+ * `total`, `high`, `medium` and `low` count privacy findings only. Structural
+ * findings (container bookkeeping such as `major_brand` or `handler_name`) are
+ * technical metadata and are counted in `technical`, never in the privacy
+ * figures. The backend computes this; the frontend only adds it up.
+ */
 export type PrivacySummary = {
   total: number;
   high: number;
   medium: number;
   low: number;
+  technical: number;
 };
 
 export type CleaningPlan = {
@@ -72,12 +79,15 @@ export type BeforeAfterRow = {
   before: string;
   after: string;
   removed: boolean;
+  technical: boolean;
 };
 
 export type VerificationReport = {
   verified: boolean;
   checks: VerificationCheck[];
   fieldsRemoved: number;
+  privacyFieldsRemoved: number;
+  technicalFieldsRemoved: number;
   chaptersRemoved: number;
   dataStreamsRemoved: number;
   residual: PrivacyFinding[];
@@ -87,7 +97,35 @@ export type VerificationReport = {
 /** Scan state of one queued file, tracked separately from cleaning status. */
 export type ScanState = "pending" | "scanning" | "done" | "failed";
 
-export const EMPTY_SUMMARY: PrivacySummary = { total: 0, high: 0, medium: 0, low: 0 };
+export const EMPTY_SUMMARY: PrivacySummary = {
+  total: 0,
+  high: 0,
+  medium: 0,
+  low: 0,
+  technical: 0,
+};
+
+/** The backend's serialised name for the one technical category. */
+export const TECHNICAL_CATEGORY = "structural";
+
+/** Structural metadata is technical, not a privacy finding. */
+export function isTechnical(finding: Pick<PrivacyFinding, "category">): boolean {
+  return finding.category === TECHNICAL_CATEGORY;
+}
+
+/** Splits a finding list for the expanded view, preserving order. */
+export function partitionFindings(findings: PrivacyFinding[]): {
+  privacy: PrivacyFinding[];
+  technical: PrivacyFinding[];
+} {
+  const privacy: PrivacyFinding[] = [];
+  const technical: PrivacyFinding[] = [];
+  for (const finding of findings) {
+    if (isTechnical(finding)) technical.push(finding);
+    else privacy.push(finding);
+  }
+  return { privacy, technical };
+}
 
 /**
  * Batch totals. Only successfully scanned files contribute; a file that could
@@ -117,6 +155,7 @@ export function summarise(scans: Iterable<ScanView>): BatchSummary {
     batch.high += scan.summary.high;
     batch.medium += scan.summary.medium;
     batch.low += scan.summary.low;
+    batch.technical += scan.summary.technical;
     if (scan.summary.high > 0) batch.filesWithHigh += 1;
   }
   return batch;
@@ -133,10 +172,21 @@ export function topSeverity(summary: PrivacySummary): Severity | null {
   return null;
 }
 
-/** `6 findings` / `1 finding` / `No metadata found`. */
+/**
+ * `4 privacy findings` / `1 privacy finding`, `No privacy findings` when only
+ * technical metadata is present, and `No metadata found` when there is nothing.
+ */
 export function findingsLabel(summary: PrivacySummary): string {
-  if (summary.total === 0) return "No metadata found";
-  return `${summary.total} ${summary.total === 1 ? "finding" : "findings"}`;
+  if (summary.total === 0) {
+    return summary.technical > 0 ? "No privacy findings" : "No metadata found";
+  }
+  return `${summary.total} privacy ${summary.total === 1 ? "finding" : "findings"}`;
+}
+
+/** `7 technical fields`, or null when there are none. Secondary copy only. */
+export function technicalLabel(count: number): string | null {
+  if (count <= 0) return null;
+  return `${count} technical ${count === 1 ? "field" : "fields"}`;
 }
 
 /**

@@ -380,6 +380,9 @@ struct CleanSummary {
     /// product will not call it verified.
     verification_failures: usize,
     fields_removed: usize,
+    /// Privacy and technical (structural) fields removed, reported apart.
+    privacy_fields_removed: usize,
+    technical_fields_removed: usize,
     chapters_removed: usize,
     data_streams_removed: usize,
     results: Vec<FileResult>,
@@ -738,6 +741,7 @@ fn run_batch(
     let (mut verified, mut verification_failures) = (0usize, 0usize);
     let (mut fields_removed, mut chapters_removed, mut data_streams_removed) =
         (0usize, 0usize, 0usize);
+    let (mut privacy_fields_removed, mut technical_fields_removed) = (0usize, 0usize);
 
     for (index, raw) in paths.iter().enumerate() {
         let input = PathBuf::from(raw);
@@ -765,6 +769,8 @@ fn run_batch(
                 verification_failures += 1;
             }
             fields_removed += report.fields_removed;
+            privacy_fields_removed += report.privacy_fields_removed;
+            technical_fields_removed += report.technical_fields_removed;
             chapters_removed += report.chapters_removed;
             data_streams_removed += report.data_streams_removed;
         }
@@ -814,6 +820,8 @@ fn run_batch(
         verified,
         verification_failures,
         fields_removed,
+        privacy_fields_removed,
+        technical_fields_removed,
         chapters_removed,
         data_streams_removed,
         results,

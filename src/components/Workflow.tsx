@@ -6,8 +6,11 @@ import {
   findingsLabel,
   formatDuration,
   groupFindings,
+  partitionFindings,
   summarise,
+  technicalLabel,
   topSeverity,
+  type FindingGroup,
   type ScanState,
   type ScanView,
   type Severity,
@@ -44,6 +47,8 @@ export type Summary = {
   verified: number;
   verificationFailures: number;
   fieldsRemoved: number;
+  privacyFieldsRemoved: number;
+  technicalFieldsRemoved: number;
   chaptersRemoved: number;
   dataStreamsRemoved: number;
 };
@@ -262,8 +267,14 @@ function ScanSummaryLine({ file }: { file: VideoFile }) {
   }
   const summary = file.scan?.summary;
   if (!summary) return null;
+  const technical = technicalLabel(summary.technical);
   if (summary.total === 0) {
-    return <span className="scan-line scan-line--clean">No metadata found</span>;
+    return (
+      <span className="scan-line scan-line--clean">
+        {findingsLabel(summary)}
+        {technical ? <span className="scan-technical">{technical}</span> : null}
+      </span>
+    );
   }
   return (
     <span className="scan-line">
@@ -271,7 +282,47 @@ function ScanSummaryLine({ file }: { file: VideoFile }) {
       {summary.medium > 0 ? <SeverityChip severity="medium" count={summary.medium} /> : null}
       {summary.low > 0 ? <SeverityChip severity="low" count={summary.low} /> : null}
       <span className="scan-total">{findingsLabel(summary)}</span>
+      {technical ? <span className="scan-technical">{technical}</span> : null}
     </span>
+  );
+}
+
+/**
+ * One list of finding groups. Technical groups carry a neutral `TECHNICAL` tag
+ * instead of a severity, so container bookkeeping never reads as a privacy
+ * warning.
+ */
+function FindingGroupList({ groups, technical }: { groups: FindingGroup[]; technical: boolean }) {
+  return (
+    <ul className="finding-groups">
+      {groups.map((group) => (
+        <li
+          key={group.category}
+          className={`finding-group finding-group--${technical ? "technical" : group.severity}`}
+        >
+          <div className="finding-group__head">
+            {technical ? (
+              <span className="sev-tag sev-tag--technical">TECHNICAL</span>
+            ) : (
+              <span className={`sev-tag sev-tag--${group.severity}`}>{group.severityLabel}</span>
+            )}
+            <span className="finding-group__name">{group.category}</span>
+            <span className="finding-group__count">{group.items.length}</span>
+          </div>
+          <p className="finding-group__why">{group.explanation}</p>
+          <ul className="finding-items">
+            {group.items.map((item) => (
+              <li key={`${item.scopeLabel}:${item.streamIndex}:${item.sourceKey}`}>
+                <span className="finding-scope">{item.scopeLabel}</span>
+                <span className="finding-detail" title={item.detail}>
+                  {item.detail}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -295,7 +346,11 @@ function FileDetail({ file }: { file: VideoFile }) {
 
   const verification = file.verification;
   const duration = formatDuration(scan.durationSeconds);
-  const groups = groupFindings(scan.findings);
+  const split = partitionFindings(scan.findings);
+  const groups = groupFindings(split.privacy);
+  const technicalGroups = groupFindings(split.technical);
+  const privacyRows = verification?.beforeAfter.filter((row) => !row.technical) ?? [];
+  const technicalRows = verification?.beforeAfter.filter((row) => row.technical) ?? [];
 
   return (
     <div className="detail-panel">
@@ -316,13 +371,22 @@ function FileDetail({ file }: { file: VideoFile }) {
             <span>Before</span>
             <span>After</span>
           </div>
-          {verification.beforeAfter.map((row) => (
+          {privacyRows.map((row) => (
             <div className="before-after__row" key={row.category}>
               <span className="ba-category">{row.category}</span>
               <span className="ba-before">{row.before}</span>
               <span className={row.removed ? "ba-after ba-after--removed" : "ba-after"}>
                 {row.after}
               </span>
+            </div>
+          ))}
+          {technicalRows.map((row) => (
+            // Neutral colours: a container field the muxer writes back is
+            // technical metadata, not a privacy failure.
+            <div className="before-after__row before-after__row--technical" key={row.category}>
+              <span className="ba-category">Technical metadata</span>
+              <span className="ba-before">{row.before}</span>
+              <span className="ba-after ba-after--technical">{row.after}</span>
             </div>
           ))}
           {!verification.verified ? (
@@ -340,31 +404,25 @@ function FileDetail({ file }: { file: VideoFile }) {
             </ul>
           ) : null}
         </div>
-      ) : groups.length === 0 ? (
+      ) : groups.length === 0 && technicalGroups.length === 0 ? (
         <p className="detail-note">This file carries no metadata to remove.</p>
       ) : (
-        <ul className="finding-groups">
-          {groups.map((group) => (
-            <li key={group.category} className={`finding-group finding-group--${group.severity}`}>
-              <div className="finding-group__head">
-                <span className={`sev-tag sev-tag--${group.severity}`}>{group.severityLabel}</span>
-                <span className="finding-group__name">{group.category}</span>
-                <span className="finding-group__count">{group.items.length}</span>
-              </div>
-              <p className="finding-group__why">{group.explanation}</p>
-              <ul className="finding-items">
-                {group.items.map((item) => (
-                  <li key={`${item.scopeLabel}:${item.streamIndex}:${item.sourceKey}`}>
-                    <span className="finding-scope">{item.scopeLabel}</span>
-                    <span className="finding-detail" title={item.detail}>
-                      {item.detail}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </li>
-          ))}
-        </ul>
+        <div className="finding-sections">
+          <p className="finding-section-title">Privacy findings</p>
+          {groups.length === 0 ? (
+            <p className="detail-note">No privacy findings in this file.</p>
+          ) : (
+            <FindingGroupList groups={groups} technical={false} />
+          )}
+          {technicalGroups.length > 0 ? (
+            <>
+              <p className="finding-section-title finding-section-title--technical">
+                Technical metadata
+              </p>
+              <FindingGroupList groups={technicalGroups} technical />
+            </>
+          ) : null}
+        </div>
       )}
     </div>
   );
@@ -403,6 +461,7 @@ export function FileQueue({
       : `${total} ${total === 1 ? "video" : "videos"} ready`;
 
   const batch = summarise(files.flatMap((file) => (file.scan ? [file.scan] : [])));
+  const batchTechnical = technicalLabel(batch.technical);
   const stillScanning = files.some(
     (file) => file.scanState === "pending" || file.scanState === "scanning",
   );
@@ -445,8 +504,10 @@ export function FileQueue({
               {batch.medium > 0 ? <SeverityChip severity="medium" count={batch.medium} /> : null}
               {batch.low > 0 ? <SeverityChip severity="low" count={batch.low} /> : null}
               <span className="scan-total">
+                {batch.total === 0 ? "No privacy findings " : ""}
                 across {batch.scanned} {batch.scanned === 1 ? "video" : "videos"}
               </span>
+              {batchTechnical ? <span className="scan-technical">{batchTechnical}</span> : null}
               {batch.failed > 0 ? (
                 <span className="batch-privacy__failed">{batch.failed} could not be scanned</span>
               ) : null}
@@ -644,9 +705,11 @@ export function CompletionSummary({ summary, onOpenFolder, onReset }: Completion
   const isWarning = hasErrors || !verified;
 
   const stats: string[] = [];
-  if (summary.fieldsRemoved > 0) {
+  // Privacy metadata leads; technical container fields follow and are never
+  // folded into the privacy figure.
+  if (summary.privacyFieldsRemoved > 0) {
     stats.push(
-      `${summary.fieldsRemoved} metadata ${summary.fieldsRemoved === 1 ? "field" : "fields"} removed`,
+      `${summary.privacyFieldsRemoved} privacy ${summary.privacyFieldsRemoved === 1 ? "field" : "fields"} removed`,
     );
   }
   if (summary.dataStreamsRemoved > 0) {
@@ -657,6 +720,11 @@ export function CompletionSummary({ summary, onOpenFolder, onReset }: Completion
   if (summary.chaptersRemoved > 0) {
     stats.push(
       `${summary.chaptersRemoved} chapter ${summary.chaptersRemoved === 1 ? "marker" : "markers"} removed`,
+    );
+  }
+  if (summary.technicalFieldsRemoved > 0) {
+    stats.push(
+      `${summary.technicalFieldsRemoved} technical ${summary.technicalFieldsRemoved === 1 ? "field" : "fields"} removed`,
     );
   }
 

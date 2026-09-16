@@ -1036,6 +1036,21 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+/* Technical metadata count: secondary to the privacy figure, same line. */
+.scan-technical {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+
+.scan-technical::before {
+  content: "\00b7";
+  margin-right: 5px;
+}
+
 /* A 2px edge tint by worst finding: enough to triage a long list at a glance,
    quiet enough that a hundred rows do not turn into a traffic light. */
 .file-row--risk-high {
@@ -1179,6 +1194,37 @@ button:disabled {
   color: var(--text-muted);
 }
 
+.sev-tag--technical {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.finding-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.finding-section-title {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 9.5px;
+  font-weight: 640;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.finding-section-title--technical {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.finding-group--technical {
+  background: transparent;
+  opacity: 0.8;
+}
+
 .finding-group__name {
   flex: 1 1 auto;
   color: var(--text-primary);
@@ -1283,6 +1329,11 @@ button:disabled {
 
 .ba-after--removed {
   color: var(--success);
+}
+
+.before-after__row--technical .ba-category,
+.ba-after--technical {
+  color: var(--text-muted);
 }
 
 .check-list {

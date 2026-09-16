@@ -22,7 +22,12 @@ import {
   supportedFormatLabels,
   type SupportedFormat,
 } from "./formats";
-import { STREAM_COPY_NOTE, type ScanView, type VerificationReport } from "./privacy";
+import {
+  EMPTY_SUMMARY,
+  STREAM_COPY_NOTE,
+  type ScanView,
+  type VerificationReport,
+} from "./privacy";
 import { statusText } from "./updater";
 import { useUpdater } from "./useUpdater";
 
@@ -51,7 +56,7 @@ function emptyScan(path: string, name: string): ScanView {
     name,
     ok: false,
     error: null,
-    summary: { total: 0, high: 0, medium: 0, low: 0 },
+    summary: { ...EMPTY_SUMMARY },
     findings: [],
     container: null,
     durationSeconds: null,

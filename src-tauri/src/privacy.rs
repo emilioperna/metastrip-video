@@ -67,6 +67,10 @@ impl PrivacyCategory {
     /// Categories that describe the container rather than the person or the
     /// place. The verifier tolerates these surviving, because a muxer has to
     /// write some of them back; everything else must be gone.
+    ///
+    /// Structural findings are technical metadata, not privacy findings: they
+    /// stay in the finding list so the user can see them, but they never count
+    /// toward a privacy total or a HIGH/MEDIUM/LOW summary.
     pub fn is_structural(self) -> bool {
         self == PrivacyCategory::Structural
     }
@@ -767,8 +771,19 @@ pub fn classify(report: &MetadataReport) -> Vec<PrivacyFinding> {
     findings
 }
 
+/// True when a metadata field is technical (structural) rather than a privacy
+/// disclosure. Used by the verifier to report the two kinds of removal apart.
+pub fn is_technical_field(field: &MetadataField) -> bool {
+    classify_field(field).0.is_structural()
+}
+
 /// Counts for the queue row and the batch header, so the UI never has to walk
 /// thousands of findings to render a summary.
+///
+/// `total`, `high`, `medium` and `low` count privacy findings only. Structural
+/// findings are counted in `technical` and nowhere else, so container
+/// bookkeeping such as `major_brand` or `handler_name` cannot inflate the
+/// privacy picture.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrivacySummary {
@@ -776,15 +791,18 @@ pub struct PrivacySummary {
     pub high: usize,
     pub medium: usize,
     pub low: usize,
+    pub technical: usize,
 }
 
 impl PrivacySummary {
     pub fn of(findings: &[PrivacyFinding]) -> Self {
-        let mut summary = PrivacySummary {
-            total: findings.len(),
-            ..Default::default()
-        };
+        let mut summary = PrivacySummary::default();
         for finding in findings {
+            if finding.category.is_structural() {
+                summary.technical += 1;
+                continue;
+            }
+            summary.total += 1;
             match finding.severity {
                 Severity::High => summary.high += 1,
                 Severity::Medium => summary.medium += 1,

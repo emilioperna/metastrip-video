@@ -53,6 +53,20 @@ fn assert_verified_clean(extension: &str) {
         report.fields_removed > 0,
         "{extension} reported no fields removed"
     );
+    // Privacy and technical removals are measured apart, and structural
+    // bookkeeping is never reported as privacy metadata removed.
+    assert!(
+        report.privacy_fields_removed > 0,
+        "{extension} reported no privacy fields removed"
+    );
+    for row in &report.before_after {
+        assert_eq!(
+            row.technical,
+            row.category == "Structural",
+            "{extension}: {} has the wrong technical flag",
+            row.category
+        );
+    }
 
     // The before/after table describes what was actually there.
     assert!(

@@ -250,5 +250,53 @@ fn summary_counts_match_the_findings_they_describe() {
     assert_eq!(summary.high, 1);
     assert_eq!(summary.medium, 2);
     assert_eq!(summary.low, 1);
+    assert_eq!(summary.technical, 0);
     assert_eq!(summary.high + summary.medium + summary.low, summary.total);
+}
+
+#[test]
+fn structural_fields_are_technical_and_never_privacy_findings() {
+    let findings = vec![
+        finding_from_field(&field("location", "+45.4+009.1/")),
+        finding_from_field(&field("make", "CanaryPhone")),
+        finding_from_field(&field("creation_time", "2024-01-01T00:00:00Z")),
+        finding_from_field(&field("encoder", "Lavf")),
+        finding_from_field(&field("major_brand", "isom")),
+        finding_from_field(&field("minor_version", "512")),
+        finding_from_field(&field("compatible_brands", "isomiso2avc1mp41")),
+        finding_from_field(&field("handler_name", "VideoHandler")),
+        finding_from_field(&field("language", "und")),
+        finding_from_field(&field("vendor_id", "[0][0][0][0]")),
+    ];
+    let summary = PrivacySummary::of(&findings);
+
+    // Privacy counts see only the four real disclosures, and severities add up.
+    assert_eq!(summary.total, 4);
+    assert_eq!(summary.high, 1);
+    assert_eq!(summary.medium + summary.low, 3);
+    assert_eq!(summary.high + summary.medium + summary.low, summary.total);
+    // The six structural fields are counted apart, and are still in the list.
+    assert_eq!(summary.technical, 6);
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|f| f.category.is_structural())
+            .count(),
+        6
+    );
+}
+
+#[test]
+fn a_file_with_only_structural_metadata_has_zero_privacy_findings() {
+    let findings: Vec<_> = ["major_brand", "minor_version", "handler_name", "language"]
+        .iter()
+        .map(|key| finding_from_field(&field(key, "x")))
+        .collect();
+    let summary = PrivacySummary::of(&findings);
+    assert_eq!(summary.total, 0);
+    assert_eq!((summary.high, summary.medium, summary.low), (0, 0, 0));
+    assert_eq!(summary.technical, 4);
+    assert!(findings
+        .iter()
+        .all(|f| is_technical_field(&field(&f.source_key, "x"))));
 }
