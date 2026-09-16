@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   allVerified,
   completionTitle,
+  detailFacts,
   STREAM_COPY_NOTE,
   VERIFIED_CLEANING_DETAIL,
   findingsLabel,
@@ -344,5 +345,27 @@ describe("stream claims", () => {
   it("states what is actually true", () => {
     expect(STREAM_COPY_NOTE).toMatch(/stream copy/);
     expect(VERIFIED_CLEANING_DETAIL).toMatch(/media stream parameters match/);
+  });
+});
+
+describe("detailFacts", () => {
+  it("shows duration and streams without a generic metadata field total", () => {
+    const facts = detailFacts(
+      scan({
+        durationSeconds: 41,
+        fieldCount: 11,
+        findings: [finding("Timestamp", "medium"), finding("Structural", "low", "major_brand")],
+      }),
+    );
+
+    expect(facts).toEqual(["41 s", "1 video · 1 audio"]);
+    expect(facts.join(" · ")).not.toMatch(/metadata|field/i);
+  });
+
+  it("still lists data tracks and chapters when present", () => {
+    expect(detailFacts(scan({ durationSeconds: null, otherStreams: 1, chapterCount: 3 }))).toEqual([
+      "1 video · 1 audio · 1 data",
+      "3 chapters",
+    ]);
   });
 });

@@ -300,3 +300,11 @@ fn a_file_with_only_structural_metadata_has_zero_privacy_findings() {
         .iter()
         .all(|f| is_technical_field(&field(&f.source_key, "x"))));
 }
+
+#[test]
+fn structural_explanation_describes_technical_properties() {
+    assert_eq!(
+        explanation(PrivacyCategory::Structural),
+        "These fields describe technical properties of the file and are not usually privacy-sensitive."
+    );
+}

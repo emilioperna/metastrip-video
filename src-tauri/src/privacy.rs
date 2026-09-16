@@ -135,7 +135,7 @@ pub fn explanation(category: PrivacyCategory) -> &'static str {
         }
         PrivacyCategory::Copyright => "This field carries ownership or licensing text.",
         PrivacyCategory::Structural => {
-            "This field describes the container itself and is not usually sensitive."
+            "These fields describe technical properties of the file and are not usually privacy-sensitive."
         }
         PrivacyCategory::Unknown => {
             "This field is not recognised, so its contents cannot be described in advance."
@@ -752,7 +752,9 @@ pub fn classify(report: &MetadataReport) -> Vec<PrivacyFinding> {
                 "{count} chapter {}",
                 if count == 1 { "marker" } else { "markers" }
             ),
-            explanation: "Chapter markers carry titles and timings added after recording.",
+            // Chapter markers are Structural, so they share its description; a
+            // group's explanation must not depend on which member sorts first.
+            explanation: explanation(PrivacyCategory::Structural),
             scope: MetadataScope::Chapter,
             scope_label: MetadataScope::Chapter.label(),
             stream_index: None,

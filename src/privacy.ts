@@ -303,3 +303,24 @@ export function formatDuration(seconds: number | null): string | null {
   if (rest === 60) return `${minutes + 1}:00`;
   return `${minutes}:${String(rest).padStart(2, "0")}`;
 }
+
+/**
+ * The secondary facts line of an expanded file: duration, streams, chapters.
+ *
+ * Deliberately no generic metadata field total: the row already states privacy
+ * findings and technical fields separately, and a combined count would blur
+ * that distinction again.
+ */
+export function detailFacts(
+  scan: Pick<ScanView, "durationSeconds" | "videoStreams" | "audioStreams" | "otherStreams" | "chapterCount">,
+): string[] {
+  const facts: string[] = [];
+  const duration = formatDuration(scan.durationSeconds);
+  if (duration) facts.push(duration);
+  facts.push(
+    `${scan.videoStreams} video · ${scan.audioStreams} audio` +
+      (scan.otherStreams > 0 ? ` · ${scan.otherStreams} data` : ""),
+  );
+  if (scan.chapterCount > 0) facts.push(`${scan.chapterCount} chapters`);
+  return facts;
+}

@@ -3,8 +3,8 @@ import { fileExtension, type SupportedFormat } from "../formats";
 import {
   allVerified,
   completionTitle,
+  detailFacts,
   findingsLabel,
-  formatDuration,
   groupFindings,
   partitionFindings,
   summarise,
@@ -345,7 +345,6 @@ function FileDetail({ file }: { file: VideoFile }) {
   if (!scan) return null;
 
   const verification = file.verification;
-  const duration = formatDuration(scan.durationSeconds);
   const split = partitionFindings(scan.findings);
   const groups = groupFindings(split.privacy);
   const technicalGroups = groupFindings(split.technical);
@@ -355,13 +354,9 @@ function FileDetail({ file }: { file: VideoFile }) {
   return (
     <div className="detail-panel">
       <ul className="detail-facts">
-        {duration ? <li>{duration}</li> : null}
-        <li>
-          {scan.videoStreams} video · {scan.audioStreams} audio
-          {scan.otherStreams > 0 ? ` · ${scan.otherStreams} data` : ""}
-        </li>
-        {scan.chapterCount > 0 ? <li>{scan.chapterCount} chapters</li> : null}
-        <li>{scan.fieldCount} metadata fields</li>
+        {detailFacts(scan).map((fact) => (
+          <li key={fact}>{fact}</li>
+        ))}
       </ul>
 
       {verification ? (
