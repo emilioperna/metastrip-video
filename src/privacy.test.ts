@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   allVerified,
   completionTitle,
+  STREAM_COPY_NOTE,
+  VERIFIED_CLEANING_DETAIL,
   findingsLabel,
   formatDuration,
   groupFindings,
@@ -200,5 +202,24 @@ describe("formatDuration", () => {
     expect(formatDuration(Number.NaN)).toBeNull();
     expect(formatDuration(Number.POSITIVE_INFINITY)).toBeNull();
     expect(formatDuration(-1)).toBeNull();
+  });
+});
+
+describe("stream claims", () => {
+  // Runtime verification compares codec parameters, not packets. The copy must
+  // not promise a bit-for-bit result that only the regression tests establish.
+  const overclaims = [/bit[- ]for[- ]bit/i, /identical/i, /unchanged/i, /lossless/i, /proven/i];
+
+  it("does not overclaim what runtime verification checks", () => {
+    for (const text of [STREAM_COPY_NOTE, VERIFIED_CLEANING_DETAIL]) {
+      for (const pattern of overclaims) {
+        expect(text).not.toMatch(pattern);
+      }
+    }
+  });
+
+  it("states what is actually true", () => {
+    expect(STREAM_COPY_NOTE).toMatch(/stream copy/);
+    expect(VERIFIED_CLEANING_DETAIL).toMatch(/media stream parameters match/);
   });
 });

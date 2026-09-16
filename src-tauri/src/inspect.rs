@@ -93,8 +93,9 @@ pub struct MetadataField {
     pub stream_kind: Option<StreamKind>,
 }
 
-/// The codec facts that must not change when a stream is copied. Compared
-/// wholesale by the verifier; any difference means something re-encoded.
+/// The codec parameters that must not change when a stream is copied. Compared
+/// wholesale by the verifier; any difference means the stream was not carried
+/// over as-is. Equality is not proof of packet identity — see `verify.rs`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamIdentity {

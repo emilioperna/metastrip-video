@@ -5,25 +5,30 @@
 //! and a file is only reported as verified when all of them pass. A check that
 //! could not be evaluated fails; it never passes by default.
 //!
-//! ## Stream identity
+//! ## Stream parameters, not stream identity
 //!
-//! The no-re-encoding guarantee is checked at two levels, deliberately.
+//! Not re-encoding is a property of the pipeline: the cleaner only ever runs
+//! FFmpeg with `-c copy` and has no transcoding path. What is checked, and
+//! where, is split deliberately.
 //!
-//! * **Runtime (this module).** Codec identity is compared field by field
-//!   between input and output: codec name, codec tag, profile, dimensions, pixel
-//!   format, sample rate, channels and layout. This costs one `ffprobe` run on
-//!   the output — constant time, independent of file size — and it is what the
-//!   UI is allowed to claim.
+//! * **Runtime (this module).** The media stream parameters are compared field
+//!   by field between input and output: codec name, codec tag, profile,
+//!   dimensions, pixel format, sample rate, channels and layout. This costs one
+//!   `ffprobe` run on the output — constant time, independent of file size. It
+//!   catches a stream that went missing or came out as a different codec or
+//!   format, but it does **not** prove the packets are bit-for-bit the same, and
+//!   it cannot on its own rule out a re-encode that kept every parameter. The
+//!   check is therefore named "Media stream parameters match" and the UI claims
+//!   only that: stream copy used, codec parameters preserved.
 //! * **Regression (tests only).** The test suite additionally hashes the encoded
-//!   packet payload of every stream with FFmpeg's `md5`/`streamhash` muxers and
-//!   asserts byte equality. That reads the whole file, which is fine for two
-//!   second fixtures and not fine for a 4 GB holiday video on every run.
+//!   packet payload of every stream with FFmpeg's `md5` muxer and asserts byte
+//!   equality. That reads the whole file, which is fine for two-second fixtures
+//!   and not fine for a 4 GB holiday video on every run.
 //!
 //! Hashing every output at runtime was rejected on cost: it turns a
-//! millisecond-scale check into a full re-read of every file in the batch. The
-//! UI therefore says streams were copied without re-encoding — which is what the
-//! codec comparison establishes — and never claims a bit-for-bit proof that only
-//! the test suite performs.
+//! millisecond-scale check into a full re-read of every file in the batch. Until
+//! runtime packet identity actually exists, nothing the user sees may describe
+//! this check as a bit-for-bit or byte-identical proof.
 
 use serde::Serialize;
 use std::path::Path;
@@ -99,6 +104,10 @@ impl OriginalFingerprint {
         }
     }
 }
+
+/// Name of the runtime stream check. Exported so tests assert against the label
+/// the UI shows instead of a copy of it.
+pub const STREAM_PARAMETERS_CHECK: &str = "Media stream parameters match";
 
 fn check(name: &'static str, passed: bool, detail: impl Into<String>) -> VerificationCheck {
     VerificationCheck {
@@ -276,8 +285,9 @@ pub fn verify(
         },
     ));
 
-    // 7. The media the user came for is still present, with identical codecs.
-    //    This is the runtime half of the no-re-encoding guarantee.
+    // 7. The media the user came for is still present, with the same codec
+    //    parameters. A parameter comparison, not packet identity: see the module
+    //    comment for what this does and does not establish.
     let mut identity_ok = true;
     let mut identity_detail = String::new();
     for kind in [StreamKind::Video, StreamKind::Audio] {
@@ -319,13 +329,10 @@ pub fn verify(
             .iter()
             .filter(|s| s.kind == StreamKind::Audio)
             .count();
-        identity_detail = format!("{video} video and {audio} audio stream(s) copied unchanged");
+        identity_detail =
+            format!("{video} video and {audio} audio stream(s) with codec parameters preserved");
     }
-    checks.push(check(
-        "Streams copied without re-encoding",
-        identity_ok,
-        identity_detail,
-    ));
+    checks.push(check(STREAM_PARAMETERS_CHECK, identity_ok, identity_detail));
 
     // 8. The original is exactly as it was.
     let original_ok = match original {

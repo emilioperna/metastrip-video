@@ -84,8 +84,8 @@ pub fn plan_for(
         .count();
 
     let mut guarantees = vec![
-        "Video streams are copied, never re-encoded",
-        "Audio streams are copied, never re-encoded",
+        "Video streams use stream copy; no transcoding path is configured",
+        "Audio streams use stream copy; no transcoding path is configured",
         "The original file is left untouched",
         "The output keeps the original file extension",
     ];

@@ -22,7 +22,7 @@ import {
   supportedFormatLabels,
   type SupportedFormat,
 } from "./formats";
-import type { ScanView, VerificationReport } from "./privacy";
+import { STREAM_COPY_NOTE, type ScanView, type VerificationReport } from "./privacy";
 import { statusText } from "./updater";
 import { useUpdater } from "./useUpdater";
 
@@ -372,7 +372,7 @@ export default function App() {
     ? "Choose an available output folder to continue."
     : !prefixValid
       ? "Enter a file name prefix to continue."
-      : "Metadata is removed locally. Video and audio streams are copied unchanged.";
+      : STREAM_COPY_NOTE;
 
   return (
     <main className={`app-shell app-shell--${phase}`} aria-busy={running}>

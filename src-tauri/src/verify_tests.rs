@@ -170,9 +170,9 @@ fn the_planted_canaries_are_found_before_and_gone_after() {
     }
 }
 
-/// The deep half of the no-re-encoding guarantee, run only in tests: the encoded
-/// packet payloads are byte-identical, not merely same-codec. See the module
-/// comment in `verify.rs` for why the runtime check is the cheaper one.
+/// Packet identity, run only in tests: the encoded packet payloads are
+/// byte-identical, not merely same-codec. The runtime verifier compares stream
+/// parameters only; see the module comment in `verify.rs` for why.
 #[test]
 fn deep_regression_encoded_payloads_are_byte_identical() {
     for extension in ["mp4", "mov", "m4v", "mkv", "webm", "avi"] {
@@ -381,10 +381,12 @@ fn a_leftover_temp_file_fails_verification() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A re-encoded output is exactly what the product promises never to produce.
-/// Feeding one to the verifier proves the codec comparison actually bites.
+/// A re-encoded output is exactly what the pipeline is built never to produce.
+/// Feeding one that changes codec to the verifier proves the parameter
+/// comparison actually bites. It is not evidence that the comparison would catch
+/// a re-encode that kept every parameter; the packet-identity test above is.
 #[test]
-fn a_re_encoded_output_fails_the_stream_identity_check() {
+fn a_transcoded_output_fails_the_stream_parameters_check() {
     let dir = scratch("verify-reencode");
     let input = sample_for_format(&dir, "mp4");
     let out = dir.join("out");
@@ -427,8 +429,8 @@ fn a_re_encoded_output_fails_the_stream_identity_check() {
         "a re-encoded output was reported as verified"
     );
     assert!(
-        failed_names(&report).contains(&"Streams copied without re-encoding"),
-        "the stream identity check did not fire: {:?}",
+        failed_names(&report).contains(&STREAM_PARAMETERS_CHECK),
+        "the stream parameters check did not fire: {:?}",
         failed_names(&report)
     );
     std::fs::remove_dir_all(&dir).unwrap();

@@ -12,6 +12,7 @@ import {
   type ScanView,
   type Severity,
   type VerificationReport,
+  VERIFIED_CLEANING_DETAIL,
 } from "../privacy";
 
 export type Status = "ready" | "processing" | "completed" | "error";
@@ -143,7 +144,7 @@ export function ProductHeader() {
       </div>
       <div className="product-intro">
         <h1>Remove metadata. Keep the quality.</h1>
-        <p>Clean videos locally without re-encoding.</p>
+        <p>Clean videos locally with stream copy, no transcoding.</p>
       </div>
     </header>
   );
@@ -670,7 +671,7 @@ export function CompletionSummary({ summary, onOpenFolder, onReset }: Completion
       <div className="completion-copy">
         <h2>{title}</h2>
         {verified ? (
-          <p className="completion-verified">
+          <p className="completion-verified" title={VERIFIED_CLEANING_DETAIL}>
             <Icon name="shield" size={14} />
             Verified cleaning
           </p>

@@ -34,7 +34,7 @@ legacy settings migration.
 v0.5 adds classifier tests that need no FFmpeg at all, inspector tests that run
 against both fixed JSON documents and the real `ffprobe`, and verification tests
 that deliberately break one guarantee at a time — a missing output, an unreadable
-output, a modified original, a leftover temp file, a re-encoded output — to prove
+output, a modified original, a leftover temp file, a transcoded output — to prove
 the verifier reports `verified: false` rather than passing by default.
 
 A fixture only plants metadata the target muxer actually keeps: the MOV muxer
@@ -280,7 +280,8 @@ anywhere in the UI:
 4. nothing at MEDIUM or above is present in the output;
 5. chapters are gone, where the input had any;
 6. data tracks are gone, where the input had any;
-7. video and audio are still present with identical codec parameters;
+7. video and audio are still present and their media stream parameters match
+   (a parameter comparison, not packet identity);
 8. the original is unchanged;
 9. the extension is preserved;
 10. no temporary file is left in the output folder.
@@ -301,23 +302,31 @@ A file that cannot be inspected is still cleaned — inspection is what makes
 verification possible, not what makes cleaning safe — but it is reported as
 cleaned-and-not-verified, never as verified.
 
-#### Stream identity: two levels, on purpose
+#### Stream parameters at runtime, packet identity in tests
 
-The no-re-encoding guarantee is checked twice, at different costs.
+Not re-encoding is a property of the pipeline: every cleaning invocation uses
+`-c copy`, and there is no transcoding path to fall back to. What is checked, and
+where, is split on purpose.
 
-- **Runtime**, in `verify.rs`: codec name, codec tag, profile, dimensions, pixel
-  format, sample rate, channels and layout are compared between input and output.
-  One ffprobe run, constant time in the file size. This is what the UI is allowed
-  to claim, and the wording is "copied without re-encoding" — not a bit-for-bit
-  claim.
+- **Runtime**, in `verify.rs`, check "Media stream parameters match": codec name,
+  codec tag, profile, dimensions, pixel format, sample rate, channels and layout
+  are compared between input and output. One ffprobe run, constant time in the
+  file size. It catches a missing stream or one that came out as a different
+  codec or format. It does **not** prove the packets are bit-for-bit the same,
+  and on its own it cannot rule out a re-encode that kept every parameter. The
+  UI therefore says only "stream copy used", "no transcoding" and "media stream
+  parameters match" — never bit-for-bit or byte-identical.
 - **Regression**, in the tests only: `deep_regression_encoded_payloads_are_byte_identical`
   hashes every stream's encoded packets with FFmpeg's `md5` muxer and asserts
-  byte equality across all six containers.
+  byte equality across all six containers. This, together with
+  `ffmpeg_options_are_container_specific_and_never_transcode`, is what backs the
+  no-re-encoding claim.
 
 Hashing at runtime was rejected on measured cost: it turns a millisecond-scale
 check into a full re-read of every file in the batch, which is fine for a
-two-second fixture and not fine for a 4 GB holiday video. `a_re_encoded_output_fails_the_stream_identity_check`
-feeds the verifier a deliberately transcoded file to prove the cheap check bites.
+two-second fixture and not fine for a 4 GB holiday video. `a_transcoded_output_fails_the_stream_parameters_check`
+feeds the verifier a deliberately transcoded file (different codec) to prove the
+parameter check bites.
 
 "The original is unchanged" is checked by size and modification time, not a
 content hash, for the same reason: the cleaner never opens the input for writing,

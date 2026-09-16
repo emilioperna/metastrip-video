@@ -383,9 +383,10 @@ pub fn assert_ffmpeg_can_read(path: &Path) {
 
 /// The md5 of one stream's encoded packet payload.
 ///
-/// This is the deep half of the no-re-encoding guarantee: it reads the whole
-/// file, which is exactly why the runtime verifier does not do it and the test
-/// suite does. See the module comment in `verify.rs`.
+/// This is the packet-identity check behind the no-re-encoding claim: it reads
+/// the whole file, which is exactly why the runtime verifier does not do it (it
+/// compares stream parameters only) and the test suite does. See the module
+/// comment in `verify.rs`.
 pub fn stream_payload_hash(path: &Path, stream: &str) -> String {
     let hash = ffmpeg()
         .args(["-v", "error", "-i"])

@@ -187,6 +187,21 @@ export function groupFindings(findings: PrivacyFinding[]): FindingGroup[] {
 }
 
 /**
+ * What the app may say about the audio and video streams.
+ *
+ * Cleaning always uses FFmpeg stream copy and has no transcoding path. The
+ * runtime verifier compares codec parameters between input and output; it does
+ * not compare packets, so nothing here may call the streams bit-for-bit or
+ * byte-identical. Packet identity is proven by the Rust regression tests only.
+ */
+export const STREAM_COPY_NOTE =
+  "Metadata is removed locally. Video and audio use stream copy, with no transcoding.";
+
+/** Tooltip for the "Verified cleaning" badge: exactly what the checks cover. */
+export const VERIFIED_CLEANING_DETAIL =
+  "Every check passed: sensitive metadata removed, stream copy used and media stream parameters match, original not modified, no temporary files left.";
+
+/**
  * Completion headline. Deliberately refuses the word "verified" unless every
  * cleaned file actually passed, and names the shortfall when it did not.
  */
