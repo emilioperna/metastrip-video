@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -17,6 +18,10 @@ mod testkit;
 #[cfg(test)]
 #[path = "bench_tests.rs"]
 mod bench_tests;
+
+#[cfg(test)]
+#[path = "offthread_tests.rs"]
+mod offthread_tests;
 
 use plan::CleaningPlan;
 use privacy::{PrivacyFinding, PrivacySummary};
@@ -957,10 +962,37 @@ fn save_settings(
     Ok(settings.into())
 }
 
-/// Inspect and classify a batch without touching anything on disk. Emits one
-/// `scan-progress` event per file so rows can fill in as results arrive.
-#[tauri::command]
-fn scan_videos(app: AppHandle, paths: Vec<String>) -> Result<Vec<ScanView>, String> {
+// Shown instead of a panic message, which can carry file paths.
+const SCAN_INTERNAL_ERROR: &str = "The privacy scan stopped because of an internal error.";
+const CLEAN_INTERNAL_ERROR: &str =
+    "Cleaning stopped because of an internal error. Files finished before it are in the output folder.";
+
+/// Runs `work` on Tauri's blocking thread pool and waits for it to finish.
+///
+/// A synchronous command runs on the window's own thread, so every ffprobe and
+/// FFmpeg run would stop the window from repainting and hold every progress
+/// event back until the batch ended. The body of an `async` command is no place
+/// for it either: that runs on one of the runtime's few core workers, which
+/// Tauri's own IPC needs. Long synchronous work belongs on the blocking pool.
+///
+/// The work is awaited, never detached, so a command still answers only once
+/// its batch is over. A panic becomes `internal_error`; its text is never
+/// forwarded to the UI.
+async fn run_blocking<T, F>(internal_error: &'static str, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|_| Err(internal_error.to_string()))
+}
+
+/// Everything `scan_videos` does, minus Tauri, so it can be tested as is.
+fn scan_request(
+    paths: &[String],
+    on_result: impl FnMut(usize, usize, &ScanView),
+) -> Result<Vec<ScanView>, String> {
     if paths.len() > MAX_BATCH {
         return Err(format!(
             "Too many videos: {} selected, the limit is {MAX_BATCH}.",
@@ -970,16 +1002,26 @@ fn scan_videos(app: AppHandle, paths: Vec<String>) -> Result<Vec<ScanView>, Stri
     if !inspect::available() {
         return Err(FFPROBE_MISSING.into());
     }
-    Ok(run_scan(&paths, |index, total, view| {
-        let _ = app.emit(
-            "scan-progress",
-            ScanProgress {
-                index,
-                total,
-                view: view.clone(),
-            },
-        );
-    }))
+    Ok(run_scan(paths, on_result))
+}
+
+/// Inspect and classify a batch without touching anything on disk. Emits one
+/// `scan-progress` event per file so rows can fill in as results arrive.
+#[tauri::command]
+async fn scan_videos(app: AppHandle, paths: Vec<String>) -> Result<Vec<ScanView>, String> {
+    run_blocking(SCAN_INTERNAL_ERROR, move || {
+        scan_request(&paths, |index, total, view| {
+            let _ = app.emit(
+                "scan-progress",
+                ScanProgress {
+                    index,
+                    total,
+                    view: view.clone(),
+                },
+            );
+        })
+    })
+    .await
 }
 
 #[derive(Clone, Serialize)]
@@ -990,18 +1032,67 @@ struct ScanProgress {
     view: ScanView,
 }
 
-#[tauri::command]
-fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary, String> {
-    let dir = app_dir(&app)?;
-    let settings = load_settings(&dir);
+const CLEAN_BUSY: &str = "A cleaning batch is already running. Wait for it to finish.";
+
+/// Set while a Clean batch runs.
+///
+/// When the commands ran on the window's thread, that thread kept batches
+/// apart for free. Off it, a page reload mid-batch leaves the old batch running
+/// and lets a new one start in the same folder, where its stale-temp sweep and
+/// the "No temporary files left" check would trip over the first batch's file.
+/// This keeps the batches' disk work apart; it does not reconnect a reloaded
+/// page to the batch still running.
+static CLEAN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Holds a flag for as long as it lives. Released by `Drop`, so a batch that
+/// ends in an error or a panic frees it too.
+struct BatchGuard(&'static AtomicBool);
+
+impl BatchGuard {
+    /// Never waits: a second batch is refused, not queued.
+    fn try_acquire(flag: &'static AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| BatchGuard(flag))
+    }
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Everything `clean_videos` does once the app data folder is known, minus
+/// Tauri, so it can be tested as is. `busy` is taken before anything touches
+/// the disk and held until the last file is verified.
+fn clean_request(
+    busy: &'static AtomicBool,
+    app_dir: &Path,
+    paths: &[String],
+    on_progress: impl FnMut(Progress),
+) -> Result<CleanSummary, String> {
+    let _batch = BatchGuard::try_acquire(busy).ok_or_else(|| CLEAN_BUSY.to_string())?;
+    let settings = load_settings(app_dir);
     if settings.output_directory.is_empty() {
         return Err("Choose an output folder first.".into());
     }
     let output_dir = PathBuf::from(&settings.output_directory);
 
-    run_batch(&paths, &settings.prefix, &output_dir, &dir, |progress| {
-        let _ = app.emit("clean-progress", progress);
+    run_batch(paths, &settings.prefix, &output_dir, app_dir, on_progress)
+}
+
+/// Clean, verify and report a batch, one file after another, emitting
+/// `clean-progress` as each file starts and as each one finishes.
+#[tauri::command]
+async fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary, String> {
+    run_blocking(CLEAN_INTERNAL_ERROR, move || {
+        let dir = app_dir(&app)?;
+        clean_request(&CLEAN_IN_PROGRESS, &dir, &paths, |progress| {
+            let _ = app.emit("clean-progress", progress);
+        })
     })
+    .await
 }
 
 #[tauri::command]
