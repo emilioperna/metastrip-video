@@ -1,8 +1,6 @@
 // Update state, kept free of Tauri imports so it can be unit-tested on its own.
 // The rule this file exists to enforce: an update never interrupts a batch.
 
-import type { ProcessingState } from "./lifecycle";
-
 export type UpdaterStatus =
   | { kind: "idle" }
   | { kind: "checking" }
@@ -25,24 +23,17 @@ export type UpdateHandle = {
  * An update that finished downloading may only be installed once nothing is
  * being processed. Installing on Windows closes the app, so doing it mid-batch
  * would abandon the remaining videos.
+ *
+ * This is the cheap gate, and it is not the one that decides: `batchRunning` is
+ * React state, and a reload resets it while the batch it was tracking carries
+ * on. The word that counts is the backend claiming the app for the install,
+ * which refuses if a batch holds it and stops one starting while it is held.
+ * Asking the backend and then installing would not do: those are two round
+ * trips, and a Clean accepted between them would be cleaning by the time the
+ * installer ran.
  */
 export function canInstall(status: UpdaterStatus, batchRunning: boolean): boolean {
   return status.kind === "ready" && !batchRunning;
-}
-
-/**
- * The last word before the installer is handed over, and the only one that
- * counts. `batchRunning` is React state, which a reload resets while the batch
- * it was tracking carries on; `backend` is the pipeline's own answer, which a
- * reload cannot change. Installing on Windows ends the process, so this is
- * asked again immediately before `install()` rather than once per render.
- */
-export function installApproved(
-  status: UpdaterStatus,
-  batchRunning: boolean,
-  backend: ProcessingState,
-): boolean {
-  return canInstall(status, batchRunning) && !backend.cleaning;
 }
 
 /**

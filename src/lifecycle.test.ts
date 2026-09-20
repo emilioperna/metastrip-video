@@ -7,12 +7,26 @@ import {
   applyProgress,
   attach,
   cleaningElsewhere,
+  pipelineBusy,
   type BatchAttachment,
   type ProcessingState,
 } from "./lifecycle";
 
-const idle = (batchId: number): ProcessingState => ({ cleaning: false, batchId });
-const cleaning = (batchId: number): ProcessingState => ({ cleaning: true, batchId });
+const idle = (batchId: number): ProcessingState => ({
+  cleaning: false,
+  installing: false,
+  batchId,
+});
+const cleaning = (batchId: number): ProcessingState => ({
+  cleaning: true,
+  installing: false,
+  batchId,
+});
+const installing = (batchId: number): ProcessingState => ({
+  cleaning: false,
+  installing: true,
+  batchId,
+});
 
 /**
  * A page's rows, driven exactly the way the window drives them: an event is
@@ -158,14 +172,34 @@ describe("a batch this page is not showing", () => {
 
 describe("what the page assumes", () => {
   it("starts from nothing running, so a launch shows no stale warning", () => {
-    expect(IDLE_PROCESSING).toEqual({ cleaning: false, batchId: 0 });
+    expect(IDLE_PROCESSING).toEqual({ cleaning: false, installing: false, batchId: 0 });
+    expect(pipelineBusy(IDLE_PROCESSING)).toBe(false);
   });
 
   it("treats a backend it cannot reach as busy", () => {
     // Every caller uses this to decide whether cleaning, installing an update
     // or closing is safe. "I don't know" is not a safe answer to any of them.
-    expect(UNKNOWN_PROCESSING.cleaning).toBe(true);
+    expect(pipelineBusy(UNKNOWN_PROCESSING)).toBe(true);
     expect(cleaningElsewhere(UNKNOWN_PROCESSING, null)).toBe(true);
+  });
+});
+
+describe("an update installing", () => {
+  // The backend refuses a Clean while an install holds the app, so the page
+  // does not offer one. It is not a batch, so it is not reported as one.
+
+  it("stops the page offering a Clean", () => {
+    expect(pipelineBusy(installing(4))).toBe(true);
+  });
+
+  it("is not reported as a batch running somewhere else", () => {
+    expect(cleaningElsewhere(installing(4), null)).toBe(false);
+  });
+
+  it("stops being in the way once the claim goes back", () => {
+    // Which is what happens when the installer never started.
+    expect(pipelineBusy(installing(4))).toBe(true);
+    expect(pipelineBusy(idle(4))).toBe(false);
   });
 });
 

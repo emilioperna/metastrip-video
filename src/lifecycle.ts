@@ -11,6 +11,11 @@
 export type ProcessingState = {
   cleaning: boolean;
   /**
+   * An update install has claimed the app. Cleaning and installing are mutually
+   * exclusive in the backend, and the claim is what makes them so.
+   */
+  installing: boolean;
+  /**
    * The newest batch the backend has started, `0` before the first one. While
    * `cleaning` it is the batch that is running. Application-internal: a counter
    * that tells this process's batches apart and says nothing about any file.
@@ -19,14 +24,27 @@ export type ProcessingState = {
 };
 
 /** Before the backend has been asked, and after it says nothing is running. */
-export const IDLE_PROCESSING: ProcessingState = { cleaning: false, batchId: 0 };
+export const IDLE_PROCESSING: ProcessingState = {
+  cleaning: false,
+  installing: false,
+  batchId: 0,
+};
 
 /**
  * What to assume when the backend cannot be reached. Busy, always: every caller
  * of this uses it to decide whether it is safe to start cleaning, install an
  * update or close, and "I don't know" is not a safe answer to any of those.
  */
-export const UNKNOWN_PROCESSING: ProcessingState = { cleaning: true, batchId: 0 };
+export const UNKNOWN_PROCESSING: ProcessingState = {
+  cleaning: true,
+  installing: true,
+  batchId: 0,
+};
+
+/** Whether the backend would refuse a Clean right now. */
+export function pipelineBusy(state: ProcessingState): boolean {
+  return state.cleaning || state.installing;
+}
 
 /**
  * This page's claim on one backend batch.

@@ -359,7 +359,7 @@ fn clean_request_without_an_output_folder_touches_nothing() {
     );
     assert!(!root.join("used-ids.txt").exists());
     // A batch that ends in an error still lets the next one start.
-    assert!(BatchGuard::try_acquire(&BUSY).is_some());
+    assert!(BatchGuard::try_acquire(&BUSY).is_ok());
     std::fs::remove_dir_all(&root).unwrap();
 }
 
@@ -369,7 +369,7 @@ fn the_batch_guard_is_exclusive_reusable_and_released_by_a_panic() {
 
     let first = BatchGuard::try_acquire(&BUSY).expect("a free guard was refused");
     assert!(
-        BatchGuard::try_acquire(&BUSY).is_none(),
+        BatchGuard::try_acquire(&BUSY).is_err(),
         "two holders at once"
     );
     drop(first);
@@ -385,7 +385,7 @@ fn the_batch_guard_is_exclusive_reusable_and_released_by_a_panic() {
     ));
     assert_eq!(result, Err(CLEAN_INTERNAL_ERROR.to_string()));
     assert!(
-        BatchGuard::try_acquire(&BUSY).is_some(),
+        BatchGuard::try_acquire(&BUSY).is_ok(),
         "a panic left the guard set"
     );
 }
@@ -408,7 +408,7 @@ fn a_panic_inside_a_clean_batch_still_frees_the_guard() {
 
     assert_eq!(result.unwrap_err(), CLEAN_INTERNAL_ERROR);
     assert!(
-        BatchGuard::try_acquire(&BUSY).is_some(),
+        BatchGuard::try_acquire(&BUSY).is_ok(),
         "one panic left every later Clean refused until a restart"
     );
     std::fs::remove_dir_all(&dirs.root).unwrap();

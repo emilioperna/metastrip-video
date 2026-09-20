@@ -1,19 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { ProcessingState } from "./lifecycle";
 import {
   CHECK_INTERVAL_MS,
   IDLE,
   canInstall,
   checkAndDownload,
-  installApproved,
   shouldCheck,
   statusText,
   type UpdaterStatus,
 } from "./updater";
 
 const ready = { kind: "ready", version: "0.3.1" } as const;
-const backendIdle: ProcessingState = { cleaning: false, batchId: 3 };
-const backendCleaning: ProcessingState = { cleaning: true, batchId: 4 };
 
 describe("install gating", () => {
   it("defers an install while a batch is running", () => {
@@ -38,38 +34,12 @@ describe("install gating", () => {
   });
 });
 
-describe("the backend has the last word on installing", () => {
-  // Installing on Windows ends the process. React state is not allowed to be
-  // the thing that decides it is safe to do so, because a page that reloaded
-  // mid-batch starts out believing nothing is running.
-
-  it("refuses while the pipeline says it is cleaning, whatever the page thinks", () => {
-    // Exactly the reload case: the page has forgotten the batch it started.
+describe("this gate is not the one that decides", () => {
+  it("lets a page that has forgotten its batch through, which is why the backend claims", () => {
+    // Exactly the reload case: the batch is still running, and React does not
+    // know. Nothing here can tell -- what stops the install is the backend
+    // refusing to hand the app over, tested in the Rust lifecycle suite.
     expect(canInstall(ready, false)).toBe(true);
-    expect(installApproved(ready, false, backendCleaning)).toBe(false);
-  });
-
-  it("allows it once the pipeline says the batch is over", () => {
-    // The same pending update, after the only thing that changed is the batch
-    // ending in the backend.
-    expect(installApproved(ready, false, backendCleaning)).toBe(false);
-    expect(installApproved(ready, false, backendIdle)).toBe(true);
-  });
-
-  it("keeps the page's own gate as well, so both have to agree", () => {
-    expect(installApproved(ready, true, backendIdle)).toBe(false);
-    expect(installApproved(ready, true, backendCleaning)).toBe(false);
-  });
-
-  it("still installs nothing that has not finished downloading", () => {
-    expect(installApproved(IDLE, false, backendIdle)).toBe(false);
-    expect(installApproved({ kind: "checking" }, false, backendIdle)).toBe(false);
-    expect(installApproved({ kind: "downloading", version: "0.3.1" }, false, backendIdle)).toBe(
-      false,
-    );
-    expect(installApproved({ kind: "installing", version: "0.3.1" }, false, backendIdle)).toBe(
-      false,
-    );
   });
 });
 

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import type { ProcessingState } from "./lifecycle";
 import {
@@ -6,10 +7,33 @@ import {
   IDLE,
   canInstall,
   checkAndDownload,
-  installApproved,
   shouldCheck,
   type UpdaterStatus,
 } from "./updater";
+
+/**
+ * Claim the app for this install. The backend refuses if a batch holds it, and
+ * refuses to start one while this holds it, in a single transition -- so unlike
+ * asking whether anything is running and then installing, there is no moment
+ * between the two for a Clean to appear in.
+ */
+async function claimForInstall(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("reserve_update_install");
+  } catch (e) {
+    console.warn("[updater] could not ask to install:", e);
+    return false;
+  }
+}
+
+/** Hand the app back when the installer never got started. */
+async function releaseInstallClaim(): Promise<void> {
+  try {
+    await invoke("release_update_install");
+  } catch (e) {
+    console.warn("[updater] could not release the install claim:", e);
+  }
+}
 
 /**
  * Check on start, then hourly. Downloading is deliberately separate from
@@ -17,10 +41,9 @@ import {
  * lose its remaining videos. The bytes are fetched as soon as they exist, the
  * installer runs only once nothing is being processed.
  *
- * `batchRunning` is the cheap gate and `readProcessing` is the authoritative
- * one: the page can be a reload behind the pipeline, so the backend is asked
- * again in the moment before the installer is handed over. `readProcessing` is
- * the window's own, so an install deferred here also tells the rest of the
+ * `batchRunning` is the cheap gate; the one that decides is the backend
+ * claiming the app, which cannot be raced by a Clean starting. `readProcessing`
+ * is the window's own, so an install refused here also tells the rest of the
  * window that a batch is running, and the answer that clears it comes back
  * through `batchRunning`.
  */
@@ -70,12 +93,13 @@ export function useUpdater(
     installing.current = true;
 
     (async () => {
-      // Asked here rather than trusting the render: a page that reloaded
-      // mid-batch starts out believing nothing is running. Left on `ready`, so
-      // the next answer that says the pipeline is free installs it.
-      const backend = await readProcessing();
-      if (!installApproved(status, batchRunning, backend)) {
+      // Claimed here rather than trusted from the render: a page that reloaded
+      // mid-batch starts out believing nothing is running. Refused leaves the
+      // status on `ready`, and `readProcessing` tells the window why, so the
+      // answer that clears it comes back as `batchRunning`.
+      if (!(await claimForInstall())) {
         installing.current = false;
+        void readProcessing();
         return;
       }
       setStatus({ kind: "installing", version: update.version });
@@ -87,11 +111,14 @@ export function useUpdater(
         await update.install();
       } catch (e) {
         // Only reachable if the installer never got started. A failed install
-        // leaves a working app on the old version.
+        // leaves a working app on the old version, so the claim goes back and
+        // cleaning is available again.
         console.warn("[updater] install skipped:", e);
+        await releaseInstallClaim();
         pending.current = null;
         installing.current = false;
         setStatus(IDLE);
+        void readProcessing();
       }
     })();
   }, [status, batchRunning, readProcessing]);

@@ -31,6 +31,7 @@ import {
   applyProgress,
   attach,
   cleaningElsewhere,
+  pipelineBusy,
   type BatchAttachment,
   type ProcessingState,
 } from "./lifecycle";
@@ -312,8 +313,12 @@ export default function App() {
     });
 
     // What a reload cannot tell this page: a batch started before it may still
-    // be running.
-    void readProcessing();
+    // be running -- and an update install claimed before the reload is this
+    // page's to give back, because the page that took it no longer exists and a
+    // claim that succeeded would have ended the process instead of reloading it.
+    void invoke("release_update_install")
+      .catch((reason) => console.warn("[lifecycle] stale install claim kept:", reason))
+      .finally(() => void readProcessing());
 
     invoke<string | null>("check_ffmpeg")
       .then((problem) => {
@@ -409,7 +414,7 @@ export default function App() {
     // backend reports here is the batch this call is about to start, and
     // nothing older can be.
     const before = await readProcessing();
-    if (before.cleaning) return;
+    if (pipelineBusy(before)) return;
     attachment.current = attach(before);
 
     setPhase("running");
@@ -468,7 +473,7 @@ export default function App() {
   // is nothing to do but say so and wait.
   const elsewhere = cleaningElsewhere(processing, attachment.current);
   // Anything that must not happen mid-batch asks this, never `running` alone.
-  const busy = running || processing.cleaning;
+  const busy = running || pipelineBusy(processing);
   const updateStatus = useUpdater(busy, readProcessing);
   const updateText = statusText(updateStatus, busy);
   const total = files.length;

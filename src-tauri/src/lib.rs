@@ -1047,6 +1047,7 @@ struct ScanProgress {
 }
 
 const CLEAN_BUSY: &str = "A cleaning batch is already running. Wait for it to finish.";
+const CLEAN_UPDATING: &str = "An update is being installed. Try again once that has finished.";
 
 /// Set while a Clean batch runs.
 ///
@@ -1062,13 +1063,20 @@ const CLEAN_BUSY: &str = "A cleaning batch is already running. Wait for it to fi
 /// to ask something that has not.
 static CLEAN_STATE: BatchState = BatchState::new();
 
-/// Whether a batch is running, and which one, in a single word.
+/// Whether a batch is running, whether an update install has been reserved,
+/// and which batch it is, in a single word.
 ///
-/// Both facts have to be read together -- a caller that learned "running" and
-/// "which" separately could mix two batches -- so they share one atomic: the
-/// low bit is "a batch is running" and the rest is the batch counter. Starting
-/// batch `n + 1` from idle is `+3` (one for the counter, one for the bit) and
-/// finishing it is `-1`.
+/// The three have to be read and changed together. A caller that learned
+/// "running" and "which" separately could mix two batches; a caller that
+/// checked "not cleaning" and then reserved an install could have a batch start
+/// in between. So they share one atomic and every transition is one
+/// compare-and-swap: bit 0 is "a batch is running", bit 1 is "an update install
+/// is reserved", and the rest is the batch counter.
+///
+/// Cleaning and installing are mutually exclusive, and each transition refuses
+/// if either bit is set. Starting batch `n + 1` from idle is `+5` (`+4` for the
+/// counter, `+1` for the bit) and finishing it is `-1`; reserving an install is
+/// `+2` and releasing it is `-2`.
 ///
 /// The counter is the batch identity. A plain integer is enough: it has to tell
 /// this process's batches apart for as long as the process lives, nothing more,
@@ -1076,13 +1084,26 @@ static CLEAN_STATE: BatchState = BatchState::new();
 /// the app and carries nothing from the files being cleaned.
 pub(crate) struct BatchState(AtomicU64);
 
-/// What the frontend is allowed to know about the pipeline: whether it is busy
-/// and which batch that is. Deliberately nothing else -- no paths, no file
+/// A batch is running.
+const CLEANING: u64 = 0b01;
+/// An update install has been reserved and may be under way.
+const INSTALLING: u64 = 0b10;
+/// One batch on the counter, which starts above both flags.
+const ONE_BATCH: u64 = 0b100;
+/// Set while either exclusive transition is held.
+const EXCLUSIVE: u64 = CLEANING | INSTALLING;
+
+/// What the frontend is allowed to know about the pipeline: whether it is busy,
+/// why, and which batch that is. Deliberately nothing else -- no paths, no file
 /// names, no counts, nothing read out of a video.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProcessingState {
     cleaning: bool,
+    /// An update install is reserved. Nothing may start cleaning until it is
+    /// released, which after a successful install means never, because the
+    /// installer ends this process.
+    installing: bool,
     /// The newest batch this process has started, `0` before the first one.
     /// While `cleaning` it is the batch that is running.
     batch_id: u64,
@@ -1093,49 +1114,108 @@ impl BatchState {
         BatchState(AtomicU64::new(0))
     }
 
-    /// One load, so the flag and the id can never disagree.
+    /// One load, so the flags and the id can never disagree.
     pub(crate) fn snapshot(&self) -> ProcessingState {
         let word = self.0.load(Ordering::Acquire);
         ProcessingState {
-            cleaning: word & 1 == 1,
-            batch_id: word >> 1,
+            cleaning: word & CLEANING != 0,
+            installing: word & INSTALLING != 0,
+            batch_id: word / ONE_BATCH,
         }
     }
 
-    /// The running batch's id, or `None` when nothing is running.
+    /// The running batch id, or `None` when nothing is running.
     fn active_id(&self) -> Option<u64> {
         let state = self.snapshot();
         state.cleaning.then_some(state.batch_id)
+    }
+
+    /// Claim the app for an update install, or refuse.
+    ///
+    /// The check and the claim are the same compare-and-swap, so a Clean cannot
+    /// slip between them: once this returns `true` no batch can start until the
+    /// reservation is released, and it returns `false` if one already has.
+    ///
+    /// Not RAII, because the installer is driven by the signed updater plugin
+    /// from the page, so the reservation has to outlive the command that takes
+    /// it. It is released deterministically in three ways: the page releases it
+    /// when `install()` fails to start the installer, the page releases any it
+    /// finds on load, and a successful install ends the process.
+    fn try_reserve_install(&self) -> bool {
+        let mut word = self.0.load(Ordering::Relaxed);
+        loop {
+            if word & EXCLUSIVE != 0 {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                word,
+                word + INSTALLING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => word = actual,
+            }
+        }
+    }
+
+    /// Give the app back. Doing this when nothing is reserved is a no-op rather
+    /// than an underflow, so the page may call it on load without knowing.
+    fn release_install(&self) {
+        let mut word = self.0.load(Ordering::Relaxed);
+        loop {
+            if word & INSTALLING == 0 {
+                return;
+            }
+            match self.0.compare_exchange_weak(
+                word,
+                word - INSTALLING,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => word = actual,
+            }
+        }
     }
 }
 
 /// Holds the state for as long as it lives. Released by `Drop`, so a batch that
 /// ends in an error or a panic frees it too.
+///
+/// Nothing can reach the cleaning pipeline without one: `clean_with` takes it
+/// by value, so "the app is marked as cleaning" is not a step that could be
+/// taken late or skipped, it is the ticket to the work.
 struct BatchGuard {
     state: &'static BatchState,
     id: u64,
 }
 
 impl BatchGuard {
-    /// Never waits: a second batch is refused, not queued. A refused attempt
-    /// consumes no id, so the id reported by `snapshot` is always the batch
-    /// that is really running.
-    fn try_acquire(state: &'static BatchState) -> Option<Self> {
+    /// Never waits: a second batch is refused, not queued, and so is one asked
+    /// for while an update install holds the app. A refused attempt consumes no
+    /// id, so the id reported by `snapshot` is always the batch that is really
+    /// running. The reason comes from the word the swap actually saw, not from
+    /// a second look afterwards.
+    fn try_acquire(state: &'static BatchState) -> Result<Self, &'static str> {
         let mut word = state.0.load(Ordering::Relaxed);
         loop {
-            if word & 1 == 1 {
-                return None;
+            if word & CLEANING != 0 {
+                return Err(CLEAN_BUSY);
+            }
+            if word & INSTALLING != 0 {
+                return Err(CLEAN_UPDATING);
             }
             match state.0.compare_exchange_weak(
                 word,
-                word + 3,
+                word + ONE_BATCH + CLEANING,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    return Some(BatchGuard {
+                    return Ok(BatchGuard {
                         state,
-                        id: (word >> 1) + 1,
+                        id: word / ONE_BATCH + 1,
                     })
                 }
                 Err(actual) => word = actual,
@@ -1148,20 +1228,35 @@ impl Drop for BatchGuard {
     fn drop(&mut self) {
         // Clears the running bit and leaves the counter where it is, so the
         // next batch is a different one and this one is never handed out again.
-        self.state.0.fetch_sub(1, Ordering::Release);
+        self.state.0.fetch_sub(CLEANING, Ordering::Release);
     }
 }
 
-/// Everything `clean_videos` does once the app data folder is known, minus
-/// Tauri, so it can be tested as is. `state` is taken before anything touches
-/// the disk and held until the last file is verified.
+/// The two steps `clean_videos` takes, run inline: claim the app, then clean
+/// with what was claimed. The command keeps them apart on purpose, because only
+/// the second belongs on the blocking pool; here they are together so a test
+/// can drive a whole batch against its own state without a live `AppHandle`.
+#[cfg(test)]
 fn clean_request(
     state: &'static BatchState,
     app_dir: &Path,
     paths: &[String],
     on_progress: impl FnMut(Progress),
 ) -> Result<CleanSummary, String> {
-    let batch = BatchGuard::try_acquire(state).ok_or_else(|| CLEAN_BUSY.to_string())?;
+    let batch = BatchGuard::try_acquire(state).map_err(str::to_string)?;
+    clean_with(batch, app_dir, paths, on_progress)
+}
+
+/// Everything `clean_videos` does once it holds the app and knows the app data
+/// folder. The guard comes in by value and is held until the last file is
+/// verified, so nothing here can run while the app looks idle to the close
+/// button, the updater or another Clean.
+fn clean_with(
+    batch: BatchGuard,
+    app_dir: &Path,
+    paths: &[String],
+    on_progress: impl FnMut(Progress),
+) -> Result<CleanSummary, String> {
     let settings = load_settings(app_dir);
     if settings.output_directory.is_empty() {
         return Err("Choose an output folder first.".into());
@@ -1180,18 +1275,25 @@ fn clean_request(
 
 /// Clean, verify and report a batch, one file after another, emitting
 /// `clean-progress` as each file starts and as each one finishes.
+///
+/// The app is claimed here, before the work is handed to the blocking pool.
+/// Taking it inside that closure instead would leave a gap between accepting
+/// the request and the state saying so, and in that gap the close button would
+/// read the app as idle and let the window go while the worker was starting
+/// FFmpeg. Only the claim is early: every heavy step still runs on the pool.
 #[tauri::command]
 async fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary, String> {
+    let batch = BatchGuard::try_acquire(&CLEAN_STATE).map_err(str::to_string)?;
     run_blocking(CLEAN_INTERNAL_ERROR, move || {
         let dir = app_dir(&app)?;
-        clean_request(&CLEAN_STATE, &dir, &paths, |progress| {
+        clean_with(batch, &dir, &paths, |progress| {
             let _ = app.emit("clean-progress", progress);
         })
     })
     .await
 }
 
-/// Whether cleaning is running, straight from the pipeline's own state.
+/// Whether cleaning is running, straight from the pipeline own state.
 ///
 /// The page that started a batch forgets it on reload; this does not. Anything
 /// whose correctness depends on a batch being over -- installing an update,
@@ -1200,6 +1302,26 @@ async fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary
 #[tauri::command]
 fn get_processing_state() -> ProcessingState {
     CLEAN_STATE.snapshot()
+}
+
+/// Claim the app for an update install. `false` means a batch holds it, or an
+/// install already does, and nothing may be installed.
+///
+/// This replaces asking `get_processing_state` and then installing: those are
+/// two round trips, and a Clean accepted between them would have been cleaning
+/// by the time the installer ran. Claiming is one transition, and it shuts out
+/// Clean for as long as it is held.
+#[tauri::command]
+fn reserve_update_install() -> bool {
+    CLEAN_STATE.try_reserve_install()
+}
+
+/// Give the app back after an install that never started, or on page load,
+/// where anything still reserved was left by a page that no longer exists.
+/// Releasing when nothing is reserved does nothing.
+#[tauri::command]
+fn release_update_install() {
+    CLEAN_STATE.release_install()
 }
 
 /// Whether a close request has to be refused. The window asks the pipeline, not
@@ -1253,6 +1375,8 @@ pub fn run() {
             get_settings,
             save_settings,
             get_processing_state,
+            reserve_update_install,
+            release_update_install,
             scan_videos,
             clean_videos,
             open_folder
