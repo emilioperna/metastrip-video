@@ -15,7 +15,6 @@
 //! racing them.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread::{self, ThreadId};
 
@@ -25,8 +24,8 @@ use tauri::AppHandle;
 
 use crate::testkit::{sample_video, scratch};
 use crate::{
-    clean_request, run_blocking, scan_request, write_settings, BatchGuard, Settings, CLEAN_BUSY,
-    CLEAN_INTERNAL_ERROR, SCAN_INTERNAL_ERROR, TEMP_PREFIX,
+    clean_request, run_blocking, scan_request, write_settings, BatchGuard, BatchState, Settings,
+    CLEAN_BUSY, CLEAN_INTERNAL_ERROR, SCAN_INTERNAL_ERROR, TEMP_PREFIX,
 };
 
 /// Compiles only for a function that returns a future: a command whose body
@@ -197,6 +196,7 @@ fn batch_dirs(name: &str, prefix: &str) -> BatchDirs {
 /// emitted it and what the output folder held at that moment.
 #[derive(Debug)]
 struct Seen {
+    batch_id: u64,
     index: usize,
     total: usize,
     status: &'static str,
@@ -207,10 +207,13 @@ struct Seen {
 }
 
 /// The output of a summary with the parts that differ between two runs of the
-/// same input (random IDs, output folder) blanked out.
+/// same input (random IDs, output folder, which batch it was) blanked out.
 fn comparable(summary: &Value) -> Value {
     let mut summary = summary.clone();
     summary["outputDir"] = Value::Null;
+    // Two runs are two batches by definition. That they are told apart is what
+    // `lifecycle_tests` is for; here it would only hide the comparison.
+    summary["batchId"] = Value::Null;
     for result in summary["results"].as_array_mut().unwrap() {
         if !result["outputName"].is_null() {
             result["outputName"] = Value::from("<id>");
@@ -237,7 +240,7 @@ fn a_clean_on_the_worker_is_sequential_ordered_verified_and_unchanged() {
 
     // The same batch, once in the calling thread and once through the boundary.
     // A flag of its own: tests run in parallel and must not share the app's.
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    static BUSY: BatchState = BatchState::new();
     let direct = clean_request(&BUSY, &direct_dirs.app, &paths, |_| {}).unwrap();
 
     let caller = thread::current().id();
@@ -247,6 +250,7 @@ fn a_clean_on_the_worker_is_sequential_ordered_verified_and_unchanged() {
     let on_worker = block_on(run_blocking(CLEAN_INTERNAL_ERROR, move || {
         clean_request(&BUSY, &app, &worker_paths, |progress| {
             tx.send(Seen {
+                batch_id: progress.batch_id,
                 index: progress.index,
                 total: progress.total,
                 status: progress.status,
@@ -286,6 +290,8 @@ fn a_clean_on_the_worker_is_sequential_ordered_verified_and_unchanged() {
     );
     for event in &seen {
         assert_eq!(event.total, 3);
+        // Stamped as it goes out, not gathered up and labelled afterwards.
+        assert_eq!(event.batch_id, on_worker.batch_id);
         match event.status {
             "completed" => assert!(event.output_name.is_some() && event.verified == Some(true)),
             _ => assert!(event.output_name.is_none() && event.verified.is_none()),
@@ -339,7 +345,7 @@ fn a_clean_on_the_worker_is_sequential_ordered_verified_and_unchanged() {
 
 #[test]
 fn clean_request_without_an_output_folder_touches_nothing() {
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    static BUSY: BatchState = BatchState::new();
     let root = scratch("offthread-no-folder");
     let mut called = false;
     let error = clean_request(&BUSY, &root, &["whatever.mp4".to_string()], |_| {
@@ -359,7 +365,7 @@ fn clean_request_without_an_output_folder_touches_nothing() {
 
 #[test]
 fn the_batch_guard_is_exclusive_reusable_and_released_by_a_panic() {
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    static BUSY: BatchState = BatchState::new();
 
     let first = BatchGuard::try_acquire(&BUSY).expect("a free guard was refused");
     assert!(
@@ -386,7 +392,7 @@ fn the_batch_guard_is_exclusive_reusable_and_released_by_a_panic() {
 
 #[test]
 fn a_panic_inside_a_clean_batch_still_frees_the_guard() {
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    static BUSY: BatchState = BatchState::new();
     let dirs = batch_dirs("offthread-guard-panic", "CLIP");
     // The file is never read: the panic comes from its "processing" event.
     let paths = vec![dirs
@@ -414,7 +420,7 @@ fn a_panic_inside_a_clean_batch_still_frees_the_guard() {
 /// it must run normally and never reuse an ID.
 #[test]
 fn a_second_clean_while_one_runs_is_refused_and_touches_nothing() {
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    static BUSY: BatchState = BatchState::new();
     let dirs = batch_dirs("offthread-guard", "CLIP");
     let inputs_dir = dirs.root.join("inputs");
     std::fs::create_dir_all(&inputs_dir).unwrap();

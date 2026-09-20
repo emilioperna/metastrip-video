@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import type { ProcessingState } from "./lifecycle";
 import {
   CHECK_INTERVAL_MS,
   IDLE,
   canInstall,
   checkAndDownload,
+  installApproved,
   shouldCheck,
   type UpdaterStatus,
 } from "./updater";
@@ -14,8 +16,18 @@ import {
  * installing: installing on Windows closes the app, so a batch in flight would
  * lose its remaining videos. The bytes are fetched as soon as they exist, the
  * installer runs only once nothing is being processed.
+ *
+ * `batchRunning` is the cheap gate and `readProcessing` is the authoritative
+ * one: the page can be a reload behind the pipeline, so the backend is asked
+ * again in the moment before the installer is handed over. `readProcessing` is
+ * the window's own, so an install deferred here also tells the rest of the
+ * window that a batch is running, and the answer that clears it comes back
+ * through `batchRunning`.
  */
-export function useUpdater(batchRunning: boolean): UpdaterStatus {
+export function useUpdater(
+  batchRunning: boolean,
+  readProcessing: () => Promise<ProcessingState>,
+): UpdaterStatus {
   const [status, setStatus] = useState<UpdaterStatus>(IDLE);
 
   // The downloaded update, held until a batch-free moment to install it.
@@ -56,9 +68,17 @@ export function useUpdater(batchRunning: boolean): UpdaterStatus {
     if (!update) return;
 
     installing.current = true;
-    setStatus({ kind: "installing", version: update.version });
 
     (async () => {
+      // Asked here rather than trusting the render: a page that reloaded
+      // mid-batch starts out believing nothing is running. Left on `ready`, so
+      // the next answer that says the pipeline is free installs it.
+      const backend = await readProcessing();
+      if (!installApproved(status, batchRunning, backend)) {
+        installing.current = false;
+        return;
+      }
+      setStatus({ kind: "installing", version: update.version });
       try {
         // On Windows this hands the installer to the shell and ends the
         // process: nothing after it runs, and the NSIS `/R` flag that
@@ -74,7 +94,7 @@ export function useUpdater(batchRunning: boolean): UpdaterStatus {
         setStatus(IDLE);
       }
     })();
-  }, [status, batchRunning]);
+  }, [status, batchRunning, readProcessing]);
 
   return status;
 }

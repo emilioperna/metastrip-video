@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -22,6 +22,10 @@ mod bench_tests;
 #[cfg(test)]
 #[path = "offthread_tests.rs"]
 mod offthread_tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 use plan::CleaningPlan;
 use privacy::{PrivacyFinding, PrivacySummary};
@@ -352,6 +356,10 @@ impl IdRegistry {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Progress {
+    /// Which batch produced this event. A page applies an event only when it
+    /// belongs to the batch it started, so one that outlived a reload cannot
+    /// write into rows it has never seen.
+    batch_id: u64,
     index: usize,
     total: usize,
     input_name: String,
@@ -375,6 +383,8 @@ struct FileResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CleanSummary {
+    /// The batch these results came from, the same id its progress carried.
+    batch_id: u64,
     output_dir: String,
     completed: usize,
     errors: usize,
@@ -719,6 +729,7 @@ fn run_batch(
     prefix: &str,
     output_dir: &Path,
     app_dir: &Path,
+    batch_id: u64,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<CleanSummary, String> {
     if paths.is_empty() {
@@ -756,6 +767,7 @@ fn run_batch(
             .unwrap_or_else(|| raw.clone());
 
         on_progress(Progress {
+            batch_id,
             index,
             total,
             input_name: input_name.clone(),
@@ -801,6 +813,7 @@ fn run_batch(
         };
 
         on_progress(Progress {
+            batch_id,
             index,
             total,
             input_name: input_name.clone(),
@@ -819,6 +832,7 @@ fn run_batch(
     }
 
     Ok(CleanSummary {
+        batch_id,
         output_dir: output_dir.to_string_lossy().into_owned(),
         completed,
         errors,
@@ -1042,44 +1056,126 @@ const CLEAN_BUSY: &str = "A cleaning batch is already running. Wait for it to fi
 /// the "No temporary files left" check would trip over the first batch's file.
 /// This keeps the batches' disk work apart; it does not reconnect a reloaded
 /// page to the batch still running.
-static CLEAN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+///
+/// It is also the only thing that knows whether cleaning is happening: a
+/// reloaded page has forgotten, and the updater and the close button both have
+/// to ask something that has not.
+static CLEAN_STATE: BatchState = BatchState::new();
 
-/// Holds a flag for as long as it lives. Released by `Drop`, so a batch that
+/// Whether a batch is running, and which one, in a single word.
+///
+/// Both facts have to be read together -- a caller that learned "running" and
+/// "which" separately could mix two batches -- so they share one atomic: the
+/// low bit is "a batch is running" and the rest is the batch counter. Starting
+/// batch `n + 1` from idle is `+3` (one for the counter, one for the bit) and
+/// finishing it is `-1`.
+///
+/// The counter is the batch identity. A plain integer is enough: it has to tell
+/// this process's batches apart for as long as the process lives, nothing more,
+/// so there is no reason to take a UUID dependency for it. It is internal to
+/// the app and carries nothing from the files being cleaned.
+pub(crate) struct BatchState(AtomicU64);
+
+/// What the frontend is allowed to know about the pipeline: whether it is busy
+/// and which batch that is. Deliberately nothing else -- no paths, no file
+/// names, no counts, nothing read out of a video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProcessingState {
+    cleaning: bool,
+    /// The newest batch this process has started, `0` before the first one.
+    /// While `cleaning` it is the batch that is running.
+    batch_id: u64,
+}
+
+impl BatchState {
+    pub(crate) const fn new() -> Self {
+        BatchState(AtomicU64::new(0))
+    }
+
+    /// One load, so the flag and the id can never disagree.
+    pub(crate) fn snapshot(&self) -> ProcessingState {
+        let word = self.0.load(Ordering::Acquire);
+        ProcessingState {
+            cleaning: word & 1 == 1,
+            batch_id: word >> 1,
+        }
+    }
+
+    /// The running batch's id, or `None` when nothing is running.
+    fn active_id(&self) -> Option<u64> {
+        let state = self.snapshot();
+        state.cleaning.then_some(state.batch_id)
+    }
+}
+
+/// Holds the state for as long as it lives. Released by `Drop`, so a batch that
 /// ends in an error or a panic frees it too.
-struct BatchGuard(&'static AtomicBool);
+struct BatchGuard {
+    state: &'static BatchState,
+    id: u64,
+}
 
 impl BatchGuard {
-    /// Never waits: a second batch is refused, not queued.
-    fn try_acquire(flag: &'static AtomicBool) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| BatchGuard(flag))
+    /// Never waits: a second batch is refused, not queued. A refused attempt
+    /// consumes no id, so the id reported by `snapshot` is always the batch
+    /// that is really running.
+    fn try_acquire(state: &'static BatchState) -> Option<Self> {
+        let mut word = state.0.load(Ordering::Relaxed);
+        loop {
+            if word & 1 == 1 {
+                return None;
+            }
+            match state.0.compare_exchange_weak(
+                word,
+                word + 3,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(BatchGuard {
+                        state,
+                        id: (word >> 1) + 1,
+                    })
+                }
+                Err(actual) => word = actual,
+            }
+        }
     }
 }
 
 impl Drop for BatchGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        // Clears the running bit and leaves the counter where it is, so the
+        // next batch is a different one and this one is never handed out again.
+        self.state.0.fetch_sub(1, Ordering::Release);
     }
 }
 
 /// Everything `clean_videos` does once the app data folder is known, minus
-/// Tauri, so it can be tested as is. `busy` is taken before anything touches
+/// Tauri, so it can be tested as is. `state` is taken before anything touches
 /// the disk and held until the last file is verified.
 fn clean_request(
-    busy: &'static AtomicBool,
+    state: &'static BatchState,
     app_dir: &Path,
     paths: &[String],
     on_progress: impl FnMut(Progress),
 ) -> Result<CleanSummary, String> {
-    let _batch = BatchGuard::try_acquire(busy).ok_or_else(|| CLEAN_BUSY.to_string())?;
+    let batch = BatchGuard::try_acquire(state).ok_or_else(|| CLEAN_BUSY.to_string())?;
     let settings = load_settings(app_dir);
     if settings.output_directory.is_empty() {
         return Err("Choose an output folder first.".into());
     }
     let output_dir = PathBuf::from(&settings.output_directory);
 
-    run_batch(paths, &settings.prefix, &output_dir, app_dir, on_progress)
+    run_batch(
+        paths,
+        &settings.prefix,
+        &output_dir,
+        app_dir,
+        batch.id,
+        on_progress,
+    )
 }
 
 /// Clean, verify and report a batch, one file after another, emitting
@@ -1088,11 +1184,28 @@ fn clean_request(
 async fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary, String> {
     run_blocking(CLEAN_INTERNAL_ERROR, move || {
         let dir = app_dir(&app)?;
-        clean_request(&CLEAN_IN_PROGRESS, &dir, &paths, |progress| {
+        clean_request(&CLEAN_STATE, &dir, &paths, |progress| {
             let _ = app.emit("clean-progress", progress);
         })
     })
     .await
+}
+
+/// Whether cleaning is running, straight from the pipeline's own state.
+///
+/// The page that started a batch forgets it on reload; this does not. Anything
+/// whose correctness depends on a batch being over -- installing an update,
+/// closing the window, starting another batch -- asks here rather than trusting
+/// what React last remembered.
+#[tauri::command]
+fn get_processing_state() -> ProcessingState {
+    CLEAN_STATE.snapshot()
+}
+
+/// Whether a close request has to be refused. The window asks the pipeline, not
+/// the page: a reloaded page believes nothing is running.
+fn cleaning_blocks_close(state: &BatchState) -> bool {
+    state.active_id().is_some()
 }
 
 #[tauri::command]
@@ -1119,11 +1232,27 @@ pub fn run() {
             }
             Ok(())
         })
+        // A responsive window is a window whose close button works mid-batch.
+        // FFmpeg would carry on in its own process and leave a half-written
+        // temporary file behind, so a normal close is refused while a batch is
+        // running and the window says why. Only this one: nothing here tries to
+        // survive Task Manager, a shutdown or a crash.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if cleaning_blocks_close(&CLEAN_STATE) {
+                    api.prevent_close();
+                    // No payload: the window already knows what to say, and a
+                    // lifecycle event is no place for anything about the files.
+                    let _ = window.emit("close-blocked", ());
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             check_ffmpeg,
             get_supported_formats,
             get_settings,
             save_settings,
+            get_processing_state,
             scan_videos,
             clean_videos,
             open_folder
@@ -1538,11 +1667,11 @@ mod tests {
     fn batch_size_is_enforced_by_the_backend() {
         let dir = scratch("limit");
         let over: Vec<String> = (0..MAX_BATCH + 1).map(|i| format!("v{i}.mp4")).collect();
-        let err = run_batch(&over, "CLIP", &dir, &dir, |_| {}).unwrap_err();
+        let err = run_batch(&over, "CLIP", &dir, &dir, 1, |_| {}).unwrap_err();
         assert!(err.contains("101"), "unexpected message: {err}");
         assert!(err.contains(&MAX_BATCH.to_string()));
 
-        let err = run_batch(&[], "CLIP", &dir, &dir, |_| {}).unwrap_err();
+        let err = run_batch(&[], "CLIP", &dir, &dir, 1, |_| {}).unwrap_err();
         assert_eq!(err, "No videos selected");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1743,7 +1872,7 @@ mod tests {
             .collect();
 
         let mut seen_processing = 0;
-        let summary = run_batch(&paths, "CLIP", &out, &dir, |p| {
+        let summary = run_batch(&paths, "CLIP", &out, &dir, 1, |p| {
             if p.status == "processing" {
                 seen_processing += 1;
             }
