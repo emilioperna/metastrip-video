@@ -1,9 +1,10 @@
 //! What the cleaner is about to do, stated before it does it.
 //!
 //! In v0.5 the plan is derived, never chosen: it is a description of the fixed
-//! pipeline applied to one particular file, not a set of options. It exists so
-//! the verifier has something concrete to check the output against, and so the
-//! UI can say what will be removed before anything is written.
+//! pipeline applied to one particular file, not a set of options. Two of its
+//! fields carry weight today -- `remove_chapters` and `remove_data_streams`
+//! gate verifier checks 5 and 6 -- and the rest describe the run. Nothing in
+//! the UI reads the plan yet, so no wording here reaches a user.
 //!
 //! The cleaner's behaviour is unchanged by this module. If a plan ever
 //! disagreed with `ffmpeg_args`, the plan would be the thing that is wrong.
@@ -24,20 +25,24 @@ pub struct CleaningPlan {
     /// `-map_chapters -1`. Reported as false when the input has no chapters, so
     /// the verifier does not claim to have removed something that never existed.
     pub remove_chapters: bool,
-    /// `-dn`. Same reasoning as chapters.
+    /// `-dn` for data streams, `-map -0:t?` for attachments. Same reasoning as
+    /// chapters: false when the input had no non-media track, so the verifier
+    /// does not claim to have removed something that never existed.
     pub remove_data_streams: bool,
     /// Human-readable description of the muxing route for this container.
     pub container_strategy: &'static str,
-    /// Stream indices that must survive, with their kind, so the verifier can
-    /// check that the media the user cares about is still there.
+    /// Stream indices that must survive, with their kind. Descriptive: the
+    /// verifier works from the inspected reports rather than from this list,
+    /// comparing every kind `is_media` keeps.
     pub preserved_streams: Vec<PreservedStream>,
     pub expected_removed_fields: usize,
     /// Findings that are not container bookkeeping: what the user is promised.
     pub sensitive_findings: usize,
     pub expected_removed_chapters: usize,
     pub expected_removed_data_streams: usize,
-    /// What the product promises about this run. Every entry is checked by the
-    /// verifier; nothing is listed here that is not actually confirmed.
+    /// What the product promises about this run. Every entry has a
+    /// corresponding check in `verify`, though the verifier does not read this
+    /// list: nothing is listed here that the run does not actually confirm.
     pub guarantees: Vec<&'static str>,
 }
 

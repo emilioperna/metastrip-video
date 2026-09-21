@@ -124,16 +124,60 @@ fn check(name: &'static str, passed: bool, detail: impl Into<String>) -> Verific
     }
 }
 
+/// The stamp `-fflags +bitexact` leaves behind: a bare `Lavf`, carrying no
+/// version and nothing about the machine that wrote it.
+const BITEXACT_ENCODER: &str = "Lavf";
+
+/// Whether a finding is that stamp rather than a disclosure out of the input.
+///
+/// Matroska and WebM write it back after every remux, so a file this app has
+/// already cleaned carries it into the next run with the same key, scope and
+/// value. Without this it looks like a sensitive field that survived cleaning,
+/// and re-cleaning an output reports a failure for a file that is in fact
+/// clean.
+fn is_bitexact_encoder_stamp(finding: &PrivacyFinding) -> bool {
+    // `detail` is "{key}: {value}", and a metadata key never contains ": ",
+    // so the first separator is the one that bounds the key.
+    finding.source_key == "encoder"
+        && finding
+            .detail
+            .split_once(": ")
+            .is_some_and(|(_, value)| value == BITEXACT_ENCODER)
+}
+
 /// Build the before/after rows from the input findings and whatever survived.
-fn before_after(before: &[PrivacyFinding], after: &[PrivacyFinding]) -> Vec<BeforeAfterRow> {
+///
+/// `survivors` is check 3's answer, reused rather than recomputed: a privacy
+/// row must not say a category is still present when the check that decides it
+/// says otherwise, or the table contradicts the "Verified" badge beside it.
+/// Technical rows still compare category labels, because container bookkeeping
+/// really is expected to come back.
+fn before_after(
+    before: &[PrivacyFinding],
+    after: &[PrivacyFinding],
+    survivors: &[PrivacyFinding],
+) -> Vec<BeforeAfterRow> {
     let mut rows: Vec<BeforeAfterRow> = Vec::new();
     for finding in before {
+        // The same exemption check 3 makes. Forcing this app's own stamp to
+        // "Removed" would state the opposite of what is in the output, which
+        // carries the identical bare `Lavf`. Skipping it before the row is
+        // opened means a genuine Software finding still gets one.
+        if is_bitexact_encoder_stamp(finding) {
+            continue;
+        }
         if rows.iter().any(|r| r.category == finding.category_label) {
             continue;
         }
-        let survived = after
-            .iter()
-            .any(|a| a.category_label == finding.category_label);
+        let survived = if finding.category.is_structural() {
+            after
+                .iter()
+                .any(|a| a.category_label == finding.category_label)
+        } else {
+            survivors
+                .iter()
+                .any(|s| s.category_label == finding.category_label)
+        };
         rows.push(BeforeAfterRow {
             category: finding.category_label,
             severity: finding.severity_label,
@@ -219,11 +263,18 @@ pub fn verify(
     //    still carries the same value. A muxer rewriting its own tag is not a
     //    surviving disclosure: `encoder` goes from `Lavf62.12.102`, which pins
     //    the exact build, to the bare `Lavf` that `-fflags +bitexact` produces.
-    //    Check 4 below independently rejects anything sensitive appearing in the
-    //    output under any value, so a partial rewrite cannot slip through.
+    //
+    //    Check 4 is NOT the net that makes this safe: it only looks at MEDIUM
+    //    and above, and `encoder` is LOW, so it can never flag this field. What
+    //    makes it safe is that the muxer writes the same bare `Lavf` whatever
+    //    the input said, so a match here carries nothing out of the input. Keep
+    //    `is_bitexact_encoder_stamp` pinned to that exact value for the same
+    //    reason: widen it and there is no second check behind it.
     let mut survivors: Vec<PrivacyFinding> = Vec::new();
     for finding in before_findings {
-        if finding.category.is_structural() {
+        // Structural bookkeeping, and this app's own bitexact stamp: neither is
+        // a disclosure the input made, so neither is one that can survive.
+        if finding.category.is_structural() || is_bitexact_encoder_stamp(finding) {
             continue;
         }
         let still_there = after_findings.iter().any(|a| {
@@ -283,15 +334,19 @@ pub fn verify(
     let before_data = before.non_media_streams().count();
     let data_removed = before_data.saturating_sub(after_data);
     let data_ok = !plan.remove_data_streams || after_data == 0;
+    // Named for the set it measures. `non_media_streams` is data, attachment
+    // and unknown tracks, so calling all of them "data" would describe an
+    // embedded font as something the file does not contain -- and this detail
+    // is what `failed_check_summary` shows the user when the check fails.
     checks.push(check(
-        "Data tracks removed",
+        "Non-media tracks removed",
         data_ok,
         if !plan.remove_data_streams {
-            "The original had no data tracks".to_string()
+            "The original had no data or attachment tracks".to_string()
         } else if data_ok {
-            format!("{data_removed} data track(s) removed")
+            format!("{data_removed} non-media track(s) removed")
         } else {
-            format!("{after_data} data track(s) remain")
+            format!("{after_data} non-media track(s) remain")
         },
     ));
 
@@ -300,7 +355,11 @@ pub fn verify(
     //    comment for what this does and does not establish.
     let mut identity_ok = true;
     let mut identity_detail = String::new();
-    for kind in [StreamKind::Video, StreamKind::Audio] {
+    // Every kind `is_media` keeps, so the check covers what its name claims.
+    // A subtitle track is copied through like the rest and nothing else in the
+    // report would notice it going missing: it is not counted by check 6
+    // either, because `non_media_streams` excludes it.
+    for kind in [StreamKind::Video, StreamKind::Audio, StreamKind::Subtitle] {
         let source: Vec<_> = before.streams.iter().filter(|s| s.kind == kind).collect();
         let result: Vec<_> = after.streams.iter().filter(|s| s.kind == kind).collect();
         if source.len() != result.len() {
@@ -329,18 +388,19 @@ pub fn verify(
         }
     }
     if identity_ok {
-        let video = before
-            .streams
-            .iter()
-            .filter(|s| s.kind == StreamKind::Video)
-            .count();
-        let audio = before
-            .streams
-            .iter()
-            .filter(|s| s.kind == StreamKind::Audio)
-            .count();
-        identity_detail =
-            format!("{video} video and {audio} audio stream(s) with codec parameters preserved");
+        let count = |kind: StreamKind| before.streams.iter().filter(|s| s.kind == kind).count();
+        let (video, audio, subtitle) = (
+            count(StreamKind::Video),
+            count(StreamKind::Audio),
+            count(StreamKind::Subtitle),
+        );
+        identity_detail = if subtitle > 0 {
+            format!(
+                "{video} video, {audio} audio and {subtitle} subtitle stream(s) with codec parameters preserved"
+            )
+        } else {
+            format!("{video} video and {audio} audio stream(s) with codec parameters preserved")
+        };
     }
     checks.push(check(STREAM_PARAMETERS_CHECK, identity_ok, identity_detail));
 
@@ -398,6 +458,8 @@ pub fn verify(
             .filter(|f| is_technical_field(f))
             .count()
     };
+    // Built before the report takes ownership of `survivors`.
+    let before_after_rows = before_after(before_findings, &after_findings, &survivors);
     let (before_technical, after_technical) = (technical_count(before), technical_count(&after));
     let privacy_fields_removed = (before.fields.len() - before_technical)
         .saturating_sub(after.fields.len() - after_technical);
@@ -412,7 +474,7 @@ pub fn verify(
         chapters_removed,
         data_streams_removed: data_removed,
         residual: survivors,
-        before_after: before_after(before_findings, &after_findings),
+        before_after: before_after_rows,
     }
 }
 

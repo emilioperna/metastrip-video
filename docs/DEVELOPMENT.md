@@ -139,7 +139,8 @@ them changes what the product does, and every one of them is there for a reason 
 enforces. ISO-BMFF profiles add faststart on the first attempt and may retry once
 without it. Other profiles never receive MOV options. AVI adds `-ignore_unknown`
 because FFmpeg exposes AVI data tracks as unknown streams; `-dn` still handles streams
-classified as data. M4V output explicitly selects the MP4 muxer because FFmpeg
+classified as data, and `-map -0:t?` excludes attachment streams, which `-dn` does not
+reach and which only Matroska can carry. M4V output explicitly selects the MP4 muxer because FFmpeg
 otherwise maps the `.m4v` suffix to a raw MPEG-4 video muxer; a bounded ISO-BMFF box
 check rejects raw M4V elementary streams before processing. No fallback ever replaces
 `-c copy` with an encoder.
@@ -210,7 +211,9 @@ Nothing downstream sees raw ffprobe JSON. The UI receives `ScanView`, never a
 Two things the parser deliberately tolerates, because ffprobe does them: numbers
 arriving either quoted or bare (`"640"` and `640`), and fields simply being
 absent. An unrecognised `codec_type` becomes `StreamKind::Unknown`, which still
-counts as a non-media track so `-dn` is described correctly.
+counts as a non-media track, so the verifier expects it gone. Which argument
+removes it depends on the kind: `-dn` covers data streams, `-map -0:t?` covers
+attachments, and neither covers the other.
 
 ### Classifier
 
@@ -268,9 +271,11 @@ made verification fail on every MOV and MKV for no privacy gain.
 ### Cleaning plan
 
 `CleaningPlan` describes what the cleaner will do to one specific file:
-metadata scopes, whether chapters and data tracks actually exist to remove, the
-container strategy, the streams that must survive and the guarantees the verifier
-will check.
+metadata scopes, whether chapters and non-media tracks actually exist to remove,
+the container strategy, the streams that must survive and the guarantees the
+product makes about the run. Two of its fields are load-bearing today --
+`remove_chapters` and `remove_data_streams` gate verifier checks 5 and 6 -- and
+the rest are descriptive.
 
 It is **derived, never chosen**. v0.5 exposes no way to edit it; it exists so the
 verifier has something concrete to check against and so a later Cleaning Profiles
@@ -289,9 +294,9 @@ anywhere in the UI:
 3. no disclosure from the input survives;
 4. nothing at MEDIUM or above is present in the output;
 5. chapters are gone, where the input had any;
-6. data tracks are gone, where the input had any;
-7. video and audio are still present and their media stream parameters match
-   (a parameter comparison, not packet identity);
+6. data and attachment tracks are gone, where the input had any;
+7. video, audio and subtitle streams are still present and their media stream
+   parameters match (a parameter comparison, not packet identity);
 8. the original is unchanged;
 9. the extension is preserved;
 10. no temporary file is left in the output folder.

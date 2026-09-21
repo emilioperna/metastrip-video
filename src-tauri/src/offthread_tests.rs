@@ -37,11 +37,22 @@ where
 {
 }
 
+/// The same guarantee for a command that takes no arguments.
+fn assert_async_nullary<F, Fut, T>(_: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+{
+}
+
 #[test]
 fn the_media_commands_are_async() {
     // Revert either one to a plain `fn` (the v0.4 freeze) and this stops building.
     assert_async_command(crate::scan_videos);
     assert_async_command(crate::clean_videos);
+    // Starts two processes while the window is first drawing, so it belongs on
+    // the pool too. A plain `fn` here stops this building.
+    assert_async_nullary(crate::check_ffmpeg);
 }
 
 #[test]

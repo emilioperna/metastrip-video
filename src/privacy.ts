@@ -319,7 +319,11 @@ export function detailFacts(
   if (duration) facts.push(duration);
   facts.push(
     `${scan.videoStreams} video · ${scan.audioStreams} audio` +
-      (scan.otherStreams > 0 ? ` · ${scan.otherStreams} data` : ""),
+      // "other", not "data": this bucket is every non-media stream the file
+      // carries, which for a Matroska is typically an attachment rather than a
+      // data track. Calling an embedded font a data track states something the
+      // file does not contain.
+      (scan.otherStreams > 0 ? ` · ${scan.otherStreams} other` : ""),
   );
   if (scan.chapterCount > 0) facts.push(`${scan.chapterCount} chapters`);
   return facts;

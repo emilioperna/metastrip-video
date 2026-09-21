@@ -425,6 +425,21 @@ fn ffmpeg_args(
         input.to_string_lossy().into_owned(),
         "-map".into(),
         "0".into(),
+        // `-map 0` selects attachment streams as well, and `-dn` does not reach
+        // them: it drops data streams only. Matroska is the one supported
+        // container that can carry an attachment -- an embedded subtitle font,
+        // typically -- and `-map_metadata:s -1` below strips the `filename` and
+        // `mimetype` tags its muxer requires for one, so leaving an attachment
+        // mapped fails the whole file at header write. Excluding it removes the
+        // embedded payload, which is what the scan already tells the user
+        // happens. The `?` keeps the negative map inert on every container that
+        // cannot carry one. Cover art is untouched wherever FFmpeg reports the
+        // embedded image as a video stream: MP4 and MOV `covr`, and Matroska
+        // covers whose mimetype maps to an image codec. A Matroska cover under
+        // any other mimetype really is an attachment and goes with the rest,
+        // which is the right outcome for an opaque embedded file.
+        "-map".into(),
+        "-0:t?".into(),
         "-c".into(),
         "copy".into(),
         // Global metadata, per-stream metadata and chapters all dropped.
@@ -436,7 +451,8 @@ fn ffmpeg_args(
         "-1".into(),
         // `-map 0` copies data tracks too, and those carry metadata of their own:
         // GoPro `gpmd` telemetry, iPhone `mebx`, chapter text. Dropped, payload
-        // and all.
+        // and all. Data streams only -- attachments are handled by the negative
+        // map above.
         "-dn".into(),
         "-fflags".into(),
         "+bitexact".into(),
@@ -452,17 +468,84 @@ fn ffmpeg_args(
     args
 }
 
-fn last_ffmpeg_error(stderr: &[u8]) -> String {
+/// FFmpeg's sign-off when a run fails. It says only that something went wrong.
+const FFMPEG_TERMINATOR: &str = "Conversion failed!";
+
+/// Lines FFmpeg prints on its way out that describe the run rather than what
+/// went wrong: the sign-off, the progress counter, the size summary and the
+/// repeat marker.
+///
+/// A failure before or at header write puts the error last. A failure after
+/// muxing has started does not: the errors come first, then this tail. Taking
+/// one line back from the sign-off would then hand the user `frame= 76 fps=0.0
+/// ... speed= 321x`, which reads like a success report. These patterns are
+/// deliberately narrow -- they must never match a line that begins with
+/// `Error`, which is the diagnostic we are walking back to find.
+fn is_ffmpeg_run_summary(line: &str) -> bool {
+    line == FFMPEG_TERMINATOR
+        || line.starts_with("frame=")
+        || line.starts_with("size=")
+        || line.starts_with("Last message repeated")
+        || line.contains("muxing overhead:")
+}
+
+/// Drops an `[out#0/matroska @ 0000017db62c0ac0] ` style prefix. The component
+/// name means nothing to a user and the value after the `@` is a heap address,
+/// which has no business on screen.
+fn strip_component_prefix(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix('[') else {
+        return line;
+    };
+    let Some(end) = rest.find("] ") else {
+        return line;
+    };
+    if !rest[..end].contains(" @ ") {
+        return line;
+    }
+    rest[end + 2..].trim_start()
+}
+
+/// The most useful single line FFmpeg wrote, made safe to show.
+///
+/// One line, never the whole of stderr: the rest is the banner, the input
+/// report and the stream mapping, none of which means anything here. The paths
+/// this app handed FFmpeg are replaced by what they are, because the message is
+/// shown beside the file's own name and an absolute path adds nothing to it.
+fn last_ffmpeg_error(stderr: &[u8], output: &Path, output_dir: &Path) -> String {
     let text = String::from_utf8_lossy(stderr);
-    let message = text
+    let lines: Vec<&str> = text
         .lines()
-        .map(|l| l.trim())
-        .rfind(|l| !l.is_empty())
-        .unwrap_or_default();
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // Walk back over the closing summary rather than assuming it is one line.
+    // If every line is summary, its last line still beats saying nothing.
+    let message = lines
+        .iter()
+        .rev()
+        .find(|line| !is_ffmpeg_run_summary(line))
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("FFmpeg failed");
+
+    let mut message = strip_component_prefix(message).to_string();
+    // Longest first: the folder is a prefix of the file. Bracketed so the
+    // result reads as a redaction rather than as a strange file name.
+    for (path, replacement) in [(output, "[output file]"), (output_dir, "[output folder]")] {
+        let raw = path.to_string_lossy();
+        if !raw.is_empty() {
+            message = message.replace(raw.as_ref(), replacement);
+        }
+    }
+    if let Some(name) = output.file_name().and_then(|name| name.to_str()) {
+        message = message.replace(name, "[output file]");
+    }
+
     if message.is_empty() {
         "FFmpeg failed".into()
     } else {
-        message.to_string()
+        message
     }
 }
 
@@ -563,7 +646,7 @@ fn clean_one(
             return Ok(final_name);
         }
 
-        last_error = last_ffmpeg_error(&result.stderr);
+        last_error = last_ffmpeg_error(&result.stderr, &temp_path, output_dir);
         // ISO-BMFF gets one retry without faststart. Other profiles have exactly
         // one attempt. Removing the partial output is required because `-n` must
         // keep protecting every invocation from overwrites.
@@ -847,15 +930,20 @@ fn run_batch(
     })
 }
 
-/// A short, safe description of why a file is not verified. Only the names of
-/// the checks that failed and their details, all of which are generated by this
-/// app rather than copied out of the media file.
+/// A short, safe description of why a file is not verified. Only the details of
+/// the checks that failed, all of which are generated by this app rather than
+/// copied out of the media file.
+///
+/// The details, not the names: every check is named for the thing it asserts
+/// ("Sensitive metadata removed"), so listing names after "Verification failed"
+/// states the opposite of what happened. Each detail is already written in the
+/// failing direction ("3 sensitive field(s) survived").
 fn failed_check_summary(report: &VerificationReport) -> String {
     let failed: Vec<&str> = report
         .checks
         .iter()
         .filter(|c| !c.passed)
-        .map(|c| c.name)
+        .map(|c| c.detail.as_str())
         .collect();
     if failed.is_empty() {
         return "Verification did not pass.".to_string();
@@ -931,15 +1019,23 @@ fn get_supported_formats() -> Vec<SupportedFormatView> {
 ///
 /// FFprobe is checked alongside FFmpeg because the privacy scan depends on it;
 /// one clear message at startup beats the same failure on every file.
+///
+/// Async for the same reason the media commands are: each check starts a real
+/// process and waits for it, and this one runs while the window is drawing for
+/// the first time. On the window's own thread that is a visible stall before
+/// anything appears, and adding the probe made it two.
 #[tauri::command]
-fn check_ffmpeg() -> Option<&'static str> {
-    if !ffmpeg_available() {
-        return Some(FFMPEG_MISSING);
-    }
-    if !inspect::available() {
-        return Some(FFPROBE_MISSING);
-    }
-    None
+async fn check_ffmpeg() -> Result<Option<&'static str>, String> {
+    run_blocking(TOOLS_INTERNAL_ERROR, || {
+        if !ffmpeg_available() {
+            return Ok(Some(FFMPEG_MISSING));
+        }
+        if !inspect::available() {
+            return Ok(Some(FFPROBE_MISSING));
+        }
+        Ok(None)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -977,6 +1073,7 @@ fn save_settings(
 }
 
 // Shown instead of a panic message, which can carry file paths.
+const TOOLS_INTERNAL_ERROR: &str = "The bundled tools could not be checked.";
 const SCAN_INTERNAL_ERROR: &str = "The privacy scan stopped because of an internal error.";
 const CLEAN_INTERNAL_ERROR: &str =
     "Cleaning stopped because of an internal error. Files finished before it are in the output folder.";
@@ -1392,6 +1489,101 @@ mod tests {
     use super::*;
     use crate::testkit::*;
 
+    // ------------------------------------------ What FFmpeg is allowed to say ---
+
+    /// The message a user gets is one line, and it has to be the line that
+    /// names the problem. FFmpeg signs off with a generic "Conversion failed!",
+    /// so a mux failure would otherwise report nothing at all.
+    #[test]
+    fn a_mux_failure_reports_the_line_that_names_the_problem() {
+        let stderr = b"  Stream #0:3 -> #0:3 (copy)\n\
+[matroska @ 0000017db633bf00] Attachment stream 3 has no filename tag.\n\
+[out#0/matroska @ 0000017db62c0ac0] Could not write header (incorrect codec parameters ?): Invalid argument\n\
+Conversion failed!\n";
+        assert_eq!(
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mkv"), Path::new(r"C:\out")),
+            "Could not write header (incorrect codec parameters ?): Invalid argument"
+        );
+    }
+
+    /// The value after the `@` is a heap address. It is noise at best and an
+    /// internal detail at worst, and neither belongs on screen.
+    #[test]
+    fn an_ffmpeg_component_prefix_never_reaches_the_user() {
+        let stderr = b"[mov,mp4 @ 000002bd58e45280] moov atom not found\n";
+        let message =
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mp4"), Path::new(r"C:\out"));
+        assert_eq!(message, "moov atom not found");
+        assert!(!message.contains('@'));
+    }
+
+    /// FFmpeg echoes the path it was handed. That path is this app's temporary
+    /// file inside the user's own folder, and the row already names the file.
+    #[test]
+    fn the_output_path_is_redacted_out_of_the_message() {
+        let dir = Path::new(r"C:\Users\someone\Holiday");
+        let output = dir.join(format!("{TEMP_PREFIX}0000000001.mp4"));
+        let stderr = format!("Error opening output file {}.\n", output.display());
+
+        let message = last_ffmpeg_error(stderr.as_bytes(), &output, dir);
+
+        assert_eq!(message, "Error opening output file [output file].");
+        assert!(
+            !message.contains("someone"),
+            "a local path leaked: {message}"
+        );
+        assert!(!message.contains(TEMP_PREFIX));
+    }
+
+    /// The terminator is only stepped over. A single useful line stays put.
+    #[test]
+    fn an_input_failure_keeps_the_diagnostic_that_explains_it() {
+        let stderr = b"Error opening input files: Invalid data found when processing input\n";
+        assert_eq!(
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mp4"), Path::new(r"C:\out")),
+            "Error opening input files: Invalid data found when processing input"
+        );
+    }
+
+    /// A failure after muxing has started prints its errors first and its
+    /// closing summary last. Stepping back exactly one line from the sign-off
+    /// would hand the user a progress counter that reads like a success report.
+    #[test]
+    fn a_failure_after_muxing_starts_still_reports_an_error() {
+        let stderr = b"[vost#0:0/copy @ 000002703a7ca080] Error submitting a packet to the muxer: Invalid argument\n\
+    Last message repeated 1 times\n\
+[out#0/matroska @ 000002703a77ec40] Error muxing a packet\n\
+[out#0/matroska @ 000002703a77ec40] Error writing trailer: Invalid argument\n\
+[out#0/matroska @ 000002703a77ec40] Error closing file: Invalid argument\n\
+video:88KiB audio:5KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 1.234567%\n\
+frame=   76 fps=0.0 q=-1.0 Lsize=      94KiB time=00:00:03.12 bitrate= 248.1kbits/s speed= 321x\n\
+Conversion failed!\n";
+        let message =
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mkv"), Path::new(r"C:\out"));
+        assert_eq!(message, "Error closing file: Invalid argument");
+        assert!(
+            !message.starts_with("frame=") && !message.contains("speed="),
+            "a progress line was reported as the error: {message}"
+        );
+    }
+
+    /// Nothing to report is still not an empty message.
+    #[test]
+    fn silent_ffmpeg_output_still_produces_a_message() {
+        assert_eq!(
+            last_ffmpeg_error(b"", Path::new(r"C:\out\clip.mp4"), Path::new(r"C:\out")),
+            "FFmpeg failed"
+        );
+        assert_eq!(
+            last_ffmpeg_error(
+                b"Conversion failed!\n",
+                Path::new(r"C:\out\clip.mp4"),
+                Path::new(r"C:\out")
+            ),
+            "Conversion failed!"
+        );
+    }
+
     fn temp_files(output_dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(output_dir)
             .unwrap()
@@ -1432,10 +1624,16 @@ mod tests {
         let input_kinds = stream_kinds(&input);
         assert!(input_kinds.contains(&"Video".to_string()));
         assert!(input_kinds.contains(&"Audio".to_string()));
-        if let Some(data_stream_kind) = capabilities.data_stream_kind {
+        if let Some(kind) = capabilities.non_media_stream_kind {
             assert!(
-                input_kinds.contains(&data_stream_kind.to_string()),
-                "{extension} fixture lacks its expected data stream: {input_kinds:?}"
+                input_kinds.contains(&kind.to_string()),
+                "{extension} fixture lacks its expected non-media stream: {input_kinds:?}"
+            );
+        }
+        if capabilities.subtitle_codec.is_some() {
+            assert!(
+                input_kinds.contains(&"Subtitle".to_string()),
+                "{extension} fixture lacks its subtitle stream: {input_kinds:?}"
             );
         }
         if extension == "avi" {
@@ -1443,6 +1641,22 @@ mod tests {
                 contains(&before, DATA_CANARY),
                 "AVI fixture lacks its data payload canary"
             );
+        }
+        if capabilities.attaches() {
+            assert_eq!(
+                input_kinds
+                    .iter()
+                    .filter(|kind| *kind == "Attachment")
+                    .count(),
+                2,
+                "{extension} fixture lacks its two attachment streams: {input_kinds:?}"
+            );
+            for canary in [ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA] {
+                assert!(
+                    contains(&before, canary),
+                    "{extension} fixture lacks an attachment payload canary"
+                );
+            }
         }
 
         let source_video_hash = stream_payload_hash(&input, "0:v:0");
@@ -1477,16 +1691,54 @@ mod tests {
             );
         }
         let output_kinds = stream_kinds(&cleaned);
-        assert!(!output_kinds.contains(&"Data".to_string()));
+        // A whitelist, not a list of the two kinds that went wrong once. It
+        // mirrors `StreamKind::is_media`, which is what decides whether the
+        // cleaner keeps a stream, so any other kind surviving fails here
+        // whatever it is -- an attachment included.
         assert!(
-            !output_kinds.contains(&"Unknown".to_string()),
-            "{extension} output still has an unknown/data stream"
+            output_kinds
+                .iter()
+                .all(|kind| matches!(kind.as_str(), "Video" | "Audio" | "Subtitle")),
+            "{extension} output kept a non-media stream: {output_kinds:?}"
         );
+        // And the media the user came for is still there.
+        assert!(output_kinds.contains(&"Video".to_string()));
+        assert!(output_kinds.contains(&"Audio".to_string()));
+        if capabilities.subtitle_codec.is_some() {
+            assert!(
+                output_kinds.contains(&"Subtitle".to_string()),
+                "{extension} lost its subtitle track: {output_kinds:?}"
+            );
+        }
+        let cleaned_bytes = std::fs::read(&cleaned).unwrap();
+        // Subtitles are kept, so the proof is symmetrical with the attachment
+        // one below: the stream is still there AND its payload came through. A
+        // remux that kept an empty subtitle track would pass the kind check.
+        if capabilities.subtitle_codec.is_some() {
+            assert!(
+                contains(&cleaned_bytes, SUBTITLE_BODY.as_bytes()),
+                "{extension} lost its subtitle payload"
+            );
+        }
         if extension == "avi" {
             assert!(
-                !contains(&std::fs::read(&cleaned).unwrap(), DATA_CANARY),
+                !contains(&cleaned_bytes, DATA_CANARY),
                 "AVI data payload survived"
             );
+        }
+        if capabilities.attaches() {
+            for canary in [ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA] {
+                assert!(
+                    !contains(&cleaned_bytes, canary),
+                    "{extension} attachment payload survived"
+                );
+            }
+            for name in [ATTACHMENT_NAME_ALPHA, ATTACHMENT_NAME_BETA] {
+                assert!(
+                    !contains(&cleaned_bytes, name.as_bytes()),
+                    "{extension} attachment filename survived"
+                );
+            }
         }
 
         // H: the encoded video and audio packet payloads are byte-identical.
@@ -1566,6 +1818,25 @@ mod tests {
                     "unexpected unknown-stream policy for {}",
                     profile.extension
                 );
+                // Attachments are excluded on every profile, not only on the
+                // one container that can carry them: a negative map is inert
+                // where there is nothing to match, and making it conditional
+                // would be a second rule to keep in step with the muxers.
+                let pair_at = |first: &str, second: &str| {
+                    args.windows(2)
+                        .position(|pair| pair[0] == first && pair[1] == second)
+                };
+                let map_all = pair_at("-map", "0")
+                    .unwrap_or_else(|| panic!("{} maps no streams", profile.extension));
+                let drop_attachments = pair_at("-map", "-0:t?").unwrap_or_else(|| {
+                    panic!("{} does not exclude attachment streams", profile.extension)
+                });
+                assert!(
+                    drop_attachments > map_all,
+                    "{}: the attachment exclusion must follow `-map 0`",
+                    profile.extension
+                );
+
                 let codec = args.iter().position(|arg| arg == "-c").unwrap();
                 assert_eq!(args[codec + 1], "copy");
                 let muxer = args.iter().position(|arg| arg == "-f").unwrap();

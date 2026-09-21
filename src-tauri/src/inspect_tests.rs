@@ -125,7 +125,8 @@ fn a_sparse_or_unusual_document_degrades_instead_of_panicking() {
     assert_eq!(empty.file_size, None);
 
     // An unrecognised codec_type is Unknown, not a crash, and still counts as a
-    // non-media track so the cleaner's `-dn` is still described correctly.
+    // non-media track, so the verifier still expects it gone. Which argument
+    // removes it depends on the kind: `-dn` covers data streams only.
     let odd = parse_ffprobe_json(
         "x.mp4",
         r#"{"streams":[{"index":0,"codec_type":"quantum"},{"index":1}]}"#,
@@ -192,7 +193,18 @@ fn a_real_fixture_is_inspected_through_the_bundled_ffprobe() {
             .any(|f| f.scope == MetadataScope::Stream),
         "no per-stream metadata was found"
     );
-    assert_eq!(report.media_streams().count(), 2);
+    // Video, audio and the subtitle track. `media_streams` is every kind the
+    // cleaner keeps, and a subtitle is one of them.
+    assert_eq!(report.media_streams().count(), 3);
+    assert_eq!(
+        report
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Subtitle)
+            .count(),
+        1,
+        "the inspector did not see the fixture's subtitle track"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

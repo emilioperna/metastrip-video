@@ -25,6 +25,22 @@ pub fn scratch(name: &str) -> PathBuf {
 /// proof that the track itself is gone, not merely its tags.
 pub const DATA_CANARY: &[u8] = b"DATA_TRACK_CANARY";
 
+/// Payloads planted in a fixture's attachment streams, for the same reason.
+/// Two of them, because a real Matroska carries a set of fonts rather than one,
+/// and dropping only the first would otherwise pass. Deliberately not prefixes
+/// of one another, so `contains` cannot match one inside the other.
+pub const ATTACHMENT_CANARY_ALPHA: &[u8] = b"ATTACHMENT_ALPHA_CANARY";
+pub const ATTACHMENT_CANARY_BETA: &[u8] = b"ATTACHMENT_BETA_CANARY";
+
+/// File names the attachments are planted under. Matroska stores the name in a
+/// `filename` tag, so it is a second canary that costs nothing.
+pub const ATTACHMENT_NAME_ALPHA: &str = "fixture-alpha.ttf";
+pub const ATTACHMENT_NAME_BETA: &str = "fixture-beta.otf";
+
+/// Body of the fixture subtitle track. Subtitles are media: the cleaner keeps
+/// them, so this must still be there afterwards.
+pub const SUBTITLE_BODY: &str = "SUBTITLE_BODY_KEPT";
+
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -181,7 +197,26 @@ pub struct FixtureCapabilities {
     pub video_codec: &'static str,
     pub audio_codec: &'static str,
     pub chapters: bool,
-    pub data_stream_kind: Option<&'static str>,
+    /// The kind FFmpeg reports for the non-media stream this fixture plants, or
+    /// `None` where the container cannot carry one. Named for what
+    /// `non_media_streams` actually means -- Data, Attachment or Unknown --
+    /// rather than for data alone, which is how an attachment-bearing MKV came
+    /// to have no fixture at all.
+    pub non_media_stream_kind: Option<&'static str>,
+    /// Subtitle codec this container accepts, where it accepts one. Subtitles
+    /// are kept by the cleaner, so a fixture carrying one proves preservation
+    /// rather than removal.
+    pub subtitle_codec: Option<&'static str>,
+}
+
+impl FixtureCapabilities {
+    /// Whether this fixture plants attachment streams, which only Matroska can
+    /// carry: the ISO-BMFF and AVI muxers refuse them outright, and the WebM
+    /// muxer accepts the argument and then silently writes no attachment, which
+    /// would leave an assertion passing against a stream that is not there.
+    pub fn attaches(self) -> bool {
+        self.non_media_stream_kind == Some("Attachment")
+    }
 }
 
 /// What each container can actually carry. Pretending a muxer supports metadata
@@ -193,27 +228,34 @@ pub fn fixture_capabilities(extension: &str) -> FixtureCapabilities {
             audio_codec: "aac",
             chapters: true,
             // FFmpeg represents ISO-BMFF chapters with a timed text/data track.
-            data_stream_kind: Some("Data"),
+            non_media_stream_kind: Some("Data"),
+            subtitle_codec: Some("mov_text"),
         },
         "mkv" => FixtureCapabilities {
             video_codec: "mpeg4",
             audio_codec: "aac",
             chapters: true,
-            data_stream_kind: None,
+            // The only supported container that can carry an attachment.
+            non_media_stream_kind: Some("Attachment"),
+            subtitle_codec: Some("srt"),
         },
         "webm" => FixtureCapabilities {
             video_codec: "libvpx",
             audio_codec: "libopus",
             chapters: true,
-            data_stream_kind: None,
+            // WebM has no attachments element and no data streams.
+            non_media_stream_kind: None,
+            subtitle_codec: Some("webvtt"),
         },
         "avi" => FixtureCapabilities {
             video_codec: "mpeg4",
             audio_codec: "libmp3lame",
             // FFmpeg's AVI muxer does not write chapters. It can carry a data
-            // stream, but reports it as `Unknown: none` when demuxing.
+            // stream, but reports it as `Unknown: none` when demuxing, and it
+            // takes no subtitles.
             chapters: false,
-            data_stream_kind: Some("Unknown"),
+            non_media_stream_kind: Some("Unknown"),
+            subtitle_codec: None,
         },
         other => panic!("missing fixture capabilities for {other}"),
     }
@@ -289,6 +331,31 @@ pub fn sample_for_format(dir: &Path, extension: &str) -> PathBuf {
         std::fs::write(&data_path, DATA_CANARY).unwrap();
     }
 
+    let subtitle_path = dir.join(format!("fixture-{extension}.srt"));
+    if capabilities.subtitle_codec.is_some() {
+        std::fs::write(
+            &subtitle_path,
+            format!("1\n00:00:00,000 --> 00:00:01,500\n{SUBTITLE_BODY}\n\n"),
+        )
+        .unwrap();
+    }
+
+    let attachment_paths: Vec<PathBuf> = if capabilities.attaches() {
+        [
+            (ATTACHMENT_NAME_ALPHA, ATTACHMENT_CANARY_ALPHA),
+            (ATTACHMENT_NAME_BETA, ATTACHMENT_CANARY_BETA),
+        ]
+        .iter()
+        .map(|(name, payload)| {
+            let attachment = dir.join(name);
+            std::fs::write(&attachment, payload).unwrap();
+            attachment
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+
     let path = dir.join(format!("fixture.{extension}"));
     let mut command = ffmpeg();
     command
@@ -307,12 +374,22 @@ pub fn sample_for_format(dir: &Path, extension: &str) -> PathBuf {
             "-i",
         ])
         .arg(&metadata_path);
-    if extension == "avi" {
+    // Inputs after the metadata one. Subtitles and the AVI data track never
+    // coexist, so both take index 3.
+    let subtitle_input = capabilities.subtitle_codec.map(|_| {
+        command.arg("-i").arg(&subtitle_path);
+        3
+    });
+    let data_input = (extension == "avi").then(|| {
         command.args(["-f", "data", "-i"]).arg(&data_path);
-    }
+        3
+    });
     command.args(["-map", "0:v:0", "-map", "1:a:0", "-map_metadata", "2"]);
-    if extension == "avi" {
-        command.args(["-map", "3:0"]);
+    if let Some(index) = subtitle_input {
+        command.args(["-map", &format!("{index}:s:0")]);
+    }
+    if let Some(index) = data_input {
+        command.args(["-map", &format!("{index}:0")]);
     }
     if capabilities.chapters {
         command.args(["-map_chapters", "2"]);
@@ -331,11 +408,23 @@ pub fn sample_for_format(dir: &Path, extension: &str) -> PathBuf {
         "-c:a",
         capabilities.audio_codec,
     ]);
+    if let Some(codec) = capabilities.subtitle_codec {
+        command.args(["-c:s", codec]);
+    }
     if extension == "avi" {
         command.args(["-c:d", "copy"]);
     }
     if extension == "webm" {
         command.args(["-deadline", "realtime", "-cpu-used", "8"]);
+    }
+    for (index, attachment) in attachment_paths.iter().enumerate() {
+        command.arg("-attach").arg(attachment);
+        // Matroska refuses to write an attachment whose mimetype it cannot work
+        // out, so without this the fixture itself would not build.
+        command.args([
+            format!("-metadata:s:t:{index}"),
+            "mimetype=application/x-truetype-font".to_string(),
+        ]);
     }
     let built = command
         .args(["-f", profile.output_muxer])

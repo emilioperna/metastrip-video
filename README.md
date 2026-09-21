@@ -167,7 +167,7 @@ For each file, MetaStrip invokes the bundled FFmpeg with this common stream-copy
 
 ```
 ffmpeg -n -i INPUT \
-  -map 0 -c copy \
+  -map 0 -map -0:t? -c copy \
   -map_metadata -1 \
   -map_metadata:s -1 \
   -map_chapters -1 \
@@ -183,6 +183,14 @@ ffmpeg -n -i INPUT \
   per-stream metadata and chapters.
 - `-dn` drops data tracks. `-map 0` would otherwise copy them, and a data track is
   metadata in its own right.
+- `-map -0:t?` drops attachment tracks: embedded subtitle fonts and similar files,
+  which Matroska can carry. `-dn` does not reach them, and stripping per-stream
+  metadata would leave such a track without the `filename` tag its muxer requires,
+  failing the whole file. Cover art is unaffected wherever FFmpeg reports the
+  embedded image as a video stream (`attached_pic`): MP4 and MOV `covr`, and
+  Matroska covers whose mimetype maps to an image codec. A Matroska cover
+  attached under some other mimetype is an attachment stream and is removed with
+  the rest, which is the right outcome for an opaque embedded file.
 - `-fflags +bitexact` keeps FFmpeg from stamping its own version into the output.
 
 Container-specific behaviour is explicit:

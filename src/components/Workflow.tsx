@@ -708,8 +708,12 @@ export function CompletionSummary({ summary, onOpenFolder, onReset }: Completion
     );
   }
   if (summary.dataStreamsRemoved > 0) {
+    // "other", for the same reason the scan line says it: this counter is every
+    // non-media track removed, and for a Matroska that is typically an embedded
+    // font rather than a data track. This line shows on a passing run, so the
+    // noun has to be one the file can actually justify.
     stats.push(
-      `${summary.dataStreamsRemoved} data ${summary.dataStreamsRemoved === 1 ? "track" : "tracks"} removed`,
+      `${summary.dataStreamsRemoved} other ${summary.dataStreamsRemoved === 1 ? "track" : "tracks"} removed`,
     );
   }
   if (summary.chaptersRemoved > 0) {

@@ -7,7 +7,7 @@
 use super::*;
 use crate::testkit::{
     assert_ffmpeg_can_read, expected_categories, sample_for_format, scratch, stream_payload_hash,
-    DATA_CANARY,
+    ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA, DATA_CANARY,
 };
 use crate::{clean_and_verify, validate_input, IdRegistry, TEMP_PREFIX};
 
@@ -73,28 +73,28 @@ fn assert_verified_clean(extension: &str) {
         !report.before_after.is_empty(),
         "{extension} produced no before/after rows"
     );
-    // Every category that was present must be gone, with two documented
-    // exceptions the muxer writes back on the way out and the table reports
-    // truthfully rather than hiding: container bookkeeping, and the `encoder`
-    // tag that Matroska and WebM regenerate as a bare `Lavf` under
-    // `-fflags +bitexact`.
+    // Every privacy category that was present must read as removed. Container
+    // bookkeeping is the one exception, and it is shown apart as technical.
+    //
+    // `Software` used to be a second exception here, for Matroska and WebM:
+    // those muxers regenerate an `encoder` tag, and the table compared category
+    // labels, so it called the category present again on a file every check had
+    // just passed. The table now answers with the same rule check 3 uses, so
+    // the exception is gone.
+    //
+    // What this is and is not: since the table reads from check 3's survivors,
+    // `report.verified` above already implies these rows. It is a regression
+    // guard -- revert the table to comparing category labels and it fires --
+    // not an independent measurement. The independent one is
+    // `the_planted_canaries_are_found_before_and_gone_after`, which re-inspects
+    // and re-classifies the output rather than trusting the report.
     for row in &report.before_after {
         assert_eq!(row.before, "Present");
-        if row.category == "Structural" || row.category == "Software" {
+        if row.technical {
             continue;
         }
         assert_eq!(row.after, "Removed", "{extension} kept {}", row.category);
         assert!(row.removed);
-    }
-    // The exception is narrow: only Matroska-family outputs may keep Software.
-    if !matches!(extension, "mkv" | "webm") {
-        assert!(
-            report
-                .before_after
-                .iter()
-                .all(|r| r.category != "Software" || r.removed),
-            "{extension} kept a Software tag it should have dropped"
-        );
     }
 
     assert_ffmpeg_can_read(&output);
@@ -411,8 +411,13 @@ fn a_transcoded_output_fails_the_stream_parameters_check() {
     let built = crate::sidecar::ffmpeg()
         .args(["-y", "-i"])
         .arg(&input)
+        // The subtitle is carried through so the video codec is the ONLY
+        // difference from the input. Dropping it here would make check 7 fail
+        // on a stream count as well, and the codec comparison this test exists
+        // to pin would no longer be the reason it fires.
         .args([
-            "-map", "0:v:0", "-map", "0:a:0", "-c:v", "mjpeg", "-c:a", "aac", "-t", "2",
+            "-map", "0:v:0", "-map", "0:a:0", "-map", "0:s:0", "-c:v", "mjpeg", "-c:a", "aac",
+            "-c:s", "copy", "-t", "2",
         ])
         .arg(&transcoded)
         .output()
@@ -447,5 +452,227 @@ fn a_transcoded_output_fails_the_stream_parameters_check() {
         "the stream parameters check did not fire: {:?}",
         failed_names(&report)
     );
+    // And it fired for the right reason. Without this the test would still pass
+    // if the codec comparison were deleted and the check failed on a count.
+    let stream_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == STREAM_PARAMETERS_CHECK)
+        .unwrap();
+    assert!(
+        stream_check.detail.contains("changed codec parameters"),
+        "the failure was not attributed to the codec comparison: {}",
+        stream_check.detail
+    );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_attachment_payload_is_gone_and_verification_says_so() {
+    // Matroska is the one supported container that can carry an attachment, so
+    // this is the only fixture that can prove the payload really leaves.
+    let dir = scratch("verify-attachment");
+    let input = sample_for_format(&dir, "mkv");
+    let raw = std::fs::read(&input).unwrap();
+    for canary in [ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA] {
+        assert!(
+            crate::testkit::contains(&raw, canary),
+            "the MKV fixture lost an attachment canary; the test would prove nothing"
+        );
+    }
+
+    let (name, report) = clean(&dir, &input);
+    let output = dir.join("out").join(&name);
+
+    assert!(report.verified, "{:?}", failed_names(&report));
+    assert!(
+        report.data_streams_removed >= 2,
+        "both attachments should be counted as removed, got {}",
+        report.data_streams_removed
+    );
+    let cleaned = std::fs::read(&output).unwrap();
+    for canary in [ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA] {
+        assert!(
+            !crate::testkit::contains(&cleaned, canary),
+            "an attachment payload is still recoverable"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cleaning_an_already_cleaned_file_still_verifies() {
+    // Matroska and WebM write `encoder=Lavf` back on every remux, so a second
+    // pass meets the same key, scope and value the first pass wrote. Counting
+    // this app's own bitexact stamp as a surviving disclosure would report a
+    // failure for a file that is in fact clean.
+    for extension in ["mkv", "webm"] {
+        let dir = scratch(&format!("verify-reclean-{extension}"));
+        let input = sample_for_format(&dir, extension);
+
+        let (first, first_report) = clean(&dir, &input);
+        assert!(
+            first_report.verified,
+            "{extension} first pass: {:?}",
+            failed_names(&first_report)
+        );
+
+        let once_cleaned = dir.join("out").join(&first);
+        let (_, second_report) = clean(&dir, &once_cleaned);
+        assert!(
+            second_report.verified,
+            "{extension} second pass: {:?}",
+            failed_names(&second_report)
+        );
+        assert!(
+            second_report.residual.is_empty(),
+            "{extension} reported its own stamp as a survivor: {:?}",
+            second_report.residual
+        );
+        // And the table does not claim a removal the output disproves. On this
+        // pass the only Software finding IS the stamp, and it is still there
+        // byte for byte, so it earns no row either way -- neither "Present",
+        // which would contradict the badge, nor "Removed", which would be false.
+        assert!(
+            !second_report
+                .before_after
+                .iter()
+                .any(|row| row.category == "Software"),
+            "{extension} claims it removed its own bitexact stamp: {:?}",
+            second_report
+                .before_after
+                .iter()
+                .map(|row| (row.category, row.after))
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[test]
+fn a_verified_file_shows_no_privacy_category_as_still_present() {
+    // The before/after table and the "Verified" badge share a screen, so they
+    // must not disagree. Nothing may read "Present -> Present" in the privacy
+    // section of a file every check just passed; technical rows are exempt,
+    // because container bookkeeping really does come back.
+    for extension in ["mp4", "mkv", "webm"] {
+        let dir = scratch(&format!("verify-beforeafter-{extension}"));
+        let input = sample_for_format(&dir, extension);
+        let (_, report) = clean(&dir, &input);
+
+        assert!(report.verified, "{extension}: {:?}", failed_names(&report));
+        let contradictions: Vec<&str> = report
+            .before_after
+            .iter()
+            .filter(|row| !row.technical && !row.removed)
+            .map(|row| row.category)
+            .collect();
+        assert!(
+            contradictions.is_empty(),
+            "{extension} calls these privacy categories present on a verified file: {contradictions:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[test]
+fn a_dropped_subtitle_fails_the_stream_parameters_check() {
+    // Subtitles are media: the cleaner keeps them, and nothing else in the
+    // report would notice one going missing. `non_media_streams` excludes them,
+    // so check 6 never counts them either.
+    let dir = scratch("verify-subtitle-lost");
+    let input = sample_for_format(&dir, "mkv");
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Everything the real cleaner produces, minus the subtitle track.
+    let stripped = out.join("stripped.mkv");
+    let built = crate::sidecar::ffmpeg()
+        .args(["-y", "-i"])
+        .arg(&input)
+        .args([
+            "-map",
+            "0:v",
+            "-map",
+            "0:a",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-dn",
+            "-fflags",
+            "+bitexact",
+            "-f",
+            "matroska",
+        ])
+        .arg(&stripped)
+        .output()
+        .expect("ffmpeg must be available for these tests");
+    assert!(
+        built.status.success(),
+        "could not build the subtitle-less output: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let before = crate::inspect::inspect(&input).unwrap();
+    let before_findings = crate::privacy::classify(&before);
+    let format = validate_input(&input).unwrap();
+    let plan = crate::plan::plan_for(&before, &before_findings, format);
+    let report = verify(
+        &input,
+        &stripped,
+        &before,
+        &before_findings,
+        &plan,
+        OriginalFingerprint::capture(&input),
+        &out,
+        TEMP_PREFIX,
+    );
+
+    assert!(!report.verified, "a lost subtitle track went unnoticed");
+    assert!(
+        failed_names(&report).contains(&STREAM_PARAMETERS_CHECK),
+        "the loss was not attributed to the stream check: {:?}",
+        failed_names(&report)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn only_this_apps_own_bitexact_stamp_is_exempt_from_the_survivor_check() {
+    // The exemption is a hole in check 3, the central privacy check, so its
+    // edge is what matters: widen it and a real `encoder` disclosure surviving
+    // unchanged into the output would be reported as verified. Check 4 cannot
+    // catch that -- it only looks at MEDIUM and above, and `encoder` is LOW.
+    let finding_for = |key: &str, value: &str| {
+        let json = format!(r#"{{"format":{{"tags":{{"{key}":"{value}"}}}},"streams":[]}}"#);
+        let report = crate::inspect::parse_ffprobe_json("x.mkv", &json).unwrap();
+        let findings = classify(&report);
+        assert_eq!(findings.len(), 1, "expected one finding for {key}={value}");
+        findings.into_iter().next().unwrap()
+    };
+
+    assert!(
+        is_bitexact_encoder_stamp(&finding_for("encoder", "Lavf")),
+        "the bare stamp must be exempt, or re-cleaning an output reports a false failure"
+    );
+
+    for (key, value) in [
+        // A version pins the exact build: a real disclosure.
+        ("encoder", "Lavf62.12.102"),
+        ("encoder", "HandBrake 1.7.3"),
+        ("encoder", "Lavf-modified"),
+        // Same value, different field: the exemption is about one key only.
+        ("writing_application", "Lavf"),
+        ("software", "Lavf"),
+    ] {
+        assert!(
+            !is_bitexact_encoder_stamp(&finding_for(key, value)),
+            "{key}={value} must still be checked as a survivor"
+        );
+    }
 }

@@ -364,7 +364,7 @@ describe("detailFacts", () => {
 
   it("still lists data tracks and chapters when present", () => {
     expect(detailFacts(scan({ durationSeconds: null, otherStreams: 1, chapterCount: 3 }))).toEqual([
-      "1 video · 1 audio · 1 data",
+      "1 video · 1 audio · 1 other",
       "3 chapters",
     ]);
   });

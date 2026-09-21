@@ -69,9 +69,10 @@ impl StreamKind {
         }
     }
 
-    /// Streams the cleaner keeps. Everything else is dropped by `-dn`, payload and
-    /// all, which is why data tracks are a privacy concern and not a bookkeeping
-    /// detail.
+    /// Streams the cleaner keeps. Everything else is dropped payload and all,
+    /// which is why those tracks are a privacy concern and not a bookkeeping
+    /// detail. Two different arguments do the dropping and neither covers the
+    /// other: `-dn` removes data streams, `-map -0:t?` removes attachments.
     pub fn is_media(self) -> bool {
         matches!(
             self,
@@ -146,7 +147,10 @@ pub struct MetadataReport {
 }
 
 impl MetadataReport {
-    /// Data, attachment and unknown tracks: everything the cleaner drops whole.
+    /// Data, attachment and unknown tracks. Data and attachment streams are
+    /// dropped whole by `-dn` and `-map -0:t?`; an unknown stream is skipped
+    /// only where `-ignore_unknown` applies, and otherwise fails the file
+    /// rather than passing through, so the verifier still checks the count.
     pub fn non_media_streams(&self) -> impl Iterator<Item = &StreamSummary> {
         self.streams.iter().filter(|s| !s.kind.is_media())
     }
