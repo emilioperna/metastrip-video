@@ -23,6 +23,14 @@ export type UpdateHandle = {
  * An update that finished downloading may only be installed once nothing is
  * being processed. Installing on Windows closes the app, so doing it mid-batch
  * would abandon the remaining videos.
+ *
+ * This is the cheap gate, and it is not the one that decides: `batchRunning` is
+ * React state, and a reload resets it while the batch it was tracking carries
+ * on. The word that counts is the backend claiming the app for the install,
+ * which refuses if a batch holds it and stops one starting while it is held.
+ * Asking the backend and then installing would not do: those are two round
+ * trips, and a Clean accepted between them would be cleaning by the time the
+ * installer ran.
  */
 export function canInstall(status: UpdaterStatus, batchRunning: boolean): boolean {
   return status.kind === "ready" && !batchRunning;

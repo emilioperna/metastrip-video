@@ -34,6 +34,15 @@ describe("install gating", () => {
   });
 });
 
+describe("this gate is not the one that decides", () => {
+  it("lets a page that has forgotten its batch through, which is why the backend claims", () => {
+    // Exactly the reload case: the batch is still running, and React does not
+    // know. Nothing here can tell -- what stops the install is the backend
+    // refusing to hand the app over, tested in the Rust lifecycle suite.
+    expect(canInstall(ready, false)).toBe(true);
+  });
+});
+
 describe("installing is terminal", () => {
   // On Windows `update.install()` hands the installer to the shell and ends the
   // process, so this state is the last thing that happens in the session. It has

@@ -1,5 +1,22 @@
 import type { ReactNode } from "react";
 import { fileExtension, type SupportedFormat } from "../formats";
+import {
+  allVerified,
+  completionTitle,
+  detailFacts,
+  findingsLabel,
+  groupFindings,
+  partitionFindings,
+  summarise,
+  technicalLabel,
+  topSeverity,
+  type FindingGroup,
+  type ScanState,
+  type ScanView,
+  type Severity,
+  type VerificationReport,
+  VERIFIED_CLEANING_DETAIL,
+} from "../privacy";
 
 export type Status = "ready" | "processing" | "completed" | "error";
 
@@ -9,6 +26,10 @@ export type VideoFile = {
   status: Status;
   outputName?: string;
   message?: string;
+  /** Privacy scan, tracked separately from the cleaning status. */
+  scanState: ScanState;
+  scan?: ScanView;
+  verification?: VerificationReport;
 };
 
 export type Phase = "idle" | "running" | "done";
@@ -23,9 +44,25 @@ export type Summary = {
   outputDir: string;
   completed: number;
   errors: number;
+  verified: number;
+  verificationFailures: number;
+  fieldsRemoved: number;
+  privacyFieldsRemoved: number;
+  technicalFieldsRemoved: number;
+  chaptersRemoved: number;
+  dataStreamsRemoved: number;
 };
 
-type IconName = "brand" | "video" | "folder" | "check" | "warning" | "info" | "failed";
+type IconName =
+  | "brand"
+  | "video"
+  | "folder"
+  | "check"
+  | "warning"
+  | "info"
+  | "failed"
+  | "shield"
+  | "chevron";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
   brand: (
@@ -68,6 +105,13 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <path d="m9 9 6 6M15 9l-6 6" />
     </>
   ),
+  shield: (
+    <>
+      <path d="M12 3.5l7 2.6v5.2c0 4.2-2.9 7.6-7 9.2-4.1-1.6-7-5-7-9.2V6.1l7-2.6Z" />
+      <path d="m8.8 12.1 2.2 2.2 4.2-4.4" />
+    </>
+  ),
+  chevron: <path d="m8 10 4 4 4-4" />,
 };
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -105,7 +149,7 @@ export function ProductHeader() {
       </div>
       <div className="product-intro">
         <h1>Remove metadata. Keep the quality.</h1>
-        <p>Clean videos locally without re-encoding.</p>
+        <p>Clean videos locally with stream copy, no transcoding.</p>
       </div>
     </header>
   );
@@ -153,10 +197,23 @@ function FileStatus({ file }: { file: VideoFile }) {
     );
   }
   if (file.status === "completed") {
+    // "Cleaned" and "Verified" are different claims, and the UI keeps them
+    // apart: the word verified appears only when every check actually passed.
+    if (file.verification?.verified) {
+      return (
+        <span className="file-status file-status--completed" title="Cleaned and verified">
+          <Icon name="check" size={15} />
+          Verified
+        </span>
+      );
+    }
     return (
-      <span className="file-status file-status--completed" title="Video cleaned">
-        <Icon name="check" size={15} />
-        Cleaned
+      <span
+        className="file-status file-status--unverified"
+        title={file.message ?? "Cleaned, but not verified"}
+      >
+        <Icon name="warning" size={15} />
+        {file.verification ? "Verification failed" : "Not verified"}
       </span>
     );
   }
@@ -176,16 +233,217 @@ function FileStatus({ file }: { file: VideoFile }) {
   );
 }
 
+function SeverityChip({ severity, count }: { severity: Severity; count: number }) {
+  return (
+    <span className={`sev-chip sev-chip--${severity}`}>
+      <span className="sev-chip__count">{count}</span>
+      {severity.toUpperCase()}
+    </span>
+  );
+}
+
+/**
+ * The scan line on a collapsed row: severity chips and a total, nothing else.
+ *
+ * Counts only, never values. With a hundred files this is all that renders until
+ * the reader opens something, which is what keeps a large batch usable.
+ */
+function ScanSummaryLine({ file }: { file: VideoFile }) {
+  if (file.scanState === "pending" || file.scanState === "scanning") {
+    return (
+      <span className="scan-line scan-line--pending">
+        <span className="status-spinner" aria-hidden="true" />
+        Scanning...
+      </span>
+    );
+  }
+  if (file.scanState === "failed") {
+    return (
+      <span className="scan-line scan-line--failed" title={file.scan?.error ?? undefined}>
+        <Icon name="warning" size={14} />
+        Scan failed
+      </span>
+    );
+  }
+  const summary = file.scan?.summary;
+  if (!summary) return null;
+  const technical = technicalLabel(summary.technical);
+  if (summary.total === 0) {
+    return (
+      <span className="scan-line scan-line--clean">
+        {findingsLabel(summary)}
+        {technical ? <span className="scan-technical">{technical}</span> : null}
+      </span>
+    );
+  }
+  return (
+    <span className="scan-line">
+      {summary.high > 0 ? <SeverityChip severity="high" count={summary.high} /> : null}
+      {summary.medium > 0 ? <SeverityChip severity="medium" count={summary.medium} /> : null}
+      {summary.low > 0 ? <SeverityChip severity="low" count={summary.low} /> : null}
+      <span className="scan-total">{findingsLabel(summary)}</span>
+      {technical ? <span className="scan-technical">{technical}</span> : null}
+    </span>
+  );
+}
+
+/**
+ * One list of finding groups. Technical groups carry a neutral `TECHNICAL` tag
+ * instead of a severity, so container bookkeeping never reads as a privacy
+ * warning.
+ */
+function FindingGroupList({ groups, technical }: { groups: FindingGroup[]; technical: boolean }) {
+  return (
+    <ul className="finding-groups">
+      {groups.map((group) => (
+        <li
+          key={group.category}
+          className={`finding-group finding-group--${technical ? "technical" : group.severity}`}
+        >
+          <div className="finding-group__head">
+            {technical ? (
+              <span className="sev-tag sev-tag--technical">TECHNICAL</span>
+            ) : (
+              <span className={`sev-tag sev-tag--${group.severity}`}>{group.severityLabel}</span>
+            )}
+            <span className="finding-group__name">{group.category}</span>
+            <span className="finding-group__count">{group.items.length}</span>
+          </div>
+          <p className="finding-group__why">{group.explanation}</p>
+          <ul className="finding-items">
+            {group.items.map((item) => (
+              <li key={`${item.scopeLabel}:${item.streamIndex}:${item.sourceKey}`}>
+                <span className="finding-scope">{item.scopeLabel}</span>
+                <span className="finding-detail" title={item.detail}>
+                  {item.detail}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** The expanded panel: grouped findings, or the before/after once cleaned. */
+function FileDetail({ file }: { file: VideoFile }) {
+  const scan = file.scan;
+
+  if (file.scanState === "failed") {
+    return (
+      <div className="detail-panel">
+        <p className="detail-note detail-note--warning">
+          {scan?.error ?? "This file could not be inspected."}
+        </p>
+        <p className="detail-note">
+          It can still be cleaned, but the result cannot be checked against a scan.
+        </p>
+      </div>
+    );
+  }
+  if (!scan) return null;
+
+  const verification = file.verification;
+  const split = partitionFindings(scan.findings);
+  const groups = groupFindings(split.privacy);
+  const technicalGroups = groupFindings(split.technical);
+  const privacyRows = verification?.beforeAfter.filter((row) => !row.technical) ?? [];
+  const technicalRows = verification?.beforeAfter.filter((row) => row.technical) ?? [];
+
+  return (
+    <div className="detail-panel">
+      <ul className="detail-facts">
+        {detailFacts(scan).map((fact) => (
+          <li key={fact}>{fact}</li>
+        ))}
+      </ul>
+
+      {verification ? (
+        <div className="before-after">
+          <div className="before-after__head">
+            <span>Category</span>
+            <span>Before</span>
+            <span>After</span>
+          </div>
+          {privacyRows.map((row) => (
+            <div className="before-after__row" key={row.category}>
+              <span className="ba-category">{row.category}</span>
+              <span className="ba-before">{row.before}</span>
+              <span className={row.removed ? "ba-after ba-after--removed" : "ba-after"}>
+                {row.after}
+              </span>
+            </div>
+          ))}
+          {technicalRows.map((row) => (
+            // Neutral colours: a container field the muxer writes back is
+            // technical metadata, not a privacy failure.
+            <div className="before-after__row before-after__row--technical" key={row.category}>
+              <span className="ba-category">Technical metadata</span>
+              <span className="ba-before">{row.before}</span>
+              <span className="ba-after ba-after--technical">{row.after}</span>
+            </div>
+          ))}
+          {!verification.verified ? (
+            <ul className="check-list">
+              {verification.checks
+                .filter((check) => !check.passed)
+                .map((check) => (
+                  <li key={check.name} className="check-list__item">
+                    <Icon name="warning" size={13} />
+                    <span>
+                      {check.name}: {check.detail}
+                    </span>
+                  </li>
+                ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : groups.length === 0 && technicalGroups.length === 0 ? (
+        <p className="detail-note">This file carries no metadata to remove.</p>
+      ) : (
+        <div className="finding-sections">
+          <p className="finding-section-title">Privacy findings</p>
+          {groups.length === 0 ? (
+            <p className="detail-note">No privacy findings in this file.</p>
+          ) : (
+            <FindingGroupList groups={groups} technical={false} />
+          )}
+          {technicalGroups.length > 0 ? (
+            <>
+              <p className="finding-section-title finding-section-title--technical">
+                Technical metadata
+              </p>
+              <FindingGroupList groups={technicalGroups} technical />
+            </>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
 type FileQueueProps = {
   files: VideoFile[];
   phase: Phase;
   done: number;
   dragging: boolean;
+  expanded: string | null;
+  onToggle: (path: string) => void;
   onAdd: () => void;
   onClear: () => void;
 };
 
-export function FileQueue({ files, phase, done, dragging, onAdd, onClear }: FileQueueProps) {
+export function FileQueue({
+  files,
+  phase,
+  done,
+  dragging,
+  expanded,
+  onToggle,
+  onAdd,
+  onClear,
+}: FileQueueProps) {
   const total = files.length;
   const running = phase === "running";
   const processingIndex = files.findIndex((file) => file.status === "processing");
@@ -196,6 +454,14 @@ export function FileQueue({ files, phase, done, dragging, onAdd, onClear }: File
     : phase === "done"
       ? "Cleaning results"
       : `${total} ${total === 1 ? "video" : "videos"} ready`;
+
+  const batch = summarise(files.flatMap((file) => (file.scan ? [file.scan] : [])));
+  const batchTechnical = technicalLabel(batch.technical);
+  const stillScanning = files.some(
+    (file) => file.scanState === "pending" || file.scanState === "scanning",
+  );
+  const showBatchLine =
+    phase !== "done" && (stillScanning || batch.total > 0 || batch.failed > 0);
 
   return (
     <section className={`queue-card${dragging ? " is-dragging" : ""}`} aria-label="Video queue">
@@ -217,6 +483,34 @@ export function FileQueue({ files, phase, done, dragging, onAdd, onClear }: File
         ) : null}
       </div>
 
+      {showBatchLine ? (
+        <div className="batch-privacy" role="status">
+          <span className="batch-privacy__label">
+            <Icon name="shield" size={15} />
+            Privacy scan
+          </span>
+          {stillScanning ? (
+            <span className="batch-privacy__pending">
+              Scanning {total} {total === 1 ? "video" : "videos"}...
+            </span>
+          ) : (
+            <span className="batch-privacy__counts">
+              {batch.high > 0 ? <SeverityChip severity="high" count={batch.high} /> : null}
+              {batch.medium > 0 ? <SeverityChip severity="medium" count={batch.medium} /> : null}
+              {batch.low > 0 ? <SeverityChip severity="low" count={batch.low} /> : null}
+              <span className="scan-total">
+                {batch.total === 0 ? "No privacy findings " : ""}
+                across {batch.scanned} {batch.scanned === 1 ? "video" : "videos"}
+              </span>
+              {batchTechnical ? <span className="scan-technical">{batchTechnical}</span> : null}
+              {batch.failed > 0 ? (
+                <span className="batch-privacy__failed">{batch.failed} could not be scanned</span>
+              ) : null}
+            </span>
+          )}
+        </div>
+      ) : null}
+
       {running ? (
         <div
           className="queue-progress"
@@ -236,29 +530,57 @@ export function FileQueue({ files, phase, done, dragging, onAdd, onClear }: File
       <ul className="file-list" aria-label={`${total} selected videos`}>
         {files.map((file) => {
           const format = fileExtension(file.name)?.toUpperCase() ?? "FILE";
+          const isOpen = expanded === file.path;
+          const canExpand = file.scanState === "done" || file.scanState === "failed";
+          // A quiet edge tint by worst finding, so a long list can be triaged
+          // without opening anything.
+          const worst = file.scan?.summary ? topSeverity(file.scan.summary) : null;
+          const riskClass = worst ? ` file-row--risk-${worst}` : "";
           const detail =
             file.status === "error"
-              ? file.message ?? "This video could not be cleaned."
+              ? (file.message ?? "This video could not be cleaned.")
               : file.outputName
                 ? `Saved as ${file.outputName}`
                 : null;
 
           return (
-            <li key={file.path} className={`file-row file-row--${file.status}`}>
-              <span className="format-indicator" aria-label={`${format} format`}>
-                {format}
-              </span>
-              <span className="file-copy">
-                <span className="file-name" title={file.path}>
-                  {file.name}
+            <li
+              key={file.path}
+              className={`file-row file-row--${file.status}${riskClass}${isOpen ? " is-open" : ""}`}
+            >
+              <div className="file-row__main">
+                <span className="format-indicator" aria-label={`${format} format`}>
+                  {format}
                 </span>
-                {detail ? (
-                  <span className="file-detail" title={detail}>
-                    {detail}
+                <span className="file-copy">
+                  <span className="file-name" title={file.path}>
+                    {file.name}
                   </span>
-                ) : null}
-              </span>
-              <FileStatus file={file} />
+                  {detail ? (
+                    <span className="file-detail" title={detail}>
+                      {detail}
+                    </span>
+                  ) : null}
+                  <ScanSummaryLine file={file} />
+                </span>
+                <FileStatus file={file} />
+                {canExpand ? (
+                  <button
+                    type="button"
+                    className={`row-toggle${isOpen ? " is-open" : ""}`}
+                    aria-expanded={isOpen}
+                    aria-label={
+                      isOpen ? `Hide details for ${file.name}` : `Show details for ${file.name}`
+                    }
+                    onClick={() => onToggle(file.path)}
+                  >
+                    <Icon name="chevron" size={16} />
+                  </button>
+                ) : (
+                  <span className="row-toggle row-toggle--placeholder" aria-hidden="true" />
+                )}
+              </div>
+              {isOpen ? <FileDetail file={file} /> : null}
             </li>
           );
         })}
@@ -266,6 +588,7 @@ export function FileQueue({ files, phase, done, dragging, onAdd, onClear }: File
     </section>
   );
 }
+
 
 type OutputSettingsProps = {
   settings: Settings | null;
@@ -369,20 +692,63 @@ type CompletionSummaryProps = {
 
 export function CompletionSummary({ summary, onOpenFolder, onReset }: CompletionSummaryProps) {
   const hasErrors = summary.errors > 0;
-  const title = hasErrors
-    ? `${summary.completed} cleaned \u00b7 ${summary.errors} failed`
-    : `${summary.completed} ${summary.completed === 1 ? "video" : "videos"} cleaned`;
+  const verified = allVerified(summary);
+  const title = completionTitle(summary);
+  // The card only turns green on a clean sweep: any failure, or any file whose
+  // checks did not pass, is a warning. "Completed" is never shown as success
+  // when verification did not succeed.
+  const isWarning = hasErrors || !verified;
+
+  const stats: string[] = [];
+  // Privacy metadata leads; technical container fields follow and are never
+  // folded into the privacy figure.
+  if (summary.privacyFieldsRemoved > 0) {
+    stats.push(
+      `${summary.privacyFieldsRemoved} privacy ${summary.privacyFieldsRemoved === 1 ? "field" : "fields"} removed`,
+    );
+  }
+  if (summary.dataStreamsRemoved > 0) {
+    // "other", for the same reason the scan line says it: this counter is every
+    // non-media track removed, and for a Matroska that is typically an embedded
+    // font rather than a data track. This line shows on a passing run, so the
+    // noun has to be one the file can actually justify.
+    stats.push(
+      `${summary.dataStreamsRemoved} other ${summary.dataStreamsRemoved === 1 ? "track" : "tracks"} removed`,
+    );
+  }
+  if (summary.chaptersRemoved > 0) {
+    stats.push(
+      `${summary.chaptersRemoved} chapter ${summary.chaptersRemoved === 1 ? "marker" : "markers"} removed`,
+    );
+  }
+  if (summary.technicalFieldsRemoved > 0) {
+    stats.push(
+      `${summary.technicalFieldsRemoved} technical ${summary.technicalFieldsRemoved === 1 ? "field" : "fields"} removed`,
+    );
+  }
 
   return (
     <section
-      className={`completion-card${hasErrors ? " completion-card--warning" : ""}`}
+      className={`completion-card${isWarning ? " completion-card--warning" : ""}`}
       aria-live="polite"
     >
       <span className="completion-icon" aria-hidden="true">
-        <Icon name={hasErrors ? "warning" : "check"} size={22} />
+        <Icon name={isWarning ? "warning" : "check"} size={22} />
       </span>
       <div className="completion-copy">
         <h2>{title}</h2>
+        {verified ? (
+          <p className="completion-verified" title={VERIFIED_CLEANING_DETAIL}>
+            <Icon name="shield" size={14} />
+            Verified cleaning
+          </p>
+        ) : summary.verificationFailures > 0 ? (
+          <p className="completion-verified completion-verified--failed">
+            <Icon name="warning" size={14} />
+            Some files could not be verified. Open a row above to see which check failed.
+          </p>
+        ) : null}
+        {stats.length > 0 ? <p className="completion-stats">{stats.join(" \u00b7 ")}</p> : null}
         <p>
           Your originals were left untouched.
           {hasErrors ? " Review the failed files above." : ""}

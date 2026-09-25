@@ -436,17 +436,30 @@ button:disabled {
   outline-offset: -2px;
 }
 
+/* The row is a column now: a summary line that is always rendered, and a detail
+   panel that only exists while the row is open. */
 .file-row {
-  min-height: 52px;
-  padding: 8px var(--space-5);
-  display: grid;
-  grid-template-columns: 38px minmax(0, 1fr) max-content;
-  align-items: center;
-  gap: 11px;
+  display: block;
   border-bottom: 1px solid rgb(255 255 255 / 5%);
   content-visibility: auto;
   contain-intrinsic-size: auto 52px;
   transition: background-color var(--duration-fast) ease;
+}
+
+/* An open row is measured for real: skipping its layout would collapse the
+   panel the reader just opened. */
+.file-row.is-open {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
+
+.file-row__main {
+  min-height: 52px;
+  padding: 8px var(--space-5);
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) max-content 24px;
+  align-items: center;
+  gap: 11px;
 }
 
 .file-row:last-child {
@@ -953,5 +966,457 @@ button:disabled {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---------------------------------------------------------- Privacy scan --- */
+
+/* Severity colours are derived from the existing palette rather than introduced:
+   HIGH reuses the danger tone, MEDIUM the warning tone, LOW the muted text tone,
+   so the scan reads as part of the product and not as a bolted-on panel. */
+.sev-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px 1px 4px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 680;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.sev-chip__count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 720;
+}
+
+.sev-chip--high {
+  border-color: rgb(223 125 130 / 28%);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.sev-chip--medium {
+  border-color: rgb(215 174 108 / 26%);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.sev-chip--low {
+  border-color: var(--border);
+  background: rgb(255 255 255 / 3%);
+  color: var(--text-muted);
+}
+
+.scan-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.scan-line--pending,
+.scan-line--failed,
+.scan-line--clean {
+  gap: 6px;
+}
+
+.scan-line--failed {
+  color: var(--warning);
+}
+
+.scan-total {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Technical metadata count: secondary to the privacy figure, same line. */
+.scan-technical {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+
+.scan-technical::before {
+  content: "\00b7";
+  margin-right: 5px;
+}
+
+/* A 2px edge tint by worst finding: enough to triage a long list at a glance,
+   quiet enough that a hundred rows do not turn into a traffic light. */
+.file-row--risk-high {
+  box-shadow: inset 2px 0 0 rgb(223 125 130 / 55%);
+}
+
+.file-row--risk-medium {
+  box-shadow: inset 2px 0 0 rgb(215 174 108 / 45%);
+}
+
+.file-row--risk-low {
+  box-shadow: inset 2px 0 0 rgb(255 255 255 / 10%);
+}
+
+.file-status--unverified {
+  color: var(--warning);
+}
+
+.row-toggle {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    transform var(--duration-fast) ease,
+    background-color var(--duration-fast) ease,
+    color var(--duration-fast) ease;
+}
+
+.row-toggle:hover {
+  background: rgb(255 255 255 / 6%);
+  color: var(--text-secondary);
+}
+
+.row-toggle.is-open {
+  transform: rotate(180deg);
+  color: var(--text-secondary);
+}
+
+.row-toggle--placeholder {
+  cursor: default;
+}
+
+.detail-panel {
+  padding: 0 var(--space-5) var(--space-4) calc(var(--space-5) + 49px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.detail-facts {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  list-style: none;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-facts li + li::before {
+  content: "·";
+  margin-right: 10px;
+  color: var(--border-strong);
+}
+
+.detail-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.detail-note--warning {
+  color: var(--warning);
+}
+
+.finding-groups,
+.finding-items,
+.check-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.finding-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.finding-group {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: rgb(255 255 255 / 2%);
+}
+
+.finding-group--high {
+  border-color: rgb(223 125 130 / 22%);
+}
+
+.finding-group--medium {
+  border-color: rgb(215 174 108 / 20%);
+}
+
+.finding-group__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sev-tag {
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.sev-tag--high {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.sev-tag--medium {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.sev-tag--low {
+  background: rgb(255 255 255 / 4%);
+  color: var(--text-muted);
+}
+
+.sev-tag--technical {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.finding-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.finding-section-title {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 9.5px;
+  font-weight: 640;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.finding-section-title--technical {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.finding-group--technical {
+  background: transparent;
+  opacity: 0.8;
+}
+
+.finding-group__name {
+  flex: 1 1 auto;
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.finding-group__count {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.finding-group__why {
+  margin: 5px 0 0;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.finding-items {
+  margin-top: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.finding-items li {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+.finding-scope {
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 620;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.finding-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-family: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, monospace;
+  font-size: 10.5px;
+}
+
+/* ------------------------------------------------------- Before / after --- */
+
+.before-after {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: rgb(255 255 255 / 2%);
+  overflow: hidden;
+}
+
+.before-after__head,
+.before-after__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 84px 84px;
+  gap: 8px;
+  padding: 6px 11px;
+  align-items: center;
+}
+
+.before-after__head {
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 640;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.before-after__row + .before-after__row {
+  border-top: 1px solid rgb(255 255 255 / 4%);
+}
+
+.ba-category {
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 550;
+}
+
+.ba-before,
+.ba-after {
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ba-before {
+  color: var(--text-muted);
+}
+
+.ba-after {
+  color: var(--warning);
+}
+
+.ba-after--removed {
+  color: var(--success);
+}
+
+.before-after__row--technical .ba-category,
+.ba-after--technical {
+  color: var(--text-muted);
+}
+
+.check-list {
+  padding: 8px 11px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.check-list__item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+/* -------------------------------------------------------- Batch summary --- */
+
+.batch-privacy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 9px var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: rgb(255 255 255 / 1.5%);
+}
+
+.batch-privacy__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.batch-privacy__counts {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.batch-privacy__pending {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.batch-privacy__failed {
+  color: var(--warning);
+  font-size: 10.5px;
+}
+
+/* ----------------------------------------------------------- Completion --- */
+
+.completion-verified {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 0;
+  color: var(--success);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.completion-verified--failed {
+  color: var(--warning);
+  font-weight: 550;
+}
+
+.completion-stats {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row-toggle {
+    transition: none;
   }
 }

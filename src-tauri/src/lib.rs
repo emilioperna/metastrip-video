@@ -2,16 +2,35 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
-#[cfg(debug_assertions)]
-const FFMPEG_MISSING: &str = "FFmpeg was not found. Install FFmpeg and restart the app.";
-#[cfg(not(debug_assertions))]
-const FFMPEG_MISSING: &str =
-    "FFmpeg was not found in the application folder. Reinstall the application.";
+mod inspect;
+mod plan;
+mod privacy;
+mod sidecar;
+mod verify;
+
+#[cfg(test)]
+mod testkit;
+
+#[cfg(test)]
+#[path = "bench_tests.rs"]
+mod bench_tests;
+
+#[cfg(test)]
+#[path = "offthread_tests.rs"]
+mod offthread_tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+use plan::CleaningPlan;
+use privacy::{PrivacyFinding, PrivacySummary};
+use sidecar::{ffmpeg, ffmpeg_available, FFMPEG_MISSING, FFPROBE_MISSING};
+use verify::{OriginalFingerprint, VerificationReport};
 
 // Functional defaults. Deliberately brand-neutral: nothing here encodes who ships
 // the app, so a fork can keep every value as-is. Product identity lives in
@@ -23,7 +42,7 @@ const DEFAULT_PREFIX: &str = "VIDEO";
 const TEMP_PREFIX: &str = ".video-cleaner-processing-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContainerProfile {
+pub(crate) enum ContainerProfile {
     IsoBmff,
     Matroska,
     WebM,
@@ -37,10 +56,10 @@ enum MuxAttempt {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct FormatProfile {
+pub(crate) struct FormatProfile {
     extension: &'static str,
     label: &'static str,
-    container: ContainerProfile,
+    pub(crate) container: ContainerProfile,
     /// Explicit rather than inferred from the temporary file name. In particular,
     /// FFmpeg maps `.m4v` to its raw MPEG-4 video muxer unless we select MP4 here.
     output_muxer: &'static str,
@@ -175,64 +194,6 @@ fn is_iso_bmff(path: &Path) -> Result<bool, String> {
 
 const MAX_PREFIX_LEN: usize = 64;
 const MAX_BATCH: usize = 100;
-
-// ---------------------------------------------------------------- FFmpeg ---
-
-/// Locate the bundled FFmpeg. `externalBin` installs the sidecar next to the app
-/// executable, so a packaged install never depends on the system PATH.
-fn ffmpeg_program() -> &'static PathBuf {
-    static PROGRAM: OnceLock<PathBuf> = OnceLock::new();
-    PROGRAM.get_or_init(|| {
-        let dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf));
-
-        if let Some(dir) = &dir {
-            // Installed layout first, then the target-triple name the Tauri CLI
-            // uses in the target dir during development.
-            let names = [
-                "ffmpeg.exe",
-                concat!("ffmpeg-", env!("TARGET_TRIPLE"), ".exe"),
-            ];
-            if let Some(found) = names.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
-                return found;
-            }
-        }
-
-        // Dev convenience only: fall back to whatever is on PATH. A release build
-        // stays pinned to its own folder so a broken install fails loudly instead
-        // of silently picking up some other FFmpeg.
-        #[cfg(debug_assertions)]
-        {
-            PathBuf::from("ffmpeg")
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            dir.unwrap_or_default().join("ffmpeg.exe")
-        }
-    })
-}
-
-/// Build an `ffmpeg` invocation. Arguments are always passed as a real argv,
-/// never through a shell, so paths cannot be interpreted as commands.
-fn ffmpeg() -> Command {
-    let mut command = Command::new(ffmpeg_program());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: keeps a console from flashing for every file.
-        command.creation_flags(0x0800_0000);
-    }
-    command
-}
-
-fn ffmpeg_available() -> bool {
-    ffmpeg()
-        .arg("-version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
 
 // -------------------------------------------------------------- Settings ---
 
@@ -395,12 +356,18 @@ impl IdRegistry {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Progress {
+    /// Which batch produced this event. A page applies an event only when it
+    /// belongs to the batch it started, so one that outlived a reload cannot
+    /// write into rows it has never seen.
+    batch_id: u64,
     index: usize,
     total: usize,
     input_name: String,
     output_name: Option<String>,
     status: &'static str,
     message: Option<String>,
+    /// Present once a file has been cleaned and checked. `None` while processing.
+    verification: Option<VerificationReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -410,14 +377,29 @@ struct FileResult {
     output_name: Option<String>,
     status: &'static str,
     message: Option<String>,
+    verification: Option<VerificationReport>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CleanSummary {
+    /// The batch these results came from, the same id its progress carried.
+    batch_id: u64,
     output_dir: String,
     completed: usize,
     errors: usize,
+    /// Cleaned files whose every verification check passed.
+    verified: usize,
+    /// Cleaned files that were written but failed at least one check. These are
+    /// deliberately counted apart from `errors`: the output exists, but the
+    /// product will not call it verified.
+    verification_failures: usize,
+    fields_removed: usize,
+    /// Privacy and technical (structural) fields removed, reported apart.
+    privacy_fields_removed: usize,
+    technical_fields_removed: usize,
+    chapters_removed: usize,
+    data_streams_removed: usize,
     results: Vec<FileResult>,
 }
 
@@ -443,6 +425,26 @@ fn ffmpeg_args(
         input.to_string_lossy().into_owned(),
         "-map".into(),
         "0".into(),
+        // `-map 0` selects attachment streams as well, and `-dn` does not reach
+        // them: it drops data streams only. Matroska is the one supported
+        // container that can carry an attachment -- an embedded subtitle font,
+        // typically -- and the metadata stripping below removes the `filename`
+        // and `mimetype` tags its muxer requires for one, so leaving an
+        // attachment mapped fails the whole file at header write. Excluding it
+        // removes the embedded payload, which is what the scan already tells
+        // the user happens. The `?` keeps the negative map inert on every
+        // container that cannot carry one.
+        //
+        // Cover art that FFmpeg reports as a video stream (`attached_pic`) is
+        // not an attachment, so this never selects it and the output is what
+        // it would be without it. What survives is the muxer's doing, not this
+        // map's: MP4 and M4V keep the image as cover art, Matroska writes it
+        // back as an ordinary one-frame video track, and MOV does not keep it.
+        // A Matroska cover under a mimetype FFmpeg cannot map to an image codec
+        // really is an attachment and goes with the rest, which is the right
+        // outcome for an opaque embedded file.
+        "-map".into(),
+        "-0:t?".into(),
         "-c".into(),
         "copy".into(),
         // Global metadata, per-stream metadata and chapters all dropped.
@@ -454,7 +456,8 @@ fn ffmpeg_args(
         "-1".into(),
         // `-map 0` copies data tracks too, and those carry metadata of their own:
         // GoPro `gpmd` telemetry, iPhone `mebx`, chapter text. Dropped, payload
-        // and all.
+        // and all. Data streams only -- attachments are handled by the negative
+        // map above.
         "-dn".into(),
         "-fflags".into(),
         "+bitexact".into(),
@@ -470,18 +473,85 @@ fn ffmpeg_args(
     args
 }
 
-fn last_ffmpeg_error(stderr: &[u8]) -> String {
+/// FFmpeg's sign-off when a run fails. It says only that something went wrong.
+const FFMPEG_TERMINATOR: &str = "Conversion failed!";
+
+/// Lines FFmpeg prints on its way out that describe the run rather than what
+/// went wrong: the sign-off, the progress counter, the size summary and the
+/// repeat marker.
+///
+/// A failure before or at header write puts the error last. A failure after
+/// muxing has started does not: the errors come first, then this tail. Taking
+/// one line back from the sign-off would then hand the user `frame= 76 fps=0.0
+/// ... speed= 321x`, which reads like a success report. These patterns are
+/// deliberately narrow -- they must never match a line that begins with
+/// `Error`, which is the diagnostic we are walking back to find.
+fn is_ffmpeg_run_summary(line: &str) -> bool {
+    line == FFMPEG_TERMINATOR
+        || line.starts_with("frame=")
+        || line.starts_with("size=")
+        || line.starts_with("Last message repeated")
+        || line.contains("muxing overhead:")
+}
+
+/// Drops an `[out#0/matroska @ 0000017db62c0ac0] ` style prefix. The component
+/// name means nothing to a user and the value after the `@` is a heap address,
+/// which has no business on screen.
+fn strip_component_prefix(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix('[') else {
+        return line;
+    };
+    let Some(end) = rest.find("] ") else {
+        return line;
+    };
+    if !rest[..end].contains(" @ ") {
+        return line;
+    }
+    rest[end + 2..].trim_start()
+}
+
+/// The most useful single line FFmpeg wrote, made safe to show.
+///
+/// One line, never the whole of stderr: the rest is the banner, the input
+/// report and the stream mapping, none of which means anything here. The output
+/// paths -- the temporary file, its name and its folder -- are replaced by what
+/// they are, because the message is shown beside the file's own name and an
+/// absolute path adds nothing to it.
+fn last_ffmpeg_error(stderr: &[u8], output: &Path, output_dir: &Path) -> String {
     let text = String::from_utf8_lossy(stderr);
-    let message = text
+    let lines: Vec<&str> = text
         .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .next_back()
-        .unwrap_or_default();
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // Walk back over the closing summary rather than assuming it is one line.
+    // If every line is summary, its last line still beats saying nothing.
+    let message = lines
+        .iter()
+        .rev()
+        .find(|line| !is_ffmpeg_run_summary(line))
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("FFmpeg failed");
+
+    let mut message = strip_component_prefix(message).to_string();
+    // Longest first: the folder is a prefix of the file. Bracketed so the
+    // result reads as a redaction rather than as a strange file name.
+    for (path, replacement) in [(output, "[output file]"), (output_dir, "[output folder]")] {
+        let raw = path.to_string_lossy();
+        if !raw.is_empty() {
+            message = message.replace(raw.as_ref(), replacement);
+        }
+    }
+    if let Some(name) = output.file_name().and_then(|name| name.to_str()) {
+        message = message.replace(name, "[output file]");
+    }
+
     if message.is_empty() {
         "FFmpeg failed".into()
     } else {
-        message.to_string()
+        message
     }
 }
 
@@ -499,21 +569,21 @@ fn remove_stale_temp_files(output_dir: &Path) {
     }
 }
 
-/// Cleans one video. Returns the final file name on success.
-fn clean_one(
-    input: &Path,
-    output_dir: &Path,
-    prefix: &str,
-    registry: &mut IdRegistry,
-) -> Result<String, String> {
+/// Everything that decides whether this app will touch a file at all: it exists,
+/// its extension is in the support matrix, and an `.m4v` is a real ISO-BMFF file
+/// rather than a raw elementary stream.
+///
+/// Shared by scanning and cleaning so a file can never pass the scan and then be
+/// rejected by the cleaner with a different message.
+fn validate_input(input: &Path) -> Result<FormatProfile, String> {
     if !input.is_file() {
         return Err("File is no longer available".into());
     }
-    let original_ext = input
+    let normalized_ext = input
         .extension()
         .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let normalized_ext = original_ext.to_ascii_lowercase();
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let format = format_profile(&normalized_ext).ok_or_else(|| {
         format!(
             "Unsupported file type. Supported: {}.",
@@ -526,6 +596,21 @@ fn clean_one(
                 .into(),
         );
     }
+    Ok(format)
+}
+
+/// Cleans one video. Returns the final file name on success.
+fn clean_one(
+    input: &Path,
+    output_dir: &Path,
+    prefix: &str,
+    registry: &mut IdRegistry,
+) -> Result<String, String> {
+    let format = validate_input(input)?;
+    let original_ext = input
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
 
     // Preserve the source spelling too (`.MOV` stays `.MOV`), while lookup above is
     // case-insensitive. Every accepted value is one of the safe ASCII extensions in
@@ -567,7 +652,7 @@ fn clean_one(
             return Ok(final_name);
         }
 
-        last_error = last_ffmpeg_error(&result.stderr);
+        last_error = last_ffmpeg_error(&result.stderr, &temp_path, output_dir);
         // ISO-BMFF gets one retry without faststart. Other profiles have exactly
         // one attempt. Removing the partial output is required because `-n` must
         // keep protecting every invocation from overwrites.
@@ -580,6 +665,152 @@ fn clean_one(
     ))
 }
 
+// ----------------------------------------------------------- Privacy scan ---
+
+/// One inspected file as the UI sees it. Normalised in Rust: the frontend never
+/// receives ffprobe's JSON, only this.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanView {
+    path: String,
+    name: String,
+    /// False when the file could not be inspected at all. The batch continues
+    /// either way; a file that cannot be scanned can still be cleaned.
+    ok: bool,
+    error: Option<String>,
+    summary: PrivacySummary,
+    findings: Vec<PrivacyFinding>,
+    container: Option<String>,
+    duration_seconds: Option<f64>,
+    video_streams: usize,
+    audio_streams: usize,
+    other_streams: usize,
+    chapter_count: usize,
+    field_count: usize,
+    plan: Option<CleaningPlan>,
+}
+
+fn failed_scan(path: &str, name: String, error: String) -> ScanView {
+    ScanView {
+        path: path.to_string(),
+        name,
+        ok: false,
+        error: Some(error),
+        summary: PrivacySummary::default(),
+        findings: Vec::new(),
+        container: None,
+        duration_seconds: None,
+        video_streams: 0,
+        audio_streams: 0,
+        other_streams: 0,
+        chapter_count: 0,
+        field_count: 0,
+        plan: None,
+    }
+}
+
+/// Inspect and classify one file. Never returns an error: a failure becomes a
+/// `ScanView` marked `ok: false`, so one bad file cannot stop a batch.
+fn scan_one(raw: &str) -> ScanView {
+    let path = PathBuf::from(raw);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.to_string());
+
+    let format = match validate_input(&path) {
+        Ok(format) => format,
+        Err(error) => return failed_scan(raw, name, error),
+    };
+    let report = match inspect::inspect(&path) {
+        Ok(report) => report,
+        Err(error) => return failed_scan(raw, name, error),
+    };
+
+    let findings = privacy::classify(&report);
+    let (video, audio, other) = privacy::stream_kind_counts(&report);
+    let plan = plan::plan_for(&report, &findings, format);
+
+    ScanView {
+        path: raw.to_string(),
+        name,
+        ok: true,
+        error: None,
+        summary: PrivacySummary::of(&findings),
+        findings,
+        container: report.container.clone(),
+        duration_seconds: report.duration_seconds,
+        video_streams: video,
+        audio_streams: audio,
+        other_streams: other,
+        chapter_count: report.chapters.len(),
+        field_count: report.fields.len(),
+        plan: Some(plan),
+    }
+}
+
+/// Scan a whole batch, reporting each result as it lands so the UI can fill rows
+/// progressively instead of waiting for the slowest file.
+fn run_scan(paths: &[String], mut on_result: impl FnMut(usize, usize, &ScanView)) -> Vec<ScanView> {
+    let total = paths.len();
+    let mut views = Vec::with_capacity(total);
+    for (index, raw) in paths.iter().enumerate() {
+        let view = scan_one(raw);
+        on_result(index, total, &view);
+        views.push(view);
+    }
+    views
+}
+
+// --------------------------------------------------------------- Cleaning ---
+
+/// Inspect, clean and verify one file.
+///
+/// The before-report is taken fresh here rather than reused from the scan: the
+/// file may have changed since the user added it, and verification has to
+/// compare the output against what was actually on disk when it was cleaned.
+///
+/// A file that cannot be inspected is still cleaned. Inspection is what makes
+/// verification possible, not what makes cleaning safe, and refusing to clean a
+/// file the v0.4 pipeline handles fine would be a regression.
+fn clean_and_verify(
+    input: &Path,
+    output_dir: &Path,
+    prefix: &str,
+    registry: &mut IdRegistry,
+) -> (Result<String, String>, Option<VerificationReport>) {
+    let fingerprint = OriginalFingerprint::capture(input);
+    let before = inspect::inspect(input).ok();
+    let before_findings = before.as_ref().map(privacy::classify);
+
+    let cleaned = clean_one(input, output_dir, prefix, registry);
+    let Ok(output_name) = &cleaned else {
+        return (cleaned, None);
+    };
+
+    let (Some(before), Some(before_findings)) = (before.as_ref(), before_findings.as_ref()) else {
+        // Cleaned, but there is no baseline to check it against. Reported as
+        // unverified rather than quietly treated as verified.
+        return (cleaned, None);
+    };
+    let Ok(format) = validate_input(input) else {
+        return (cleaned, None);
+    };
+
+    let plan = plan::plan_for(before, before_findings, format);
+    let report = verify::verify(
+        input,
+        &output_dir.join(output_name),
+        before,
+        before_findings,
+        &plan,
+        fingerprint,
+        output_dir,
+        TEMP_PREFIX,
+    );
+    (cleaned, Some(report))
+}
+
 /// The whole batch, with progress pushed through a callback so this stays
 /// independent of Tauri and testable on its own.
 fn run_batch(
@@ -587,6 +818,7 @@ fn run_batch(
     prefix: &str,
     output_dir: &Path,
     app_dir: &Path,
+    batch_id: u64,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<CleanSummary, String> {
     if paths.is_empty() {
@@ -611,6 +843,10 @@ fn run_batch(
     let total = paths.len();
     let mut results = Vec::with_capacity(total);
     let (mut completed, mut errors) = (0usize, 0usize);
+    let (mut verified, mut verification_failures) = (0usize, 0usize);
+    let (mut fields_removed, mut chapters_removed, mut data_streams_removed) =
+        (0usize, 0usize, 0usize);
+    let (mut privacy_fields_removed, mut technical_fields_removed) = (0usize, 0usize);
 
     for (index, raw) in paths.iter().enumerate() {
         let input = PathBuf::from(raw);
@@ -620,48 +856,105 @@ fn run_batch(
             .unwrap_or_else(|| raw.clone());
 
         on_progress(Progress {
+            batch_id,
             index,
             total,
             input_name: input_name.clone(),
             output_name: None,
             status: "processing",
             message: None,
+            verification: None,
         });
 
-        let (status, output_name, message) =
-            match clean_one(&input, output_dir, prefix, &mut registry) {
-                Ok(name) => {
-                    completed += 1;
-                    ("completed", Some(name), None)
-                }
-                Err(e) => {
-                    errors += 1;
-                    ("error", None, Some(e))
-                }
-            };
+        let (outcome, verification) = clean_and_verify(&input, output_dir, prefix, &mut registry);
+
+        if let Some(report) = &verification {
+            if report.verified {
+                verified += 1;
+            } else {
+                verification_failures += 1;
+            }
+            fields_removed += report.fields_removed;
+            privacy_fields_removed += report.privacy_fields_removed;
+            technical_fields_removed += report.technical_fields_removed;
+            chapters_removed += report.chapters_removed;
+            data_streams_removed += report.data_streams_removed;
+        }
+
+        let (status, output_name, message) = match outcome {
+            Ok(name) => {
+                completed += 1;
+                let note = match &verification {
+                    Some(report) if !report.verified => Some(failed_check_summary(report)),
+                    // Cleaned, but with no baseline to verify against.
+                    None => Some(
+                        "Cleaned, but this file could not be inspected, so the result was not verified."
+                            .to_string(),
+                    ),
+                    Some(_) => None,
+                };
+                ("completed", Some(name), note)
+            }
+            Err(e) => {
+                errors += 1;
+                ("error", None, Some(e))
+            }
+        };
 
         on_progress(Progress {
+            batch_id,
             index,
             total,
             input_name: input_name.clone(),
             output_name: output_name.clone(),
             status,
             message: message.clone(),
+            verification: verification.clone(),
         });
         results.push(FileResult {
             input_name,
             output_name,
             status,
             message,
+            verification,
         });
     }
 
     Ok(CleanSummary {
+        batch_id,
         output_dir: output_dir.to_string_lossy().into_owned(),
         completed,
         errors,
+        verified,
+        verification_failures,
+        fields_removed,
+        privacy_fields_removed,
+        technical_fields_removed,
+        chapters_removed,
+        data_streams_removed,
         results,
     })
+}
+
+/// A short, safe description of why a file is not verified. Only the details of
+/// the checks that failed, all of which are generated by this app rather than
+/// copied out of the media file.
+///
+/// The details, not the names: every check is named for the thing it asserts
+/// ("Sensitive metadata removed"), so listing names after "Verification failed"
+/// states the opposite of what happened. Each detail is already written in the
+/// failing direction ("3 sensitive field(s) survived").
+fn failed_check_summary(report: &VerificationReport) -> String {
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| !c.passed)
+        .map(|c| c.detail.as_str())
+        .collect();
+    if failed.is_empty() {
+        return "Verification did not pass.".to_string();
+    }
+    format!("Verification failed: {}.", failed.join(", "))
 }
 
 // --------------------------------------------------------------- Commands ---
@@ -726,16 +1019,29 @@ fn get_supported_formats() -> Vec<SupportedFormatView> {
         .collect()
 }
 
-/// `null` when FFmpeg is usable, otherwise the message to show. Returning the
-/// text from here keeps the wording in one place, since it differs between a
-/// development build (PATH) and a packaged one (bundled sidecar).
+/// `null` when both bundled tools are usable, otherwise the message to show.
+/// Returning the text from here keeps the wording in one place, since it differs
+/// between a development build (PATH) and a packaged one (bundled sidecar).
+///
+/// FFprobe is checked alongside FFmpeg because the privacy scan depends on it;
+/// one clear message at startup beats the same failure on every file.
+///
+/// Async for the same reason the media commands are: each check starts a real
+/// process and waits for it, and this one runs while the window is drawing for
+/// the first time. On the window's own thread that is a visible stall before
+/// anything appears, and adding the probe made it two.
 #[tauri::command]
-fn check_ffmpeg() -> Option<&'static str> {
-    if ffmpeg_available() {
-        None
-    } else {
-        Some(FFMPEG_MISSING)
-    }
+async fn check_ffmpeg() -> Result<Option<&'static str>, String> {
+    run_blocking(TOOLS_INTERNAL_ERROR, || {
+        if !ffmpeg_available() {
+            return Ok(Some(FFMPEG_MISSING));
+        }
+        if !inspect::available() {
+            return Ok(Some(FFPROBE_MISSING));
+        }
+        Ok(None)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -772,18 +1078,359 @@ fn save_settings(
     Ok(settings.into())
 }
 
+// Shown instead of a panic message, which can carry file paths.
+const TOOLS_INTERNAL_ERROR: &str = "The bundled tools could not be checked.";
+const SCAN_INTERNAL_ERROR: &str = "The privacy scan stopped because of an internal error.";
+const CLEAN_INTERNAL_ERROR: &str =
+    "Cleaning stopped because of an internal error. Files finished before it are in the output folder.";
+
+/// Runs `work` on Tauri's blocking thread pool and waits for it to finish.
+///
+/// A synchronous command runs on the window's own thread, so every ffprobe and
+/// FFmpeg run would stop the window from repainting and hold every progress
+/// event back until the batch ended. The body of an `async` command is no place
+/// for it either: that runs on one of the runtime's few core workers, which
+/// Tauri's own IPC needs. Long synchronous work belongs on the blocking pool.
+///
+/// The work is awaited, never detached, so a command still answers only once
+/// its batch is over. A panic becomes `internal_error`; its text is never
+/// forwarded to the UI.
+async fn run_blocking<T, F>(internal_error: &'static str, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|_| Err(internal_error.to_string()))
+}
+
+/// Everything `scan_videos` does, minus Tauri, so it can be tested as is.
+fn scan_request(
+    paths: &[String],
+    on_result: impl FnMut(usize, usize, &ScanView),
+) -> Result<Vec<ScanView>, String> {
+    if paths.len() > MAX_BATCH {
+        return Err(format!(
+            "Too many videos: {} selected, the limit is {MAX_BATCH}.",
+            paths.len()
+        ));
+    }
+    if !inspect::available() {
+        return Err(FFPROBE_MISSING.into());
+    }
+    Ok(run_scan(paths, on_result))
+}
+
+/// Inspect and classify a batch without touching anything on disk. Emits one
+/// `scan-progress` event per file so rows can fill in as results arrive.
 #[tauri::command]
-fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary, String> {
-    let dir = app_dir(&app)?;
-    let settings = load_settings(&dir);
+async fn scan_videos(app: AppHandle, paths: Vec<String>) -> Result<Vec<ScanView>, String> {
+    run_blocking(SCAN_INTERNAL_ERROR, move || {
+        scan_request(&paths, |index, total, view| {
+            let _ = app.emit(
+                "scan-progress",
+                ScanProgress {
+                    index,
+                    total,
+                    view: view.clone(),
+                },
+            );
+        })
+    })
+    .await
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    index: usize,
+    total: usize,
+    view: ScanView,
+}
+
+const CLEAN_BUSY: &str = "A cleaning batch is already running. Wait for it to finish.";
+const CLEAN_UPDATING: &str = "An update is being installed. Try again once that has finished.";
+
+/// Set while a Clean batch runs.
+///
+/// When the commands ran on the window's thread, that thread kept batches
+/// apart for free. Off it, a page reload mid-batch leaves the old batch running
+/// and lets a new one start in the same folder, where its stale-temp sweep and
+/// the "No temporary files left" check would trip over the first batch's file.
+/// This keeps the batches' disk work apart; it does not reconnect a reloaded
+/// page to the batch still running.
+///
+/// It is also the only thing that knows whether cleaning is happening: a
+/// reloaded page has forgotten, and the updater and the close button both have
+/// to ask something that has not.
+static CLEAN_STATE: BatchState = BatchState::new();
+
+/// Whether a batch is running, whether an update install has been reserved,
+/// and which batch it is, in a single word.
+///
+/// The three have to be read and changed together. A caller that learned
+/// "running" and "which" separately could mix two batches; a caller that
+/// checked "not cleaning" and then reserved an install could have a batch start
+/// in between. So they share one atomic and every transition is one
+/// compare-and-swap: bit 0 is "a batch is running", bit 1 is "an update install
+/// is reserved", and the rest is the batch counter.
+///
+/// Cleaning and installing are mutually exclusive, and each transition refuses
+/// if either bit is set. Starting batch `n + 1` from idle is `+5` (`+4` for the
+/// counter, `+1` for the bit) and finishing it is `-1`; reserving an install is
+/// `+2` and releasing it is `-2`.
+///
+/// The counter is the batch identity. A plain integer is enough: it has to tell
+/// this process's batches apart for as long as the process lives, nothing more,
+/// so there is no reason to take a UUID dependency for it. It is internal to
+/// the app and carries nothing from the files being cleaned.
+pub(crate) struct BatchState(AtomicU64);
+
+/// A batch is running.
+const CLEANING: u64 = 0b01;
+/// An update install has been reserved and may be under way.
+const INSTALLING: u64 = 0b10;
+/// One batch on the counter, which starts above both flags.
+const ONE_BATCH: u64 = 0b100;
+/// Set while either exclusive transition is held.
+const EXCLUSIVE: u64 = CLEANING | INSTALLING;
+
+/// What the frontend is allowed to know about the pipeline: whether it is busy,
+/// why, and which batch that is. Deliberately nothing else -- no paths, no file
+/// names, no counts, nothing read out of a video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProcessingState {
+    cleaning: bool,
+    /// An update install is reserved. Nothing may start cleaning until it is
+    /// released, which after a successful install means never, because the
+    /// installer ends this process.
+    installing: bool,
+    /// The newest batch this process has started, `0` before the first one.
+    /// While `cleaning` it is the batch that is running.
+    batch_id: u64,
+}
+
+impl BatchState {
+    pub(crate) const fn new() -> Self {
+        BatchState(AtomicU64::new(0))
+    }
+
+    /// One load, so the flags and the id can never disagree.
+    pub(crate) fn snapshot(&self) -> ProcessingState {
+        let word = self.0.load(Ordering::Acquire);
+        ProcessingState {
+            cleaning: word & CLEANING != 0,
+            installing: word & INSTALLING != 0,
+            batch_id: word / ONE_BATCH,
+        }
+    }
+
+    /// The running batch id, or `None` when nothing is running.
+    fn active_id(&self) -> Option<u64> {
+        let state = self.snapshot();
+        state.cleaning.then_some(state.batch_id)
+    }
+
+    /// Claim the app for an update install, or refuse.
+    ///
+    /// The check and the claim are the same compare-and-swap, so a Clean cannot
+    /// slip between them: once this returns `true` no batch can start until the
+    /// reservation is released, and it returns `false` if one already has.
+    ///
+    /// Not RAII, because the installer is driven by the signed updater plugin
+    /// from the page, so the reservation has to outlive the command that takes
+    /// it. It is released deterministically in three ways: the page releases it
+    /// when `install()` fails to start the installer, the page releases any it
+    /// finds on load, and a successful install ends the process.
+    fn try_reserve_install(&self) -> bool {
+        let mut word = self.0.load(Ordering::Relaxed);
+        loop {
+            if word & EXCLUSIVE != 0 {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                word,
+                word + INSTALLING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => word = actual,
+            }
+        }
+    }
+
+    /// Give the app back. Doing this when nothing is reserved is a no-op rather
+    /// than an underflow, so the page may call it on load without knowing.
+    fn release_install(&self) {
+        let mut word = self.0.load(Ordering::Relaxed);
+        loop {
+            if word & INSTALLING == 0 {
+                return;
+            }
+            match self.0.compare_exchange_weak(
+                word,
+                word - INSTALLING,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => word = actual,
+            }
+        }
+    }
+}
+
+/// Holds the state for as long as it lives. Released by `Drop`, so a batch that
+/// ends in an error or a panic frees it too.
+///
+/// Nothing can reach the cleaning pipeline without one: `clean_with` takes it
+/// by value, so "the app is marked as cleaning" is not a step that could be
+/// taken late or skipped, it is the ticket to the work.
+struct BatchGuard {
+    state: &'static BatchState,
+    id: u64,
+}
+
+impl BatchGuard {
+    /// Never waits: a second batch is refused, not queued, and so is one asked
+    /// for while an update install holds the app. A refused attempt consumes no
+    /// id, so the id reported by `snapshot` is always the batch that is really
+    /// running. The reason comes from the word the swap actually saw, not from
+    /// a second look afterwards.
+    fn try_acquire(state: &'static BatchState) -> Result<Self, &'static str> {
+        let mut word = state.0.load(Ordering::Relaxed);
+        loop {
+            if word & CLEANING != 0 {
+                return Err(CLEAN_BUSY);
+            }
+            if word & INSTALLING != 0 {
+                return Err(CLEAN_UPDATING);
+            }
+            match state.0.compare_exchange_weak(
+                word,
+                word + ONE_BATCH + CLEANING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(BatchGuard {
+                        state,
+                        id: word / ONE_BATCH + 1,
+                    })
+                }
+                Err(actual) => word = actual,
+            }
+        }
+    }
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        // Clears the running bit and leaves the counter where it is, so the
+        // next batch is a different one and this one is never handed out again.
+        self.state.0.fetch_sub(CLEANING, Ordering::Release);
+    }
+}
+
+/// The two steps `clean_videos` takes, run inline: claim the app, then clean
+/// with what was claimed. The command keeps them apart on purpose, because only
+/// the second belongs on the blocking pool; here they are together so a test
+/// can drive a whole batch against its own state without a live `AppHandle`.
+#[cfg(test)]
+fn clean_request(
+    state: &'static BatchState,
+    app_dir: &Path,
+    paths: &[String],
+    on_progress: impl FnMut(Progress),
+) -> Result<CleanSummary, String> {
+    let batch = BatchGuard::try_acquire(state).map_err(str::to_string)?;
+    clean_with(batch, app_dir, paths, on_progress)
+}
+
+/// Everything `clean_videos` does once it holds the app and knows the app data
+/// folder. The guard comes in by value and is held until the last file is
+/// verified, so nothing here can run while the app looks idle to the close
+/// button, the updater or another Clean.
+fn clean_with(
+    batch: BatchGuard,
+    app_dir: &Path,
+    paths: &[String],
+    on_progress: impl FnMut(Progress),
+) -> Result<CleanSummary, String> {
+    let settings = load_settings(app_dir);
     if settings.output_directory.is_empty() {
         return Err("Choose an output folder first.".into());
     }
     let output_dir = PathBuf::from(&settings.output_directory);
 
-    run_batch(&paths, &settings.prefix, &output_dir, &dir, |progress| {
-        let _ = app.emit("clean-progress", progress);
+    run_batch(
+        paths,
+        &settings.prefix,
+        &output_dir,
+        app_dir,
+        batch.id,
+        on_progress,
+    )
+}
+
+/// Clean, verify and report a batch, one file after another, emitting
+/// `clean-progress` as each file starts and as each one finishes.
+///
+/// The app is claimed here, before the work is handed to the blocking pool.
+/// Taking it inside that closure instead would leave a gap between accepting
+/// the request and the state saying so, and in that gap the close button would
+/// read the app as idle and let the window go while the worker was starting
+/// FFmpeg. Only the claim is early: every heavy step still runs on the pool.
+#[tauri::command]
+async fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary, String> {
+    let batch = BatchGuard::try_acquire(&CLEAN_STATE).map_err(str::to_string)?;
+    run_blocking(CLEAN_INTERNAL_ERROR, move || {
+        let dir = app_dir(&app)?;
+        clean_with(batch, &dir, &paths, |progress| {
+            let _ = app.emit("clean-progress", progress);
+        })
     })
+    .await
+}
+
+/// Whether cleaning is running, straight from the pipeline own state.
+///
+/// The page that started a batch forgets it on reload; this does not. Anything
+/// whose correctness depends on a batch being over -- installing an update,
+/// closing the window, starting another batch -- asks here rather than trusting
+/// what React last remembered.
+#[tauri::command]
+fn get_processing_state() -> ProcessingState {
+    CLEAN_STATE.snapshot()
+}
+
+/// Claim the app for an update install. `false` means a batch holds it, or an
+/// install already does, and nothing may be installed.
+///
+/// This replaces asking `get_processing_state` and then installing: those are
+/// two round trips, and a Clean accepted between them would have been cleaning
+/// by the time the installer ran. Claiming is one transition, and it shuts out
+/// Clean for as long as it is held.
+#[tauri::command]
+fn reserve_update_install() -> bool {
+    CLEAN_STATE.try_reserve_install()
+}
+
+/// Give the app back after an install that never started, or on page load,
+/// where anything still reserved was left by a page that no longer exists.
+/// Releasing when nothing is reserved does nothing.
+#[tauri::command]
+fn release_update_install() {
+    CLEAN_STATE.release_install()
+}
+
+/// Whether a close request has to be refused. The window asks the pipeline, not
+/// the page: a reloaded page believes nothing is running.
+fn cleaning_blocks_close(state: &BatchState) -> bool {
+    state.active_id().is_some()
 }
 
 #[tauri::command]
@@ -810,11 +1457,30 @@ pub fn run() {
             }
             Ok(())
         })
+        // A responsive window is a window whose close button works mid-batch.
+        // FFmpeg would carry on in its own process and leave a half-written
+        // temporary file behind, so a normal close is refused while a batch is
+        // running and the window says why. Only this one: nothing here tries to
+        // survive Task Manager, a shutdown or a crash.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if cleaning_blocks_close(&CLEAN_STATE) {
+                    api.prevent_close();
+                    // No payload: the window already knows what to say, and a
+                    // lifecycle event is no place for anything about the files.
+                    let _ = window.emit("close-blocked", ());
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             check_ffmpeg,
             get_supported_formats,
             get_settings,
             save_settings,
+            get_processing_state,
+            reserve_update_install,
+            release_update_install,
+            scan_videos,
             clean_videos,
             open_folder
         ])
@@ -827,334 +1493,101 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::*;
 
-    /// A throwaway directory under the OS temp dir.
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("video-cleaner-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    // ------------------------------------------ What FFmpeg is allowed to say ---
 
-    /// A tiny real MP4, so the FFmpeg path is exercised for real.
-    fn sample_video(dir: &Path, name: &str) -> PathBuf {
-        let path = dir.join(name);
-        let status = ffmpeg()
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x64:rate=10:duration=1",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=1",
-                "-c:v",
-                "mpeg4",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-metadata",
-                "title=SECRET",
-            ])
-            .arg(&path)
-            .output()
-            .expect("ffmpeg must be available for these tests");
-        assert!(
-            status.status.success(),
-            "could not build the sample video: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-        path
-    }
-
-    /// Payload planted in the fixture's data track. Its absence from an output is
-    /// the proof that the track itself is gone, not merely its tags.
-    const DATA_CANARY: &[u8] = b"DATA_TRACK_CANARY";
-
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
-    }
-
-    /// A sample that really carries a data stream, which is what `-dn` has to drop.
-    ///
-    /// The mp4 muxer refuses a bare `bin_data` track, so the only way to get one out
-    /// of a stock LGPL FFmpeg is to let `-map_chapters` build a chapter text track.
-    /// The demuxer hands those samples back only when the chapters stop short of the
-    /// media, hence a 7 s clip whose chapters end at 7000 ms: flush against the end
-    /// the track reads back empty and the fixture would prove nothing. The test
-    /// asserts the payload is present in the input for exactly that reason.
-    fn sample_video_with_data_track(dir: &Path, name: &str) -> PathBuf {
-        let base = dir.join("base-for-data-track.mp4");
-        let built = ffmpeg()
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x64:rate=10:duration=7",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=7",
-                "-c:v",
-                "mpeg4",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&base)
-            .output()
-            .expect("ffmpeg must be available for these tests");
-        assert!(
-            built.status.success(),
-            "could not build the base clip: {}",
-            String::from_utf8_lossy(&built.stderr)
-        );
-
-        let chapters = dir.join("chapters.ffmetadata");
-        let script = [
-            ";FFMETADATA1",
-            "[CHAPTER]",
-            "TIMEBASE=1/1000",
-            "START=0",
-            "END=3000",
-            "title=opening",
-            "[CHAPTER]",
-            "TIMEBASE=1/1000",
-            "START=3000",
-            "END=7000",
-            "title=DATA_TRACK_CANARY",
-        ]
-        .join("\n");
-        std::fs::write(&chapters, script).unwrap();
-
-        let path = dir.join(name);
-        let built = ffmpeg()
-            .args(["-y", "-i"])
-            .arg(&base)
-            .arg("-i")
-            .arg(&chapters)
-            .args([
-                "-map",
-                "0",
-                "-map_chapters",
-                "1",
-                "-c",
-                "copy",
-                "-metadata",
-                "title=SECRET",
-            ])
-            .arg(&path)
-            .output()
-            .expect("ffmpeg must be available for these tests");
-        assert!(
-            built.status.success(),
-            "could not build the fixture: {}",
-            String::from_utf8_lossy(&built.stderr)
-        );
-        path
-    }
-
-    /// The stream kinds FFmpeg reports for a file, in order, e.g. `["Video", "Audio"]`.
-    fn stream_kinds(path: &Path) -> Vec<String> {
-        // No output file, so FFmpeg exits non-zero after printing the input report.
-        let probe = ffmpeg()
-            .arg("-i")
-            .arg(path)
-            .output()
-            .expect("ffmpeg must be available for these tests");
-        String::from_utf8_lossy(&probe.stderr)
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("Stream #0:"))
-            .filter_map(|line| {
-                [
-                    "Video",
-                    "Audio",
-                    "Data",
-                    "Unknown",
-                    "Subtitle",
-                    "Attachment",
-                ]
-                .into_iter()
-                .find(|kind| line.contains(&format!(": {kind}: ")))
-                .map(str::to_string)
-            })
-            .collect()
-    }
-
-    #[derive(Clone, Copy)]
-    struct FixtureCapabilities {
-        video_codec: &'static str,
-        audio_codec: &'static str,
-        chapters: bool,
-        data_stream_kind: Option<&'static str>,
-    }
-
-    fn fixture_capabilities(extension: &str) -> FixtureCapabilities {
-        match extension {
-            "mp4" | "mov" | "m4v" => FixtureCapabilities {
-                video_codec: "mpeg4",
-                audio_codec: "aac",
-                chapters: true,
-                // FFmpeg represents ISO-BMFF chapters with a timed text/data track.
-                data_stream_kind: Some("Data"),
-            },
-            "mkv" => FixtureCapabilities {
-                video_codec: "mpeg4",
-                audio_codec: "aac",
-                chapters: true,
-                data_stream_kind: None,
-            },
-            "webm" => FixtureCapabilities {
-                video_codec: "libvpx",
-                audio_codec: "libopus",
-                chapters: true,
-                data_stream_kind: None,
-            },
-            "avi" => FixtureCapabilities {
-                video_codec: "mpeg4",
-                audio_codec: "libmp3lame",
-                // FFmpeg's AVI muxer does not write chapters. It can carry a data
-                // stream, but reports it as `Unknown: none` when demuxing.
-                chapters: false,
-                data_stream_kind: Some("Unknown"),
-            },
-            other => panic!("missing fixture capabilities for {other}"),
-        }
-    }
-
-    /// Builds a real, container-appropriate fixture with global metadata and,
-    /// wherever the muxer supports them, chapters. Encoding only happens here to
-    /// create synthetic input; the production cleaning path is always stream copy.
-    fn sample_for_format(dir: &Path, extension: &str) -> PathBuf {
-        let profile = format_profile(extension).expect("fixture requested for unsupported format");
-        let capabilities = fixture_capabilities(extension);
-        let metadata_path = dir.join(format!("fixture-{extension}.ffmetadata"));
-        let mut metadata =
-            String::from(";FFMETADATA1\ntitle=GLOBAL_SECRET\ncomment=SENSITIVE_COMMENT\n");
-        if capabilities.chapters {
-            metadata
-                .push_str("[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1200\ntitle=CHAPTER_SECRET\n");
-        }
-        std::fs::write(&metadata_path, metadata).unwrap();
-        let data_path = dir.join("avi-data-canary.bin");
-        if extension == "avi" {
-            std::fs::write(&data_path, DATA_CANARY).unwrap();
-        }
-
-        let path = dir.join(format!("fixture.{extension}"));
-        let mut command = ffmpeg();
-        command
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x64:rate=10:duration=2",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=2",
-                "-f",
-                "ffmetadata",
-                "-i",
-            ])
-            .arg(&metadata_path);
-        if extension == "avi" {
-            command.args(["-f", "data", "-i"]).arg(&data_path);
-        }
-        command.args(["-map", "0:v:0", "-map", "1:a:0", "-map_metadata", "2"]);
-        if extension == "avi" {
-            command.args(["-map", "3:0"]);
-        }
-        if capabilities.chapters {
-            command.args(["-map_chapters", "2"]);
-        } else {
-            command.args(["-map_chapters", "-1"]);
-        }
-        command.args([
-            "-metadata:s:v:0",
-            "title=STREAM_SECRET",
-            "-t",
-            "2",
-            "-c:v",
-            capabilities.video_codec,
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            capabilities.audio_codec,
-        ]);
-        if extension == "avi" {
-            command.args(["-c:d", "copy"]);
-        }
-        if extension == "webm" {
-            command.args(["-deadline", "realtime", "-cpu-used", "8"]);
-        }
-        let built = command
-            .args(["-f", profile.output_muxer])
-            .arg(&path)
-            .output()
-            .expect("ffmpeg must be available for these tests");
-        assert!(
-            built.status.success(),
-            "could not build the {extension} fixture: {}",
-            String::from_utf8_lossy(&built.stderr)
-        );
-        path
-    }
-
-    fn ffmetadata(path: &Path) -> String {
-        let probe = ffmpeg()
-            .args(["-v", "error", "-i"])
-            .arg(path)
-            .args(["-f", "ffmetadata", "-"])
-            .output()
-            .expect("ffmpeg must be available for these tests");
-        assert!(
-            probe.status.success(),
-            "could not inspect metadata in {path:?}: {}",
-            String::from_utf8_lossy(&probe.stderr)
-        );
-        String::from_utf8_lossy(&probe.stdout).to_lowercase()
-    }
-
-    fn assert_ffmpeg_can_read(path: &Path) {
-        let probe = ffmpeg()
-            .args(["-v", "error", "-i"])
-            .arg(path)
-            .args([
-                "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-f", "null", "-",
-            ])
-            .output()
-            .expect("ffmpeg must be available for these tests");
-        assert!(
-            probe.status.success(),
-            "FFmpeg could not read {path:?}: {}",
-            String::from_utf8_lossy(&probe.stderr)
+    /// The message a user gets is one line, and it has to be the line that
+    /// names the problem. FFmpeg signs off with a generic "Conversion failed!",
+    /// so a mux failure would otherwise report nothing at all.
+    #[test]
+    fn a_mux_failure_reports_the_line_that_names_the_problem() {
+        let stderr = b"  Stream #0:3 -> #0:3 (copy)\n\
+[matroska @ 0000017db633bf00] Attachment stream 3 has no filename tag.\n\
+[out#0/matroska @ 0000017db62c0ac0] Could not write header (incorrect codec parameters ?): Invalid argument\n\
+Conversion failed!\n";
+        assert_eq!(
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mkv"), Path::new(r"C:\out")),
+            "Could not write header (incorrect codec parameters ?): Invalid argument"
         );
     }
 
-    fn stream_payload_hash(path: &Path, stream: &str) -> String {
-        let hash = ffmpeg()
-            .args(["-v", "error", "-i"])
-            .arg(path)
-            .args(["-map", stream, "-c", "copy", "-f", "md5", "-"])
-            .output()
-            .expect("ffmpeg must be available for these tests");
+    /// The value after the `@` is a heap address. It is noise at best and an
+    /// internal detail at worst, and neither belongs on screen.
+    #[test]
+    fn an_ffmpeg_component_prefix_never_reaches_the_user() {
+        let stderr = b"[mov,mp4 @ 000002bd58e45280] moov atom not found\n";
+        let message =
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mp4"), Path::new(r"C:\out"));
+        assert_eq!(message, "moov atom not found");
+        assert!(!message.contains('@'));
+    }
+
+    /// FFmpeg echoes the path it was handed. That path is this app's temporary
+    /// file inside the user's own folder, and the row already names the file.
+    #[test]
+    fn the_output_path_is_redacted_out_of_the_message() {
+        let dir = Path::new(r"C:\Users\someone\Holiday");
+        let output = dir.join(format!("{TEMP_PREFIX}0000000001.mp4"));
+        let stderr = format!("Error opening output file {}.\n", output.display());
+
+        let message = last_ffmpeg_error(stderr.as_bytes(), &output, dir);
+
+        assert_eq!(message, "Error opening output file [output file].");
         assert!(
-            hash.status.success(),
-            "could not hash {stream} in {path:?}: {}",
-            String::from_utf8_lossy(&hash.stderr)
+            !message.contains("someone"),
+            "a local path leaked: {message}"
         );
-        let value = String::from_utf8_lossy(&hash.stdout).trim().to_string();
-        assert!(!value.is_empty(), "empty {stream} hash for {path:?}");
-        value
+        assert!(!message.contains(TEMP_PREFIX));
+    }
+
+    /// The terminator is only stepped over. A single useful line stays put.
+    #[test]
+    fn an_input_failure_keeps_the_diagnostic_that_explains_it() {
+        let stderr = b"Error opening input files: Invalid data found when processing input\n";
+        assert_eq!(
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mp4"), Path::new(r"C:\out")),
+            "Error opening input files: Invalid data found when processing input"
+        );
+    }
+
+    /// A failure after muxing has started prints its errors first and its
+    /// closing summary last. Stepping back exactly one line from the sign-off
+    /// would hand the user a progress counter that reads like a success report.
+    #[test]
+    fn a_failure_after_muxing_starts_still_reports_an_error() {
+        let stderr = b"[vost#0:0/copy @ 000002703a7ca080] Error submitting a packet to the muxer: Invalid argument\n\
+    Last message repeated 1 times\n\
+[out#0/matroska @ 000002703a77ec40] Error muxing a packet\n\
+[out#0/matroska @ 000002703a77ec40] Error writing trailer: Invalid argument\n\
+[out#0/matroska @ 000002703a77ec40] Error closing file: Invalid argument\n\
+video:88KiB audio:5KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 1.234567%\n\
+frame=   76 fps=0.0 q=-1.0 Lsize=      94KiB time=00:00:03.12 bitrate= 248.1kbits/s speed= 321x\n\
+Conversion failed!\n";
+        let message =
+            last_ffmpeg_error(stderr, Path::new(r"C:\out\clip.mkv"), Path::new(r"C:\out"));
+        assert_eq!(message, "Error closing file: Invalid argument");
+        assert!(
+            !message.starts_with("frame=") && !message.contains("speed="),
+            "a progress line was reported as the error: {message}"
+        );
+    }
+
+    /// Nothing to report is still not an empty message.
+    #[test]
+    fn silent_ffmpeg_output_still_produces_a_message() {
+        assert_eq!(
+            last_ffmpeg_error(b"", Path::new(r"C:\out\clip.mp4"), Path::new(r"C:\out")),
+            "FFmpeg failed"
+        );
+        assert_eq!(
+            last_ffmpeg_error(
+                b"Conversion failed!\n",
+                Path::new(r"C:\out\clip.mp4"),
+                Path::new(r"C:\out")
+            ),
+            "Conversion failed!"
+        );
     }
 
     fn temp_files(output_dir: &Path) -> Vec<PathBuf> {
@@ -1166,6 +1599,10 @@ mod tests {
             .collect()
     }
 
+    /// The whole v0.4 contract for one container, re-run on every supported
+    /// format: the fixture really is sensitive, the output is readable, the
+    /// metadata and chapters and data tracks are gone, the encoded payload is
+    /// byte-identical, the source is untouched and nothing is left behind.
     fn assert_format_cleaning(extension: &str) {
         let dir = scratch(&format!("format-{extension}"));
         let out = dir.join("out");
@@ -1193,10 +1630,16 @@ mod tests {
         let input_kinds = stream_kinds(&input);
         assert!(input_kinds.contains(&"Video".to_string()));
         assert!(input_kinds.contains(&"Audio".to_string()));
-        if let Some(data_stream_kind) = capabilities.data_stream_kind {
+        if let Some(kind) = capabilities.non_media_stream_kind {
             assert!(
-                input_kinds.contains(&data_stream_kind.to_string()),
-                "{extension} fixture lacks its expected data stream: {input_kinds:?}"
+                input_kinds.contains(&kind.to_string()),
+                "{extension} fixture lacks its expected non-media stream: {input_kinds:?}"
+            );
+        }
+        if capabilities.subtitle_codec.is_some() {
+            assert!(
+                input_kinds.contains(&"Subtitle".to_string()),
+                "{extension} fixture lacks its subtitle stream: {input_kinds:?}"
             );
         }
         if extension == "avi" {
@@ -1204,6 +1647,22 @@ mod tests {
                 contains(&before, DATA_CANARY),
                 "AVI fixture lacks its data payload canary"
             );
+        }
+        if capabilities.attaches() {
+            assert_eq!(
+                input_kinds
+                    .iter()
+                    .filter(|kind| *kind == "Attachment")
+                    .count(),
+                2,
+                "{extension} fixture lacks its two attachment streams: {input_kinds:?}"
+            );
+            for canary in [ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA] {
+                assert!(
+                    contains(&before, canary),
+                    "{extension} fixture lacks an attachment payload canary"
+                );
+            }
         }
 
         let source_video_hash = stream_payload_hash(&input, "0:v:0");
@@ -1238,16 +1697,54 @@ mod tests {
             );
         }
         let output_kinds = stream_kinds(&cleaned);
-        assert!(!output_kinds.contains(&"Data".to_string()));
+        // A whitelist, not a list of the two kinds that went wrong once. It
+        // mirrors `StreamKind::is_media`, which is what decides whether the
+        // cleaner keeps a stream, so any other kind surviving fails here
+        // whatever it is -- an attachment included.
         assert!(
-            !output_kinds.contains(&"Unknown".to_string()),
-            "{extension} output still has an unknown/data stream"
+            output_kinds
+                .iter()
+                .all(|kind| matches!(kind.as_str(), "Video" | "Audio" | "Subtitle")),
+            "{extension} output kept a non-media stream: {output_kinds:?}"
         );
+        // And the media the user came for is still there.
+        assert!(output_kinds.contains(&"Video".to_string()));
+        assert!(output_kinds.contains(&"Audio".to_string()));
+        if capabilities.subtitle_codec.is_some() {
+            assert!(
+                output_kinds.contains(&"Subtitle".to_string()),
+                "{extension} lost its subtitle track: {output_kinds:?}"
+            );
+        }
+        let cleaned_bytes = std::fs::read(&cleaned).unwrap();
+        // Subtitles are kept, so the proof is symmetrical with the attachment
+        // one below: the stream is still there AND its payload came through. A
+        // remux that kept an empty subtitle track would pass the kind check.
+        if capabilities.subtitle_codec.is_some() {
+            assert!(
+                contains(&cleaned_bytes, SUBTITLE_BODY.as_bytes()),
+                "{extension} lost its subtitle payload"
+            );
+        }
         if extension == "avi" {
             assert!(
-                !contains(&std::fs::read(&cleaned).unwrap(), DATA_CANARY),
+                !contains(&cleaned_bytes, DATA_CANARY),
                 "AVI data payload survived"
             );
+        }
+        if capabilities.attaches() {
+            for canary in [ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA] {
+                assert!(
+                    !contains(&cleaned_bytes, canary),
+                    "{extension} attachment payload survived"
+                );
+            }
+            for name in [ATTACHMENT_NAME_ALPHA, ATTACHMENT_NAME_BETA] {
+                assert!(
+                    !contains(&cleaned_bytes, name.as_bytes()),
+                    "{extension} attachment filename survived"
+                );
+            }
         }
 
         // H: the encoded video and audio packet payloads are byte-identical.
@@ -1327,6 +1824,25 @@ mod tests {
                     "unexpected unknown-stream policy for {}",
                     profile.extension
                 );
+                // Attachments are excluded on every profile, not only on the
+                // one container that can carry them: a negative map is inert
+                // where there is nothing to match, and making it conditional
+                // would be a second rule to keep in step with the muxers.
+                let pair_at = |first: &str, second: &str| {
+                    args.windows(2)
+                        .position(|pair| pair[0] == first && pair[1] == second)
+                };
+                let map_all = pair_at("-map", "0")
+                    .unwrap_or_else(|| panic!("{} maps no streams", profile.extension));
+                let drop_attachments = pair_at("-map", "-0:t?").unwrap_or_else(|| {
+                    panic!("{} does not exclude attachment streams", profile.extension)
+                });
+                assert!(
+                    drop_attachments > map_all,
+                    "{}: the attachment exclusion must follow `-map 0`",
+                    profile.extension
+                );
+
                 let codec = args.iter().position(|arg| arg == "-c").unwrap();
                 assert_eq!(args[codec + 1], "copy");
                 let muxer = args.iter().position(|arg| arg == "-f").unwrap();
@@ -1552,11 +2068,11 @@ mod tests {
     fn batch_size_is_enforced_by_the_backend() {
         let dir = scratch("limit");
         let over: Vec<String> = (0..MAX_BATCH + 1).map(|i| format!("v{i}.mp4")).collect();
-        let err = run_batch(&over, "CLIP", &dir, &dir, |_| {}).unwrap_err();
+        let err = run_batch(&over, "CLIP", &dir, &dir, 1, |_| {}).unwrap_err();
         assert!(err.contains("101"), "unexpected message: {err}");
         assert!(err.contains(&MAX_BATCH.to_string()));
 
-        let err = run_batch(&[], "CLIP", &dir, &dir, |_| {}).unwrap_err();
+        let err = run_batch(&[], "CLIP", &dir, &dir, 1, |_| {}).unwrap_err();
         assert_eq!(err, "No videos selected");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1757,7 +2273,7 @@ mod tests {
             .collect();
 
         let mut seen_processing = 0;
-        let summary = run_batch(&paths, "CLIP", &out, &dir, |p| {
+        let summary = run_batch(&paths, "CLIP", &out, &dir, 1, |p| {
             if p.status == "processing" {
                 seen_processing += 1;
             }
