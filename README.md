@@ -219,9 +219,10 @@ The current build targets Windows 10/11 on x86_64.
 ## How it works
 
 Files are inspected with the bundled `ffprobe` (`-show_format -show_streams
--show_chapters`, JSON output): once when added, for the scan, and again after cleaning,
-when the verifier re-inspects the input and inspects the output. Nothing is parsed from
-FFmpeg's human-readable output.
+-show_chapters`, JSON output). The Privacy Scan inspects each file when it is added.
+Immediately before cleaning, the input is inspected again to take a fresh baseline, in
+case it changed while queued. After cleaning, the written output is inspected and
+verified against that baseline. Nothing is parsed from FFmpeg's human-readable output.
 
 For each file, MetaStrip invokes the bundled FFmpeg with this common stream-copy core:
 
