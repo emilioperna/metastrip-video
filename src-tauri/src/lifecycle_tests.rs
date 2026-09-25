@@ -18,11 +18,12 @@ use std::sync::mpsc;
 
 use tauri::async_runtime::block_on;
 
-use crate::testkit::{sample_video, scratch};
+use crate::plan::CleaningOptions;
+use crate::testkit::{sample_for_format, sample_video, scratch, stream_kinds};
 use crate::{
-    clean_request, clean_with, cleaning_blocks_close, run_blocking, write_settings, BatchGuard,
-    BatchState, CleanSummary, ProcessingState, Progress, Settings, CLEAN_BUSY,
-    CLEAN_INTERNAL_ERROR, CLEAN_UPDATING,
+    clean_request, clean_with, cleaning_blocks_close, run_blocking, store_cleaning_options,
+    write_settings, BatchGuard, BatchState, CleanSummary, ProcessingState, Progress, Settings,
+    CLEAN_BUSY, CLEAN_INTERNAL_ERROR, CLEAN_UPDATING,
 };
 
 /// A batch folder with its own app data dir and output folder, as the app has.
@@ -41,6 +42,7 @@ fn batch_dirs(name: &str) -> BatchDirs {
         &Settings {
             prefix: "CLIP".into(),
             output_directory: out.to_string_lossy().into_owned(),
+            ..Settings::default()
         },
     )
     .unwrap();
@@ -134,8 +136,14 @@ fn the_state_is_released_after_an_error_and_after_a_panic() {
     let root = scratch("lifecycle-error");
     // No output folder configured, so the batch fails right after taking the
     // state and before it touches the disk.
-    let error = clean_request(&AFTER_ERROR, &root, &["whatever.mp4".to_string()], |_| {})
-        .expect_err("a batch ran with no output folder");
+    let error = clean_request(
+        &AFTER_ERROR,
+        &root,
+        &["whatever.mp4".to_string()],
+        CleaningOptions::default(),
+        |_| {},
+    )
+    .expect_err("a batch ran with no output folder");
     assert_eq!(error, "Choose an output folder first.");
     assert_eq!(AFTER_ERROR.snapshot(), idle(1));
     assert!(!cleaning_blocks_close(&AFTER_ERROR));
@@ -151,7 +159,13 @@ fn the_state_is_released_after_an_error_and_after_a_panic() {
         .to_string_lossy()
         .into_owned()];
     let result = block_on(run_blocking(CLEAN_INTERNAL_ERROR, move || {
-        clean_request(&AFTER_PANIC, &app, &paths, |_| panic!("mid-batch"))
+        clean_request(
+            &AFTER_PANIC,
+            &app,
+            &paths,
+            CleaningOptions::default(),
+            |_| panic!("mid-batch"),
+        )
     }));
 
     assert_eq!(result.unwrap_err(), CLEAN_INTERNAL_ERROR);
@@ -191,15 +205,21 @@ fn a_batch_names_itself_the_same_way_from_its_first_event_to_its_summary() {
     }
 
     let mut seen: Vec<Seen> = Vec::new();
-    let first = clean_request(&STATE, &dirs.app, &paths, |progress: Progress| {
-        seen.push(Seen {
-            batch_id: progress.batch_id,
-            index: progress.index,
-            status: progress.status,
-            state: STATE.snapshot(),
-            close_blocked: cleaning_blocks_close(&STATE),
-        });
-    })
+    let first = clean_request(
+        &STATE,
+        &dirs.app,
+        &paths,
+        CleaningOptions::default(),
+        |progress: Progress| {
+            seen.push(Seen {
+                batch_id: progress.batch_id,
+                index: progress.index,
+                status: progress.status,
+                state: STATE.snapshot(),
+                close_blocked: cleaning_blocks_close(&STATE),
+            });
+        },
+    )
     .unwrap();
 
     // Four events, in the order the pipeline has always emitted them, and every
@@ -233,9 +253,13 @@ fn a_batch_names_itself_the_same_way_from_its_first_event_to_its_summary() {
     // every event. This is what stops a page that reloaded mid-batch from
     // taking the old batch's events for its new one.
     let mut later_ids: Vec<u64> = Vec::new();
-    let second = clean_request(&STATE, &dirs.app, &paths, |progress: Progress| {
-        later_ids.push(progress.batch_id)
-    })
+    let second = clean_request(
+        &STATE,
+        &dirs.app,
+        &paths,
+        CleaningOptions::default(),
+        |progress: Progress| later_ids.push(progress.batch_id),
+    )
     .unwrap();
     assert_eq!(second.batch_id, 2);
     assert_ne!(second.batch_id, first.batch_id);
@@ -263,13 +287,19 @@ fn while_a_batch_runs_a_second_clean_is_refused_and_a_normal_close_waits() {
     let running_batch =
         tauri::async_runtime::spawn(run_blocking(CLEAN_INTERNAL_ERROR, move || {
             let mut paused = false;
-            clean_request(&STATE, &app, &paths, |progress| {
-                if !paused {
-                    paused = true;
-                    started_tx.send(progress.batch_id).unwrap();
-                    resume_rx.recv().unwrap();
-                }
-            })
+            clean_request(
+                &STATE,
+                &app,
+                &paths,
+                CleaningOptions::default(),
+                |progress| {
+                    if !paused {
+                        paused = true;
+                        started_tx.send(progress.batch_id).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                },
+            )
         }));
     let live_id = started_rx.recv().expect("the first batch never started");
 
@@ -284,7 +314,13 @@ fn while_a_batch_runs_a_second_clean_is_refused_and_a_normal_close_waits() {
     // A page that forgot the batch and asked for another one is refused, and
     // the refusal does not disturb what the running batch reports.
     let mut reported = false;
-    let refused = clean_request(&STATE, &dirs.app, &later_batch, |_| reported = true);
+    let refused = clean_request(
+        &STATE,
+        &dirs.app,
+        &later_batch,
+        CleaningOptions::default(),
+        |_| reported = true,
+    );
     assert_eq!(refused.unwrap_err(), CLEAN_BUSY);
     assert!(!reported, "the refused batch reported progress");
     assert_eq!(STATE.snapshot(), running(live_id));
@@ -297,7 +333,14 @@ fn while_a_batch_runs_a_second_clean_is_refused_and_a_normal_close_waits() {
     // Finished, so the window closes and the next batch runs.
     assert_eq!(STATE.snapshot(), idle(live_id));
     assert!(!cleaning_blocks_close(&STATE));
-    let later = clean_request(&STATE, &dirs.app, &later_batch, |_| {}).unwrap();
+    let later = clean_request(
+        &STATE,
+        &dirs.app,
+        &later_batch,
+        CleaningOptions::default(),
+        |_| {},
+    )
+    .unwrap();
     assert_eq!(later.batch_id, live_id + 1);
     assert_eq!((later.completed, later.verified), (1, 1));
 
@@ -477,7 +520,7 @@ fn the_close_button_sees_a_clean_before_its_work_is_queued() {
     let running_batch =
         tauri::async_runtime::spawn(run_blocking(CLEAN_INTERNAL_ERROR, move || {
             let mut paused = false;
-            clean_with(batch, &app, &paths, |_| {
+            clean_with(batch, &app, &paths, CleaningOptions::default(), |_| {
                 if !paused {
                     paused = true;
                     started_tx.send(()).unwrap();
@@ -506,8 +549,70 @@ fn the_close_button_sees_a_clean_before_its_work_is_queued() {
 fn the_pipeline_can_only_be_entered_with_the_app_claimed() {
     fn assert_takes_the_guard<F>(_: F)
     where
-        F: FnOnce(BatchGuard, &Path, &[String], fn(Progress)) -> Result<CleanSummary, String>,
+        F: FnOnce(
+            BatchGuard,
+            &Path,
+            &[String],
+            CleaningOptions,
+            fn(Progress),
+        ) -> Result<CleanSummary, String>,
     {
     }
     assert_takes_the_guard(clean_with);
+}
+
+/// The options are the ones the click carried, for every file of the batch.
+/// The stored preference is changed -- both before the batch and while its
+/// first file is being cleaned -- and neither change reaches the batch.
+#[test]
+fn a_batch_runs_with_the_options_it_was_handed_from_first_file_to_last() {
+    static STATE: BatchState = BatchState::new();
+    let dirs = batch_dirs("lifecycle-options");
+    let inputs = dirs.root.join("inputs");
+    std::fs::create_dir_all(&inputs).unwrap();
+    let first_dir = inputs.join("first");
+    let second_dir = inputs.join("second");
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let paths: Vec<String> = [&first_dir, &second_dir]
+        .iter()
+        .map(|dir| sample_for_format(dir, "mkv").to_string_lossy().into_owned())
+        .collect();
+
+    // Stored: keep subtitles. Clicked: remove them.
+    store_cleaning_options(&dirs.app, CleaningOptions::default()).unwrap();
+    let clicked = CleaningOptions {
+        remove_subtitles: true,
+    };
+    let mut flipped = false;
+    let summary = clean_request(&STATE, &dirs.app, &paths, clicked, |progress: Progress| {
+        if !flipped && progress.status == "processing" {
+            // The user flips the stored preference mid-batch.
+            store_cleaning_options(&dirs.app, CleaningOptions::default()).unwrap();
+            flipped = true;
+        }
+    })
+    .unwrap();
+
+    assert!(flipped);
+    assert_eq!(
+        summary.options, clicked,
+        "the summary does not echo what ran"
+    );
+    assert_eq!(summary.completed, 2);
+    assert_eq!(summary.verified, 2, "{:?}", summary.results);
+    assert_eq!(summary.subtitle_streams_removed, 2);
+    for result in &summary.results {
+        let output = dirs
+            .root
+            .join("out")
+            .join(result.output_name.as_ref().unwrap());
+        let kinds = stream_kinds(&output);
+        assert!(
+            !kinds.iter().any(|kind| kind == "Subtitle"),
+            "{} kept its subtitle: {kinds:?}",
+            result.input_name
+        );
+    }
+    std::fs::remove_dir_all(&dirs.root).unwrap();
 }

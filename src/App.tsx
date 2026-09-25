@@ -41,6 +41,17 @@ import {
   type ScanView,
   type VerificationReport,
 } from "./privacy";
+import {
+  DEFAULT_CLEANING_OPTIONS,
+  cleanRequest,
+  cleaningControlLocked,
+  preCleanWarnings,
+  readCleaningOptions,
+  saveOptionsRequest,
+  snapshotOptions,
+  withRemoveSubtitles,
+  type CleaningOptions,
+} from "./cleaning";
 import { statusText } from "./updater";
 import { useUpdater } from "./useUpdater";
 
@@ -76,10 +87,11 @@ function emptyScan(path: string, name: string): ScanView {
     durationSeconds: null,
     videoStreams: 0,
     audioStreams: 0,
+    subtitleStreams: 0,
+    coverImages: 0,
     otherStreams: 0,
     chapterCount: 0,
     fieldCount: 0,
-    plan: null,
   };
 }
 
@@ -104,6 +116,10 @@ export default function App() {
   const [supportedFormats, setSupportedFormats] = useState<SupportedFormat[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [prefixDraft, setPrefixDraft] = useState("");
+  // The cleaning choice as the checkbox shows it. Loaded from the stored
+  // preference, saved on every change, and copied into each Clean request at
+  // the click -- the backend never reads the stored value for a batch.
+  const [cleaning, setCleaning] = useState<CleaningOptions>(DEFAULT_CLEANING_OPTIONS);
   const [previewId] = useState(demoId);
   // At most one row is open at a time. With a hundred files, letting every row
   // expand at once is what turns a usable list into an unreadable wall.
@@ -338,6 +354,7 @@ export default function App() {
       .then((loaded) => {
         setSettings(loaded);
         setPrefixDraft(loaded.prefix);
+        setCleaning(readCleaningOptions(loaded.cleaning));
       })
       .catch((reason) => setError(String(reason)));
 
@@ -377,6 +394,16 @@ export default function App() {
     }
   }
 
+  function changeRemoveSubtitles(removeSubtitles: boolean) {
+    const next = withRemoveSubtitles(cleaning, removeSubtitles);
+    // The checkbox is what the next batch uses, saved or not; the save only
+    // makes the choice outlast this session.
+    setCleaning(next);
+    invoke<Settings>("save_cleaning_options", saveOptionsRequest(next))
+      .then((saved) => setSettings(saved))
+      .catch((reason) => setError(`Could not save the cleaning choice: ${String(reason)}`));
+  }
+
   function commitPrefix() {
     if (!settings || prefixDraft.trim() === settings.prefix) return;
     void persist(prefixDraft, settings.outputDirectory);
@@ -400,14 +427,21 @@ export default function App() {
   async function cleanVideos() {
     if (cleanInFlight.current) return;
     cleanInFlight.current = true;
+    // Fixed here, at the click, before anything is awaited: the queue and the
+    // options this batch runs with. The checkbox is locked while it runs, and
+    // nothing done to the page afterwards can reach this copy.
+    const request = cleanRequest(
+      files.map((file) => file.path),
+      snapshotOptions(cleaning),
+    );
     try {
-      await runBatch();
+      await runBatch(request);
     } finally {
       cleanInFlight.current = false;
     }
   }
 
-  async function runBatch() {
+  async function runBatch(request: ReturnType<typeof cleanRequest>) {
     // The backend decides, not this page: a batch it started before a reload is
     // still running even though nothing here remembers it. Asking also fixes
     // the batch this page is about to own -- anything newer than what the
@@ -436,9 +470,7 @@ export default function App() {
     );
 
     try {
-      const result = await invoke<Summary>("clean_videos", {
-        paths: files.map((file) => file.path),
-      });
+      const result = await invoke<Summary>("clean_videos", request);
       setSummary(result);
       setPhase("done");
       // Deliberately still attached: the last file's event and this answer
@@ -494,6 +526,8 @@ export default function App() {
   // Shown only while the batch it refers to is still running; a close that was
   // refused a batch ago is not news.
   const closeWarning = closeBlocked && busy;
+  const cleaningLocked = cleaningControlLocked(busy, settings !== null);
+  const removalWarnings = total > 0 && !busy ? preCleanWarnings(files, cleaning) : [];
 
   return (
     <main className={`app-shell app-shell--${phase}`} aria-busy={busy}>
@@ -545,10 +579,21 @@ export default function App() {
             previewName={previewName}
             prefixValid={prefixValid}
             running={busy}
+            cleaning={cleaning}
+            cleaningLocked={cleaningLocked}
             onChooseFolder={chooseOutputFolder}
             onPrefixChange={setPrefixDraft}
             onPrefixCommit={commitPrefix}
+            onRemoveSubtitlesChange={changeRemoveSubtitles}
           />
+
+          {removalWarnings.length > 0 ? (
+            <ul className="removal-warnings" role="status" aria-label="What cleaning will remove">
+              {removalWarnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          ) : null}
 
           {total > 0 && !busy ? (
             <div className="primary-action-row">

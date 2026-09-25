@@ -38,7 +38,8 @@ pub const ATTACHMENT_NAME_ALPHA: &str = "fixture-alpha.ttf";
 pub const ATTACHMENT_NAME_BETA: &str = "fixture-beta.otf";
 
 /// Body of the fixture subtitle track. Subtitles are media: the cleaner keeps
-/// them, so this must still be there afterwards.
+/// them by default, so this must still be there afterwards -- and must be gone
+/// when subtitle removal was asked for.
 pub const SUBTITLE_BODY: &str = "SUBTITLE_BODY_KEPT";
 
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -204,8 +205,8 @@ pub struct FixtureCapabilities {
     /// to have no fixture at all.
     pub non_media_stream_kind: Option<&'static str>,
     /// Subtitle codec this container accepts, where it accepts one. Subtitles
-    /// are kept by the cleaner, so a fixture carrying one proves preservation
-    /// rather than removal.
+    /// are kept by default, so a fixture carrying one proves preservation, and
+    /// the same fixture proves removal when the option is on.
     pub subtitle_codec: Option<&'static str>,
 }
 
@@ -491,4 +492,265 @@ pub fn stream_payload_hash(path: &Path, stream: &str) -> String {
     let value = String::from_utf8_lossy(&hash.stdout).trim().to_string();
     assert!(!value.is_empty(), "empty {stream} hash for {path:?}");
     value
+}
+
+// ------------------------------------------------------------- Cover art ---
+
+/// Text a fixture cover image carries in its own EXIF block. A phone photo
+/// used as a cover carries its camera and its location the same way, inside
+/// the picture rather than in any container tag.
+pub const EXIF_DESCRIPTION_CANARY: &str = "EXIF_DESCRIPTION_CANARY";
+pub const EXIF_MAKE_CANARY: &str = "EXIF_MAKE_CANARY";
+
+/// A TIFF-structured EXIF block, little-endian: IFD0 with an image
+/// description, a camera make and a pointer to a GPS IFD holding a latitude
+/// of 45 deg 27 min 51.23 sec N. Laid out by the EXIF 2.3 rules -- word-aligned
+/// values, offsets from the TIFF header -- so FFmpeg's own EXIF reader parses it.
+fn exif_block() -> Vec<u8> {
+    fn entry(tag: u16, kind: u16, count: u32, value: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(12);
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(kind.to_le_bytes());
+        bytes.extend(count.to_le_bytes());
+        bytes.extend(value.to_le_bytes());
+        bytes
+    }
+    fn ascii(text: &str) -> Vec<u8> {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        if bytes.len() % 2 == 1 {
+            bytes.push(0);
+        }
+        bytes
+    }
+    const ASCII: u16 = 2;
+    const LONG: u16 = 4;
+    const RATIONAL: u16 = 5;
+
+    let description = ascii(EXIF_DESCRIPTION_CANARY);
+    let make = ascii(EXIF_MAKE_CANARY);
+    let ifd0 = 8u32;
+    let description_at = ifd0 + 2 + 12 * 3 + 4;
+    let make_at = description_at + description.len() as u32;
+    let gps_at = make_at + make.len() as u32;
+    let latitude_at = gps_at + 2 + 12 * 2 + 4;
+
+    let mut tiff = b"II*\0".to_vec();
+    tiff.extend(ifd0.to_le_bytes());
+    tiff.extend(3u16.to_le_bytes());
+    tiff.extend(entry(
+        0x010E,
+        ASCII,
+        EXIF_DESCRIPTION_CANARY.len() as u32 + 1,
+        description_at,
+    ));
+    tiff.extend(entry(
+        0x010F,
+        ASCII,
+        EXIF_MAKE_CANARY.len() as u32 + 1,
+        make_at,
+    ));
+    tiff.extend(entry(0x8825, LONG, 1, gps_at));
+    tiff.extend(0u32.to_le_bytes());
+    tiff.extend(description);
+    tiff.extend(make);
+    tiff.extend(2u16.to_le_bytes());
+    // GPSLatitudeRef "N": two bytes, stored inline in the value field.
+    tiff.extend(0x0001u16.to_le_bytes());
+    tiff.extend(ASCII.to_le_bytes());
+    tiff.extend(2u32.to_le_bytes());
+    tiff.extend(*b"N\0\0\0");
+    tiff.extend(entry(0x0002, RATIONAL, 3, latitude_at));
+    tiff.extend(0u32.to_le_bytes());
+    for value in [45u32, 1, 27, 1, 5123, 100] {
+        tiff.extend(value.to_le_bytes());
+    }
+    tiff
+}
+
+/// A real JPEG made by FFmpeg, optionally carrying an EXIF block in the APP1
+/// segment right after SOI, which is where cameras put it. Nothing else in the
+/// file changes, and FFmpeg decodes it and reads its EXIF back (asserted by the
+/// tests that use it), so this is a valid photo rather than bytes a lenient
+/// parser happens to accept.
+pub fn cover_jpeg(dir: &Path, with_exif: bool) -> PathBuf {
+    let plain = dir.join("cover-plain.jpg");
+    let built = ffmpeg()
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=orange:s=64x64",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "mjpeg",
+            "-pix_fmt",
+            "yuvj420p",
+            "-f",
+            "image2",
+        ])
+        .arg(&plain)
+        .output()
+        .expect("ffmpeg must be available for these tests");
+    assert!(
+        built.status.success(),
+        "could not build the cover image: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !with_exif {
+        return plain;
+    }
+
+    let jpeg = std::fs::read(&plain).unwrap();
+    assert_eq!(jpeg[..2], [0xFF, 0xD8], "FFmpeg did not write a JPEG");
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend(exif_block());
+    let length = u16::try_from(payload.len() + 2).unwrap();
+    let mut photo = jpeg[..2].to_vec();
+    photo.extend([0xFF, 0xE1]);
+    photo.extend(length.to_be_bytes());
+    photo.extend(payload);
+    photo.extend(&jpeg[2..]);
+
+    let path = dir.join("cover-exif.jpg");
+    std::fs::write(&path, photo).unwrap();
+    path
+}
+
+/// The EXIF FFmpeg itself reads out of an image, one `key=value` per line.
+/// Empty when it finds none.
+pub fn exif_seen_by_ffprobe(image: &Path) -> String {
+    let probe = crate::sidecar::ffprobe()
+        .args([
+            "-v",
+            "error",
+            "-show_frames",
+            "-show_entries",
+            "frame_tags",
+            "-of",
+            "flat",
+        ])
+        .arg(image)
+        .output()
+        .expect("ffprobe must be available for these tests");
+    assert!(
+        probe.status.success() && probe.stderr.is_empty(),
+        "ffprobe could not read {image:?} cleanly: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    String::from_utf8_lossy(&probe.stdout).into_owned()
+}
+
+/// The container-specific fixture with `cover` attached as cover art, the way
+/// each container exposes one to FFmpeg as `disposition.attached_pic`:
+///
+/// * MP4 and M4V: an iTunes-style `covr` image.
+/// * MOV: the same ISO-BMFF `covr` layout under a `.mov` name. FFmpeg's `mov`
+///   muxer cannot write a cover, so this is the MOV case users actually meet:
+///   a file from another tool that FFmpeg reads a cover out of.
+/// * MKV: an image attachment with an image mimetype, which FFmpeg demuxes as
+///   an attached picture rather than as an attachment.
+///
+/// Everything else the base fixture carries -- metadata, chapters, subtitles,
+/// fonts -- comes along, so the cover is removed from a realistic file.
+pub fn sample_with_cover(dir: &Path, extension: &str, cover: &Path) -> PathBuf {
+    let path = dir.join(format!("fixture-cover.{extension}"));
+    let mut command = ffmpeg();
+    command.arg("-y");
+    match extension {
+        "mp4" | "m4v" | "mov" => {
+            let base = sample_for_format(dir, if extension == "m4v" { "m4v" } else { "mp4" });
+            // The chapter text track is regenerated from the chapters, and the
+            // muxer refuses a bare copy of it, hence `-dn`.
+            command.arg("-i").arg(&base).arg("-i").arg(cover).args([
+                "-map",
+                "0",
+                "-dn",
+                "-map",
+                "1",
+                "-c",
+                "copy",
+                "-disposition:v:1",
+                "attached_pic",
+                "-f",
+                "mp4",
+            ]);
+        }
+        "mkv" => {
+            let base = sample_for_format(dir, "mkv");
+            // The base fixture already carries two font attachments, so the
+            // cover is the third attachment stream.
+            command
+                .arg("-i")
+                .arg(&base)
+                .args(["-map", "0", "-c", "copy", "-attach"])
+                .arg(cover)
+                .args([
+                    "-metadata:s:t:2",
+                    "mimetype=image/jpeg",
+                    "-metadata:s:t:2",
+                    "filename=cover.jpg",
+                    "-f",
+                    "matroska",
+                ]);
+        }
+        other => panic!("no cover art fixture for {other}"),
+    }
+    let built = command
+        .arg(&path)
+        .output()
+        .expect("ffmpeg must be available for these tests");
+    assert!(
+        built.status.success(),
+        "could not build the {extension} cover fixture: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    path
+}
+
+/// Two genuine camera angles and one audio track: the second video stream is
+/// footage, not a cover, and nothing may treat it as removable.
+pub fn sample_with_two_videos(dir: &Path) -> PathBuf {
+    let path = dir.join("two-angles.mp4");
+    let built = ffmpeg()
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=10:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=10:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-map",
+            "0:v",
+            "-map",
+            "1:v",
+            "-map",
+            "2:a",
+            "-c:v",
+            "mpeg4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-metadata",
+            "title=SECRET",
+        ])
+        .arg(&path)
+        .output()
+        .expect("ffmpeg must be available for these tests");
+    assert!(
+        built.status.success(),
+        "could not build the two-angle fixture: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    path
 }

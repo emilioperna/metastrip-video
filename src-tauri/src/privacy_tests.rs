@@ -188,6 +188,7 @@ fn stream(kind: StreamKind, codec_tag: Option<&str>, handler: Option<&str>) -> S
             channel_layout: None,
         },
         handler_name: handler.map(str::to_string),
+        attached_pic: false,
         tag_count: 0,
     }
 }

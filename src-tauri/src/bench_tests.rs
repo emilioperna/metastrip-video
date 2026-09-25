@@ -12,6 +12,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::plan::CleaningOptions;
 use crate::testkit::{sample_for_format, scratch};
 use crate::{clean_and_verify, run_scan, IdRegistry};
 
@@ -65,7 +66,14 @@ fn measure(label: &str, count: usize) {
     let started = Instant::now();
     for path in &paths {
         let input = std::path::PathBuf::from(path);
-        crate::clean_one(&input, &baseline_out, "BASE", &mut registry).expect("bench clean failed");
+        crate::clean_one(
+            &input,
+            &baseline_out,
+            "BASE",
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .expect("bench clean failed");
     }
     let clean_time = started.elapsed();
 
@@ -76,7 +84,13 @@ fn measure(label: &str, count: usize) {
     let mut verified = 0usize;
     for path in &paths {
         let input = std::path::PathBuf::from(path);
-        let (outcome, report) = clean_and_verify(&input, &verified_out, "BENCH", &mut registry);
+        let (outcome, report) = clean_and_verify(
+            &input,
+            &verified_out,
+            "BENCH",
+            CleaningOptions::default(),
+            &mut registry,
+        );
         assert!(outcome.is_ok(), "bench clean failed: {outcome:?}");
         if report.is_some_and(|r| r.verified) {
             verified += 1;

@@ -11,15 +11,24 @@
 //! FFmpeg with `-c copy` and has no transcoding path. What is checked, and
 //! where, is split deliberately.
 //!
-//! * **Runtime (this module).** The media stream parameters are compared field
-//!   by field between input and output: codec name, codec tag, profile,
-//!   dimensions, pixel format, sample rate, channels and layout. This costs one
-//!   `ffprobe` run on the output — constant time, independent of file size. It
-//!   catches a stream that went missing or came out as a different codec or
-//!   format, but it does **not** prove the packets are bit-for-bit the same, and
-//!   it cannot on its own rule out a re-encode that kept every parameter. The
-//!   check is therefore named "Media stream parameters match" and the UI claims
-//!   only that: stream copy used, codec parameters preserved.
+//! * **Runtime (this module).** Every media stream the plan promises to keep
+//!   is compared field by field with what came out: codec name, codec tag,
+//!   profile, dimensions, pixel format, sample rate, channels and layout, plus
+//!   the cover art flag. This costs one `ffprobe` run on the output — constant
+//!   time, independent of file size. It catches a stream that went missing or
+//!   came out as a different codec or format, but it does **not** prove the
+//!   packets are bit-for-bit the same, and it cannot on its own rule out a
+//!   re-encode that kept every parameter. The check is therefore named "Kept
+//!   stream parameters match" and the UI claims only that: stream copy used,
+//!   codec parameters preserved. Nothing here looks inside a kept stream either:
+//!   what a subtitle says or a picture shows is copied, not inspected.
+//!
+//! ## Floor checks and plan checks
+//!
+//! Chapters, non-media tracks and detected cover art are checked on every file,
+//! whatever the input had and whatever the user chose: an output carrying any
+//! of them fails. Only two things read the plan: which media streams must
+//! survive, and whether subtitle removal has to be proven.
 //! * **Regression (tests only).** The test suite additionally hashes the encoded
 //!   packet payload of every stream with FFmpeg's `md5` muxer and asserts byte
 //!   equality. That reads the whole file, which is fine for two-second fixtures
@@ -61,6 +70,10 @@ pub struct VerificationReport {
     pub technical_fields_removed: usize,
     pub chapters_removed: usize,
     pub data_streams_removed: usize,
+    /// Streams the container marked as attached cover art that are gone.
+    pub cover_art_streams_removed: usize,
+    /// Subtitle tracks removed. Zero unless the run asked for their removal.
+    pub subtitle_streams_removed: usize,
     /// Findings that survived into the output, if any. Empty on a pass except
     /// for container bookkeeping, which is expected and reported separately.
     pub residual: Vec<PrivacyFinding>,
@@ -114,7 +127,14 @@ impl OriginalFingerprint {
 
 /// Name of the runtime stream check. Exported so tests assert against the label
 /// the UI shows instead of a copy of it.
-pub const STREAM_PARAMETERS_CHECK: &str = "Media stream parameters match";
+pub const STREAM_PARAMETERS_CHECK: &str = "Kept stream parameters match";
+
+/// Name of the cover art check. "Detected" is load-bearing: only streams the
+/// container marks as attached pictures are covered by it.
+pub const COVER_ART_CHECK: &str = "Detected cover art removed";
+
+/// Name of the check that runs only when subtitle removal was asked for.
+pub const SUBTITLE_REMOVAL_CHECK: &str = "Subtitle tracks removed";
 
 fn check(name: &'static str, passed: bool, detail: impl Into<String>) -> VerificationCheck {
     VerificationCheck {
@@ -237,6 +257,8 @@ pub fn verify(
             technical_fields_removed: 0,
             chapters_removed: 0,
             data_streams_removed: 0,
+            cover_art_streams_removed: 0,
+            subtitle_streams_removed: 0,
             residual: Vec::new(),
             before_after: Vec::new(),
         };
@@ -259,10 +281,17 @@ pub fn verify(
     //    `handler_name` and `vendor_id` back, and demanding otherwise would fail
     //    every file for no privacy gain.
     //
-    //    A field counts as surviving only when the same key in the same place
-    //    still carries the same value. A muxer rewriting its own tag is not a
+    //    A field counts as surviving when the same key, in the same scope, still
+    //    carries the same value. A muxer rewriting its own tag is not a
     //    surviving disclosure: `encoder` goes from `Lavf62.12.102`, which pins
     //    the exact build, to the bare `Lavf` that `-fflags +bitexact` produces.
+    //
+    //    The stream index is deliberately NOT part of the match. Removing a
+    //    stream -- detected cover art, subtitles -- renumbers every stream after
+    //    it, so a disclosure that survived on input stream 3 turns up on output
+    //    stream 2, and requiring the same index would let exactly that one
+    //    through. Ignoring it is the conservative direction: it can only find
+    //    more survivors, never fewer.
     //
     //    Check 4 is NOT the net that makes this safe: it only looks at MEDIUM
     //    and above, and `encoder` is LOW, so it can never flag this field. What
@@ -280,7 +309,6 @@ pub fn verify(
         let still_there = after_findings.iter().any(|a| {
             a.source_key == finding.source_key
                 && a.scope == finding.scope
-                && a.stream_index == finding.stream_index
                 && a.detail == finding.detail
         });
         if still_there {
@@ -314,26 +342,27 @@ pub fn verify(
         },
     ));
 
-    // 5. Chapters, where the input had any.
+    // 5. No chapters, whatever the input had. An output that somehow gained
+    //    chapters is not clean just because the original had none to remove.
     let chapters_removed = before.chapters.len().saturating_sub(after.chapters.len());
-    let chapters_ok = !plan.remove_chapters || after.chapters.is_empty();
+    let chapters_ok = after.chapters.is_empty();
     checks.push(check(
         "Chapters removed",
         chapters_ok,
-        if !plan.remove_chapters {
-            "The original had no chapters".to_string()
-        } else if chapters_ok {
-            format!("{chapters_removed} chapter marker(s) removed")
-        } else {
+        if !chapters_ok {
             format!("{} chapter marker(s) remain", after.chapters.len())
+        } else if before.chapters.is_empty() {
+            "The original had no chapters".to_string()
+        } else {
+            format!("{chapters_removed} chapter marker(s) removed")
         },
     ));
 
-    // 6. Data and other non-media tracks, where the input had any.
+    // 6. No data, attachment or unknown track, whatever the input had.
     let after_data = after.non_media_streams().count();
     let before_data = before.non_media_streams().count();
     let data_removed = before_data.saturating_sub(after_data);
-    let data_ok = !plan.remove_data_streams || after_data == 0;
+    let data_ok = after_data == 0;
     // Named for the set it measures. `non_media_streams` is data, attachment
     // and unknown tracks, so calling all of them "data" would describe an
     // embedded font as something the file does not contain -- and this detail
@@ -341,70 +370,141 @@ pub fn verify(
     checks.push(check(
         "Non-media tracks removed",
         data_ok,
-        if !plan.remove_data_streams {
-            "The original had no data or attachment tracks".to_string()
-        } else if data_ok {
-            format!("{data_removed} non-media track(s) removed")
-        } else {
+        if !data_ok {
             format!("{after_data} non-media track(s) remain")
+        } else if before_data == 0 {
+            "The original had no data or attachment tracks".to_string()
+        } else {
+            format!("{data_removed} non-media track(s) removed")
         },
     ));
 
-    // 7. The media the user came for is still present, with the same codec
-    //    parameters. A parameter comparison, not packet identity: see the module
-    //    comment for what this does and does not establish.
-    let mut identity_ok = true;
-    let mut identity_detail = String::new();
-    // Every kind `is_media` keeps, so the check covers what its name claims.
-    // A subtitle track is copied through like the rest and nothing else in the
-    // report would notice it going missing: it is not counted by check 6
-    // either, because `non_media_streams` excludes it.
-    for kind in [StreamKind::Video, StreamKind::Audio, StreamKind::Subtitle] {
-        let source: Vec<_> = before.streams.iter().filter(|s| s.kind == kind).collect();
-        let result: Vec<_> = after.streams.iter().filter(|s| s.kind == kind).collect();
-        if source.len() != result.len() {
-            identity_ok = false;
-            identity_detail = format!(
-                "{} stream count changed: {} -> {}",
-                kind.label(),
-                source.len(),
-                result.len()
-            );
-            break;
-        }
-        for (a, b) in source.iter().zip(&result) {
-            if a.identity != b.identity {
-                identity_ok = false;
-                identity_detail = format!(
+    // 7. No stream the container marks as attached cover art. Only that mark
+    //    counts: an image carried as an ordinary video track cannot be told
+    //    apart from footage, so it is kept as video and this check says nothing
+    //    about it -- which is why the name says "detected".
+    let before_covers = before.attached_pictures().count();
+    let after_covers = after.attached_pictures().count();
+    let covers_removed = before_covers.saturating_sub(after_covers);
+    let covers_ok = after_covers == 0;
+    checks.push(check(
+        COVER_ART_CHECK,
+        covers_ok,
+        if !covers_ok {
+            format!("{after_covers} detected cover art stream(s) remain")
+        } else if before_covers == 0 {
+            "The original had no detected cover art".to_string()
+        } else {
+            format!("{covers_removed} detected cover art stream(s) removed")
+        },
+    ));
+
+    // 8. Subtitles, when the run was asked to remove them. Stated positively:
+    //    none remain. When they are kept they are in `expected_media` instead,
+    //    and check 9 proves they survived.
+    let before_subtitles = before.subtitle_streams().count();
+    let after_subtitles = after.subtitle_streams().count();
+    let subtitles_removed = if plan.remove_subtitles {
+        before_subtitles.saturating_sub(after_subtitles)
+    } else {
+        0
+    };
+    if plan.remove_subtitles {
+        let subtitles_ok = after_subtitles == 0;
+        checks.push(check(
+            SUBTITLE_REMOVAL_CHECK,
+            subtitles_ok,
+            if !subtitles_ok {
+                format!("{after_subtitles} subtitle track(s) remain")
+            } else if before_subtitles == 0 {
+                "The original had no subtitle tracks".to_string()
+            } else {
+                format!("{subtitles_removed} subtitle track(s) removed")
+            },
+        ));
+    }
+
+    // 9. Every stream the plan promised to keep is there, in order, with the
+    //    same codec parameters, and nothing else is. A parameter comparison,
+    //    not packet identity: see the module comment for what this does and
+    //    does not establish.
+    let kept: Vec<_> = after.media_streams().collect();
+    let expected = &plan.expected_media;
+    let count_of = |kind: StreamKind| expected.iter().filter(|s| s.kind == kind).count();
+    let mut stream_failure: Option<String> = None;
+    if kept.len() != expected.len() {
+        // Name the kind that moved rather than a bare total, so a lost camera
+        // angle reads as lost video.
+        let moved = [StreamKind::Video, StreamKind::Audio, StreamKind::Subtitle]
+            .into_iter()
+            .map(|kind| {
+                let found = kept.iter().filter(|s| s.kind == kind).count();
+                (kind, count_of(kind), found)
+            })
+            .find(|(_, want, found)| want != found);
+        stream_failure = Some(match moved {
+            Some((kind, want, found)) => format!(
+                "{} stream count changed: {want} expected, {found} found",
+                kind.label()
+            ),
+            None => format!(
+                "Kept stream count changed: {} expected, {} found",
+                expected.len(),
+                kept.len()
+            ),
+        });
+    } else {
+        // Same length, so this pairs every stream: `zip` cannot stop early and
+        // leave one unexamined.
+        for (want, got) in expected.iter().zip(&kept) {
+            let problem = if want.kind != got.kind {
+                Some(format!(
+                    "Stream order changed: {} found where {} stream {} was expected",
+                    got.kind.label(),
+                    want.kind.label(),
+                    want.input_index
+                ))
+            } else if want.identity != got.identity {
+                Some(format!(
                     "{} stream {} changed codec parameters",
-                    kind.label(),
-                    a.index
-                );
+                    want.kind.label(),
+                    want.input_index
+                ))
+            } else if want.attached_pic != got.attached_pic {
+                Some(format!(
+                    "{} stream {} changed its cover art flag",
+                    want.kind.label(),
+                    want.input_index
+                ))
+            } else {
+                None
+            };
+            if problem.is_some() {
+                stream_failure = problem;
                 break;
             }
         }
-        if !identity_ok {
-            break;
-        }
     }
-    if identity_ok {
-        let count = |kind: StreamKind| before.streams.iter().filter(|s| s.kind == kind).count();
+    let identity_ok = stream_failure.is_none();
+    let identity_detail = stream_failure.unwrap_or_else(|| {
         let (video, audio, subtitle) = (
-            count(StreamKind::Video),
-            count(StreamKind::Audio),
-            count(StreamKind::Subtitle),
+            count_of(StreamKind::Video),
+            count_of(StreamKind::Audio),
+            count_of(StreamKind::Subtitle),
         );
-        identity_detail = if subtitle > 0 {
+        if subtitle > 0 {
             format!(
-                "{video} video, {audio} audio and {subtitle} subtitle stream(s) with codec parameters preserved"
+                "{video} video, {audio} audio and {subtitle} subtitle stream(s) kept with codec parameters preserved"
             )
         } else {
-            format!("{video} video and {audio} audio stream(s) with codec parameters preserved")
-        };
-    }
+            format!(
+                "{video} video and {audio} audio stream(s) kept with codec parameters preserved"
+            )
+        }
+    });
     checks.push(check(STREAM_PARAMETERS_CHECK, identity_ok, identity_detail));
 
-    // 8. The original is exactly as it was.
+    // 10. The original is exactly as it was.
     let original_ok = match original {
         Some(fingerprint) => fingerprint.still_matches(input),
         None => false,
@@ -419,7 +519,7 @@ pub fn verify(
         },
     ));
 
-    // 9. The extension is preserved, case included.
+    // 11. The extension is preserved, case included.
     let same_extension =
         input.extension().and_then(|e| e.to_str()) == output.extension().and_then(|e| e.to_str());
     checks.push(check(
@@ -431,7 +531,7 @@ pub fn verify(
         },
     ));
 
-    // 10. No half-written artefact left in the output folder.
+    // 12. No half-written artefact left in the output folder.
     let leftovers = std::fs::read_dir(output_dir)
         .map(|entries| {
             entries
@@ -473,6 +573,8 @@ pub fn verify(
         technical_fields_removed,
         chapters_removed,
         data_streams_removed: data_removed,
+        cover_art_streams_removed: covers_removed,
+        subtitle_streams_removed: subtitles_removed,
         residual: survivors,
         before_after: before_after_rows,
     }

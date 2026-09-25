@@ -4,7 +4,6 @@ import {
   completionTitle,
   detailFacts,
   STREAM_COPY_NOTE,
-  VERIFIED_CLEANING_DETAIL,
   findingsLabel,
   formatDuration,
   groupFindings,
@@ -17,6 +16,7 @@ import {
   type ScanView,
   type Severity,
 } from "./privacy";
+import { verifiedCleaningDetail } from "./cleaning";
 
 function finding(
   categoryLabel: string,
@@ -62,10 +62,11 @@ function scan(overrides: Partial<ScanView> = {}): ScanView {
     durationSeconds: 12,
     videoStreams: 1,
     audioStreams: 1,
+    subtitleStreams: 0,
+    coverImages: 0,
     otherStreams: 0,
     chapterCount: 0,
     fieldCount: findings.length,
-    plan: null,
     ...overrides,
   };
 }
@@ -335,7 +336,11 @@ describe("stream claims", () => {
   const overclaims = [/bit[- ]for[- ]bit/i, /identical/i, /unchanged/i, /lossless/i, /proven/i];
 
   it("does not overclaim what runtime verification checks", () => {
-    for (const text of [STREAM_COPY_NOTE, VERIFIED_CLEANING_DETAIL]) {
+    const verified = [
+      verifiedCleaningDetail({ removeSubtitles: false }),
+      verifiedCleaningDetail({ removeSubtitles: true }),
+    ];
+    for (const text of [STREAM_COPY_NOTE, ...verified]) {
       for (const pattern of overclaims) {
         expect(text).not.toMatch(pattern);
       }
@@ -344,7 +349,9 @@ describe("stream claims", () => {
 
   it("states what is actually true", () => {
     expect(STREAM_COPY_NOTE).toMatch(/stream copy/);
-    expect(VERIFIED_CLEANING_DETAIL).toMatch(/media stream parameters match/);
+    expect(verifiedCleaningDetail({ removeSubtitles: false })).toMatch(
+      /stream copy with matching codec parameters/,
+    );
   });
 });
 
@@ -360,6 +367,12 @@ describe("detailFacts", () => {
 
     expect(facts).toEqual(["41 s", "1 video · 1 audio"]);
     expect(facts.join(" · ")).not.toMatch(/metadata|field/i);
+  });
+
+  it("lists subtitles and detected cover art apart from footage", () => {
+    expect(
+      detailFacts(scan({ durationSeconds: null, subtitleStreams: 2, coverImages: 1 })),
+    ).toEqual(["1 video · 1 audio · 2 subtitle", "1 detected cover art"]);
   });
 
   it("still lists data tracks and chapters when present", () => {

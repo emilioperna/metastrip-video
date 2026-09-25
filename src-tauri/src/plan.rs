@@ -1,124 +1,149 @@
-//! What the cleaner is about to do, stated before it does it.
+//! What a cleaned file must look like, stated before it is cleaned.
 //!
-//! In v0.5 the plan is derived, never chosen: it is a description of the fixed
-//! pipeline applied to one particular file, not a set of options. Two of its
-//! fields carry weight today -- `remove_chapters` and `remove_data_streams`
-//! gate verifier checks 5 and 6 -- and the rest describe the run. Nothing in
-//! the UI reads the plan yet, so no wording here reaches a user.
+//! Two things live here and they are kept apart on purpose.
 //!
-//! The cleaner's behaviour is unchanged by this module. If a plan ever
-//! disagreed with `ffmpeg_args`, the plan would be the thing that is wrong.
+//! * [`CleaningOptions`] is what the user chose. It drives the FFmpeg argument
+//!   list directly (`ffmpeg_args`), so a file that cannot be inspected is still
+//!   cleaned exactly as asked, with no plan at all.
+//! * [`CleaningPlan`] is the verifier's contract for one inspected file: which
+//!   media streams must come out the other side, in which order and with which
+//!   parameters, and whether subtitle removal has to be proven. It is derived
+//!   from the fresh pre-clean report and the options for the run, and nothing
+//!   reads it but `verify`.
+//!
+//! The privacy floor -- metadata, chapters, non-media tracks and detected cover
+//! art -- is not an option and has no field here. The verifier checks it on
+//! every file, whatever the plan says.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::inspect::MetadataReport;
-use crate::privacy::PrivacyFinding;
-use crate::{ContainerProfile, FormatProfile};
+use crate::inspect::{MetadataReport, StreamIdentity, StreamKind};
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// The one cleaning choice the user can make. Everything else is the floor.
+///
+/// `default` at the struct level so a stored value written by a later version
+/// with more fields still yields this one rather than failing as a whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CleaningOptions {
+    /// Also drop every subtitle stream. Off by default: subtitles are media the
+    /// user usually wants, and removing them is destructive.
+    pub remove_subtitles: bool,
+}
+
+/// One media stream the clean promises to keep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedStream {
+    /// Position in the input, for messages. Output indices shift whenever
+    /// something before a stream is removed, so this is never matched against
+    /// an output index.
+    pub input_index: usize,
+    pub kind: StreamKind,
+    pub identity: StreamIdentity,
+    /// Always `false` in practice, since detected cover art is removed, but
+    /// compared anyway: a kept stream must not come out claiming to be one.
+    pub attached_pic: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct CleaningPlan {
-    /// Always true: `-map_metadata -1` drops container-level tags.
-    pub remove_format_metadata: bool,
-    /// Always true: `-map_metadata:s -1` drops per-stream tags.
-    pub remove_stream_metadata: bool,
-    /// `-map_chapters -1`. Reported as false when the input has no chapters, so
-    /// the verifier does not claim to have removed something that never existed.
-    pub remove_chapters: bool,
-    /// `-dn` for data streams, `-map -0:t?` for attachments. Same reasoning as
-    /// chapters: false when the input had no non-media track, so the verifier
-    /// does not claim to have removed something that never existed.
-    pub remove_data_streams: bool,
-    /// Human-readable description of the muxing route for this container.
-    pub container_strategy: &'static str,
-    /// Stream indices that must survive, with their kind. Descriptive: the
-    /// verifier works from the inspected reports rather than from this list,
-    /// comparing every kind `is_media` keeps.
-    pub preserved_streams: Vec<PreservedStream>,
-    pub expected_removed_fields: usize,
-    /// Findings that are not container bookkeeping: what the user is promised.
-    pub sensitive_findings: usize,
-    pub expected_removed_chapters: usize,
-    pub expected_removed_data_streams: usize,
-    /// What the product promises about this run. Every entry has a
-    /// corresponding check in `verify`, though the verifier does not read this
-    /// list: nothing is listed here that the run does not actually confirm.
-    pub guarantees: Vec<&'static str>,
+    /// Whether the output must carry no subtitle stream at all.
+    pub remove_subtitles: bool,
+    /// Every media stream that must survive, in input order: the input's media
+    /// minus detected cover art, minus subtitles when they are being removed.
+    pub expected_media: Vec<ExpectedStream>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreservedStream {
-    pub index: usize,
-    pub kind: &'static str,
-    pub codec_name: Option<String>,
-}
-
-fn container_strategy(profile: FormatProfile) -> &'static str {
-    match profile.container {
-        ContainerProfile::IsoBmff => {
-            "ISO-BMFF remux, faststart first with one plain retry, streams copied"
-        }
-        ContainerProfile::Matroska => "Matroska remux, streams copied",
-        ContainerProfile::WebM => "WebM remux, streams copied",
-        ContainerProfile::Avi => "AVI remux with unknown streams skipped, streams copied",
-    }
-}
-
-/// Build the plan for one inspected file.
-pub fn plan_for(
-    report: &MetadataReport,
-    findings: &[PrivacyFinding],
-    profile: FormatProfile,
-) -> CleaningPlan {
-    let data_streams = report.non_media_streams().count();
-    let chapters = report.chapters.len();
-
-    // `-map_metadata -1`, `-map_metadata:s -1` and `-map_chapters -1` between them
-    // drop every field the inspector found, so the expected count is simply all of
-    // them. The muxer then writes its own structural tags back (`major_brand`,
-    // `handler_name`, `language`); the verifier measures what actually went and
-    // reports that number rather than this estimate.
-    let expected_removed_fields = report.fields.len();
-
-    // What the user is actually being promised: the disclosures that are not just
-    // container bookkeeping.
-    let sensitive_findings = findings
-        .iter()
-        .filter(|f| !f.category.is_structural())
-        .count();
-
-    let mut guarantees = vec![
-        "Video streams use stream copy; no transcoding path is configured",
-        "Audio streams use stream copy; no transcoding path is configured",
-        "The original file is left untouched",
-        "The output keeps the original file extension",
-    ];
-    if data_streams > 0 {
-        guarantees.push("Data tracks are removed with their payload");
-    }
-    if chapters > 0 {
-        guarantees.push("Chapter markers are removed");
-    }
+/// The verifier contract for one inspected file and one set of options.
+pub fn plan_for(report: &MetadataReport, options: CleaningOptions) -> CleaningPlan {
+    let expected_media = report
+        .media_streams()
+        .filter(|stream| !stream.attached_pic)
+        .filter(|stream| !(options.remove_subtitles && stream.kind == StreamKind::Subtitle))
+        .map(|stream| ExpectedStream {
+            input_index: stream.index,
+            kind: stream.kind,
+            identity: stream.identity.clone(),
+            attached_pic: stream.attached_pic,
+        })
+        .collect();
 
     CleaningPlan {
-        remove_format_metadata: true,
-        remove_stream_metadata: true,
-        remove_chapters: chapters > 0,
-        remove_data_streams: data_streams > 0,
-        container_strategy: container_strategy(profile),
-        preserved_streams: report
-            .media_streams()
-            .map(|s| PreservedStream {
-                index: s.index,
-                kind: s.kind.label(),
-                codec_name: s.identity.codec_name.clone(),
-            })
-            .collect(),
-        expected_removed_fields,
-        sensitive_findings,
-        expected_removed_chapters: chapters,
-        expected_removed_data_streams: data_streams,
-        guarantees,
+        remove_subtitles: options.remove_subtitles,
+        expected_media,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inspect::parse_ffprobe_json;
+
+    /// Video, a cover, audio, two subtitles and a data track, in an order that
+    /// puts the cover between real streams.
+    const MIXED: &str = r#"{"streams":[
+        {"index":0,"codec_type":"video","codec_name":"h264","width":1920,"disposition":{"attached_pic":0}},
+        {"index":1,"codec_type":"video","codec_name":"mjpeg","width":300,"disposition":{"attached_pic":1}},
+        {"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000"},
+        {"index":3,"codec_type":"subtitle","codec_name":"mov_text"},
+        {"index":4,"codec_type":"subtitle","codec_name":"mov_text"},
+        {"index":5,"codec_type":"data","codec_name":"bin_data"}
+    ]}"#;
+
+    fn indices(plan: &CleaningPlan) -> Vec<usize> {
+        plan.expected_media.iter().map(|s| s.input_index).collect()
+    }
+
+    #[test]
+    fn the_default_keeps_every_media_stream_but_detected_cover_art() {
+        let report = parse_ffprobe_json("x.mp4", MIXED).unwrap();
+        let plan = plan_for(&report, CleaningOptions::default());
+
+        assert!(!plan.remove_subtitles);
+        // Cover (1) and data (5) are not expected; order is the input's.
+        assert_eq!(indices(&plan), [0, 2, 3, 4]);
+        assert!(plan.expected_media.iter().all(|s| !s.attached_pic));
+        assert_eq!(
+            plan.expected_media[0].identity.codec_name.as_deref(),
+            Some("h264")
+        );
+    }
+
+    #[test]
+    fn removing_subtitles_takes_them_out_of_the_expected_media() {
+        let report = parse_ffprobe_json("x.mp4", MIXED).unwrap();
+        let plan = plan_for(
+            &report,
+            CleaningOptions {
+                remove_subtitles: true,
+            },
+        );
+
+        assert!(plan.remove_subtitles);
+        assert_eq!(indices(&plan), [0, 2]);
+    }
+
+    #[test]
+    fn a_second_real_video_stream_is_expected_to_survive() {
+        let two_angles = r#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264"},
+            {"index":1,"codec_type":"video","codec_name":"h264"},
+            {"index":2,"codec_type":"audio","codec_name":"aac"}
+        ]}"#;
+        let report = parse_ffprobe_json("x.mov", two_angles).unwrap();
+        let plan = plan_for(&report, CleaningOptions::default());
+        assert_eq!(indices(&plan), [0, 1, 2]);
+    }
+
+    #[test]
+    fn options_serialise_in_camel_case_and_default_to_keeping_subtitles() {
+        assert!(!CleaningOptions::default().remove_subtitles);
+        let json = serde_json::to_string(&CleaningOptions {
+            remove_subtitles: true,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"removeSubtitles":true}"#);
+        let parsed: CleaningOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, CleaningOptions::default());
     }
 }

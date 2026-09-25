@@ -5,17 +5,24 @@
 //! forces one check to fail and asserts that `verified` goes false.
 
 use super::*;
+use crate::plan::{plan_for, CleaningOptions};
 use crate::testkit::{
     assert_ffmpeg_can_read, expected_categories, sample_for_format, scratch, stream_payload_hash,
     ATTACHMENT_CANARY_ALPHA, ATTACHMENT_CANARY_BETA, DATA_CANARY,
 };
-use crate::{clean_and_verify, validate_input, IdRegistry, TEMP_PREFIX};
+use crate::{clean_and_verify, IdRegistry, TEMP_PREFIX};
 
 fn clean(dir: &std::path::Path, input: &std::path::Path) -> (String, VerificationReport) {
     let out = dir.join("out");
     std::fs::create_dir_all(&out).unwrap();
     let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-    let (outcome, report) = clean_and_verify(input, &out, "CLIP", &mut registry);
+    let (outcome, report) = clean_and_verify(
+        input,
+        &out,
+        "CLIP",
+        CleaningOptions::default(),
+        &mut registry,
+    );
     (outcome.unwrap(), report.expect("no verification report"))
 }
 
@@ -273,7 +280,7 @@ fn a_missing_output_fails_verification_instead_of_passing_vacuously() {
 
     let before = inspect(&input).unwrap();
     let findings = classify(&before);
-    let plan = crate::plan::plan_for(&before, &findings, validate_input(&input).unwrap());
+    let plan = plan_for(&before, CleaningOptions::default());
 
     let report = verify(
         &input,
@@ -309,7 +316,7 @@ fn an_unreadable_output_fails_verification() {
 
     let before = inspect(&input).unwrap();
     let findings = classify(&before);
-    let plan = crate::plan::plan_for(&before, &findings, validate_input(&input).unwrap());
+    let plan = plan_for(&before, CleaningOptions::default());
 
     let report = verify(
         &input,
@@ -336,12 +343,19 @@ fn a_changed_original_fails_verification() {
 
     let before = inspect(&input).unwrap();
     let findings = classify(&before);
-    let plan = crate::plan::plan_for(&before, &findings, validate_input(&input).unwrap());
+    let plan = plan_for(&before, CleaningOptions::default());
     let fingerprint = OriginalFingerprint::capture(&input);
 
     // Clean normally, then tamper with the source behind the verifier's back.
     let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-    let name = crate::clean_one(&input, &out, "CLIP", &mut registry).unwrap();
+    let name = crate::clean_one(
+        &input,
+        &out,
+        "CLIP",
+        CleaningOptions::default(),
+        &mut registry,
+    )
+    .unwrap();
     std::fs::write(&input, b"the original was replaced").unwrap();
 
     let report = verify(
@@ -372,11 +386,18 @@ fn a_leftover_temp_file_fails_verification() {
 
     let before = inspect(&input).unwrap();
     let findings = classify(&before);
-    let plan = crate::plan::plan_for(&before, &findings, validate_input(&input).unwrap());
+    let plan = plan_for(&before, CleaningOptions::default());
     let fingerprint = OriginalFingerprint::capture(&input);
 
     let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-    let name = crate::clean_one(&input, &out, "CLIP", &mut registry).unwrap();
+    let name = crate::clean_one(
+        &input,
+        &out,
+        "CLIP",
+        CleaningOptions::default(),
+        &mut registry,
+    )
+    .unwrap();
     std::fs::write(out.join(format!("{TEMP_PREFIX}0000000001.mp4")), b"partial").unwrap();
 
     let report = verify(
@@ -412,7 +433,7 @@ fn a_transcoded_output_fails_the_stream_parameters_check() {
         .args(["-y", "-i"])
         .arg(&input)
         // The subtitle is carried through so the video codec is the ONLY
-        // difference from the input. Dropping it here would make check 7 fail
+        // difference from the input. Dropping it here would make check 9 fail
         // on a stream count as well, and the codec comparison this test exists
         // to pin would no longer be the reason it fires.
         .args([
@@ -430,7 +451,7 @@ fn a_transcoded_output_fails_the_stream_parameters_check() {
 
     let before = inspect(&input).unwrap();
     let findings = classify(&before);
-    let plan = crate::plan::plan_for(&before, &findings, validate_input(&input).unwrap());
+    let plan = plan_for(&before, CleaningOptions::default());
 
     let report = verify(
         &input,
@@ -577,7 +598,7 @@ fn a_verified_file_shows_no_privacy_category_as_still_present() {
 
 #[test]
 fn a_dropped_subtitle_fails_the_stream_parameters_check() {
-    // Subtitles are media: the cleaner keeps them, and nothing else in the
+    // Subtitles are media: the default keeps them, and nothing else in the
     // report would notice one going missing. `non_media_streams` excludes them,
     // so check 6 never counts them either.
     let dir = scratch("verify-subtitle-lost");
@@ -620,8 +641,7 @@ fn a_dropped_subtitle_fails_the_stream_parameters_check() {
 
     let before = crate::inspect::inspect(&input).unwrap();
     let before_findings = crate::privacy::classify(&before);
-    let format = validate_input(&input).unwrap();
-    let plan = crate::plan::plan_for(&before, &before_findings, format);
+    let plan = plan_for(&before, CleaningOptions::default());
     let report = verify(
         &input,
         &stripped,
@@ -675,4 +695,719 @@ fn only_this_apps_own_bitexact_stamp_is_exempt_from_the_survivor_check() {
             "{key}={value} must still be checked as a survivor"
         );
     }
+}
+
+// ------------------------------------------------ v0.5.1: cleaning options ---
+
+const REMOVE_SUBTITLES: CleaningOptions = CleaningOptions {
+    remove_subtitles: true,
+};
+
+fn clean_with_options(
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    options: CleaningOptions,
+) -> (String, VerificationReport) {
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
+    let (outcome, report) = clean_and_verify(input, &out, "CLIP", options, &mut registry);
+    (outcome.unwrap(), report.expect("no verification report"))
+}
+
+fn check_named<'a>(report: &'a VerificationReport, name: &str) -> &'a VerificationCheck {
+    report
+        .checks
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("no {name} check in {:?}", failed_names(report)))
+}
+
+/// Builds an output the real cleaner would never write, from `args` placed
+/// between the input and the output path. For the negative tests: each one
+/// hands the verifier exactly one broken promise.
+fn forge_output(input: &std::path::Path, output: &std::path::Path, args: &[&str]) {
+    let built = crate::sidecar::ffmpeg()
+        .args(["-y", "-i"])
+        .arg(input)
+        .args(args)
+        .arg(output)
+        .output()
+        .expect("ffmpeg must be available for these tests");
+    assert!(
+        built.status.success(),
+        "could not forge {output:?}: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+}
+
+fn verify_against(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    options: CleaningOptions,
+) -> VerificationReport {
+    let before = inspect(input).unwrap();
+    let findings = classify(&before);
+    let plan = plan_for(&before, options);
+    let out = output.parent().unwrap();
+    verify(
+        input,
+        output,
+        &before,
+        &findings,
+        &plan,
+        OriginalFingerprint::capture(input),
+        out,
+        TEMP_PREFIX,
+    )
+}
+
+/// Detected cover art goes, and nothing else the file carries moves: the
+/// footage, sound and subtitles come out packet-identical and the file
+/// verifies. Includes the ISO-BMFF `.mov` that v0.5.0 reported as a failure
+/// because the mov muxer drops the cover and the video count changed.
+fn assert_cover_art_removed(extension: &str) {
+    let dir = scratch(&format!("cover-{extension}"));
+    let cover = crate::testkit::cover_jpeg(&dir, false);
+    let input = crate::testkit::sample_with_cover(&dir, extension, &cover);
+    let cover_bytes = std::fs::read(&cover).unwrap();
+
+    // The fixture really carries the cover, as FFmpeg reports it, and the
+    // first video stream is the footage rather than the picture.
+    let before = inspect(&input).unwrap();
+    let covers: Vec<_> = before.attached_pictures().collect();
+    assert_eq!(covers.len(), 1, "{extension} fixture has no detected cover");
+    assert_eq!(covers[0].kind, StreamKind::Video);
+    let first_video = before
+        .streams
+        .iter()
+        .find(|s| s.kind == StreamKind::Video)
+        .unwrap();
+    assert!(!first_video.attached_pic, "{extension}: v:0 is the cover");
+    assert!(
+        crate::testkit::contains(&std::fs::read(&input).unwrap(), &cover_bytes),
+        "{extension} fixture does not carry the cover image"
+    );
+    let kept = [
+        ("0:v:0", "video"),
+        ("0:a:0", "audio"),
+        ("0:s:0", "subtitle"),
+    ];
+    let hashes: Vec<String> = kept
+        .iter()
+        .map(|(stream, _)| stream_payload_hash(&input, stream))
+        .collect();
+
+    let (name, report) = clean(&dir, &input);
+    let output = dir.join("out").join(&name);
+
+    assert!(
+        report.verified,
+        "{extension}: {:?}",
+        report
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| (c.name, &c.detail))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.cover_art_streams_removed, 1);
+    assert_eq!(
+        check_named(&report, COVER_ART_CHECK).detail,
+        "1 detected cover art stream(s) removed"
+    );
+
+    let after = inspect(&output).unwrap();
+    assert_eq!(
+        after.attached_pictures().count(),
+        0,
+        "{extension} kept the cover"
+    );
+    assert!(
+        !crate::testkit::contains(&std::fs::read(&output).unwrap(), &cover_bytes),
+        "{extension}: the cover image bytes are still in the output"
+    );
+    let footage = |report: &crate::inspect::MetadataReport| {
+        report
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Video && !s.attached_pic)
+            .map(|s| s.identity.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        footage(&before),
+        footage(&after),
+        "{extension} footage changed"
+    );
+    for ((stream, what), hash) in kept.iter().zip(&hashes) {
+        assert_eq!(
+            hash,
+            &stream_payload_hash(&output, stream),
+            "{extension} {what} payload changed"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn mp4_detected_cover_art_is_removed() {
+    assert_cover_art_removed("mp4");
+}
+#[test]
+fn m4v_detected_cover_art_is_removed() {
+    assert_cover_art_removed("m4v");
+}
+#[test]
+fn mkv_detected_cover_art_is_removed() {
+    assert_cover_art_removed("mkv");
+}
+#[test]
+fn iso_bmff_mov_detected_cover_art_is_removed_and_verifies() {
+    assert_cover_art_removed("mov");
+}
+
+/// The disclosure the design spike found in v0.5.0: a cover photo carries its
+/// own EXIF -- camera make, a description, a GPS latitude -- and stream copy
+/// carried it into a file marked Verified. The cover is a valid JPEG that
+/// FFmpeg decodes and whose EXIF FFmpeg reads back, so this is the real class
+/// of file, not a parser accepting junk.
+#[test]
+fn a_cover_photo_with_exif_location_does_not_reach_the_output() {
+    for extension in ["mp4", "mkv"] {
+        let dir = scratch(&format!("cover-exif-{extension}"));
+        let cover = crate::testkit::cover_jpeg(&dir, true);
+
+        let exif = crate::testkit::exif_seen_by_ffprobe(&cover);
+        for expected in [
+            crate::testkit::EXIF_DESCRIPTION_CANARY,
+            crate::testkit::EXIF_MAKE_CANARY,
+            "GPSLatitude",
+        ] {
+            assert!(
+                exif.contains(expected),
+                "FFmpeg does not read {expected}: {exif}"
+            );
+        }
+
+        let input = crate::testkit::sample_with_cover(&dir, extension, &cover);
+        let raw = std::fs::read(&input).unwrap();
+        for canary in [
+            crate::testkit::EXIF_DESCRIPTION_CANARY,
+            crate::testkit::EXIF_MAKE_CANARY,
+        ] {
+            assert!(
+                crate::testkit::contains(&raw, canary.as_bytes()),
+                "{extension} fixture lost the EXIF canary {canary}"
+            );
+        }
+
+        let (name, report) = clean(&dir, &input);
+        assert!(report.verified, "{extension}: {:?}", failed_names(&report));
+        let cleaned = std::fs::read(dir.join("out").join(&name)).unwrap();
+        for canary in [
+            crate::testkit::EXIF_DESCRIPTION_CANARY,
+            crate::testkit::EXIF_MAKE_CANARY,
+            "Exif\0\0",
+        ] {
+            assert!(
+                !crate::testkit::contains(&cleaned, canary.as_bytes()),
+                "{extension}: {canary:?} survived cleaning"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// With the option on, every container that can carry a subtitle loses it,
+/// its text goes with it, and video and audio come through packet-identical.
+/// AVI cannot carry one FFmpeg can write; the option must be harmless there.
+#[test]
+fn subtitle_tracks_are_removed_when_asked_and_nothing_else_moves() {
+    for extension in ["mp4", "mov", "m4v", "mkv", "webm", "avi"] {
+        let dir = scratch(&format!("subtitles-{extension}"));
+        let input = sample_for_format(&dir, extension);
+        let carries_subtitles = crate::testkit::fixture_capabilities(extension)
+            .subtitle_codec
+            .is_some();
+        let kinds = crate::testkit::stream_kinds(&input);
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "Subtitle").count(),
+            usize::from(carries_subtitles),
+            "{extension} fixture: {kinds:?}"
+        );
+        if carries_subtitles {
+            assert!(
+                crate::testkit::contains(
+                    &std::fs::read(&input).unwrap(),
+                    crate::testkit::SUBTITLE_BODY.as_bytes()
+                ),
+                "{extension} fixture lacks its subtitle text"
+            );
+        }
+        let video = stream_payload_hash(&input, "0:v:0");
+        let audio = stream_payload_hash(&input, "0:a:0");
+
+        let (name, report) = clean_with_options(&dir, &input, REMOVE_SUBTITLES);
+        let output = dir.join("out").join(&name);
+
+        assert!(report.verified, "{extension}: {:?}", failed_names(&report));
+        let subtitle_check = check_named(&report, SUBTITLE_REMOVAL_CHECK);
+        assert!(subtitle_check.passed);
+        if carries_subtitles {
+            assert_eq!(subtitle_check.detail, "1 subtitle track(s) removed");
+            assert_eq!(report.subtitle_streams_removed, 1);
+        } else {
+            assert_eq!(subtitle_check.detail, "The original had no subtitle tracks");
+            assert_eq!(report.subtitle_streams_removed, 0);
+        }
+        let kinds = crate::testkit::stream_kinds(&output);
+        assert!(
+            !kinds.iter().any(|k| k == "Subtitle"),
+            "{extension} kept a subtitle: {kinds:?}"
+        );
+        assert!(
+            !crate::testkit::contains(
+                &std::fs::read(&output).unwrap(),
+                crate::testkit::SUBTITLE_BODY.as_bytes()
+            ),
+            "{extension}: the subtitle text survived"
+        );
+        assert_eq!(
+            video,
+            stream_payload_hash(&output, "0:v:0"),
+            "{extension} video"
+        );
+        assert_eq!(
+            audio,
+            stream_payload_hash(&output, "0:a:0"),
+            "{extension} audio"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The default keeps subtitles, proves they are kept, and never runs the
+/// removal check at all.
+#[test]
+fn by_default_subtitles_are_kept_and_no_removal_is_claimed() {
+    let dir = scratch("subtitles-default");
+    let input = sample_for_format(&dir, "mkv");
+    let subtitle = stream_payload_hash(&input, "0:s:0");
+
+    let (name, report) = clean(&dir, &input);
+
+    assert!(report.verified, "{:?}", failed_names(&report));
+    assert!(report
+        .checks
+        .iter()
+        .all(|c| c.name != SUBTITLE_REMOVAL_CHECK));
+    assert_eq!(report.subtitle_streams_removed, 0);
+    assert!(check_named(&report, STREAM_PARAMETERS_CHECK)
+        .detail
+        .contains("1 subtitle stream(s) kept"));
+    assert_eq!(
+        subtitle,
+        stream_payload_hash(&dir.join("out").join(&name), "0:s:0")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A second camera angle is footage. It is kept, packet-identical, and the
+/// file verifies: nothing about removing cover art may touch it.
+#[test]
+fn a_genuine_second_video_stream_is_kept() {
+    let dir = scratch("two-angles");
+    let input = crate::testkit::sample_with_two_videos(&dir);
+    let before = inspect(&input).unwrap();
+    assert_eq!(
+        before
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Video && !s.attached_pic)
+            .count(),
+        2,
+        "the fixture does not carry two real video streams"
+    );
+    let angles = [
+        stream_payload_hash(&input, "0:v:0"),
+        stream_payload_hash(&input, "0:v:1"),
+    ];
+    assert_ne!(angles[0], angles[1], "the two angles are the same stream");
+
+    let (name, report) = clean(&dir, &input);
+    let output = dir.join("out").join(&name);
+
+    assert!(report.verified, "{:?}", failed_names(&report));
+    assert_eq!(report.cover_art_streams_removed, 0);
+    assert_eq!(angles[0], stream_payload_hash(&output, "0:v:0"));
+    assert_eq!(angles[1], stream_payload_hash(&output, "0:v:1"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------- negative verifier ---
+
+#[test]
+fn a_subtitle_left_behind_fails_when_removal_was_asked_for() {
+    let dir = scratch("negative-subtitle-kept");
+    let input = sample_for_format(&dir, "mkv");
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // The default clean keeps the subtitle; the plan says it must be gone.
+    let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
+    let name = crate::clean_one(
+        &input,
+        &out,
+        "CLIP",
+        CleaningOptions::default(),
+        &mut registry,
+    )
+    .unwrap();
+
+    let report = verify_against(&input, &out.join(&name), REMOVE_SUBTITLES);
+
+    assert!(!report.verified, "a kept subtitle passed a removal plan");
+    let subtitle_check = check_named(&report, SUBTITLE_REMOVAL_CHECK);
+    assert!(!subtitle_check.passed);
+    assert_eq!(subtitle_check.detail, "1 subtitle track(s) remain");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn detected_cover_art_left_behind_fails_verification() {
+    let dir = scratch("negative-cover-kept");
+    let cover = crate::testkit::cover_jpeg(&dir, false);
+    let input = crate::testkit::sample_with_cover(&dir, "mp4", &cover);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Exactly the v0.5.0 command: everything but the cover removal.
+    let output = out.join("kept-cover.mp4");
+    forge_output(
+        &input,
+        &output,
+        &[
+            "-map",
+            "0",
+            "-map",
+            "-0:t?",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-dn",
+            "-fflags",
+            "+bitexact",
+            "-f",
+            "mp4",
+        ],
+    );
+
+    let report = verify_against(&input, &output, CleaningOptions::default());
+
+    assert!(!report.verified, "an output with its cover passed");
+    let cover_check = check_named(&report, COVER_ART_CHECK);
+    assert!(!cover_check.passed);
+    assert_eq!(cover_check.detail, "1 detected cover art stream(s) remain");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_lost_second_video_stream_fails_verification() {
+    let dir = scratch("negative-angle-lost");
+    let input = crate::testkit::sample_with_two_videos(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Everything the cleaner does, and the second angle dropped as if it had
+    // been mistaken for a cover.
+    let output = out.join("one-angle.mp4");
+    forge_output(
+        &input,
+        &output,
+        &[
+            "-map",
+            "0",
+            "-map",
+            "-0:v:1",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-fflags",
+            "+bitexact",
+        ],
+    );
+
+    let report = verify_against(&input, &output, CleaningOptions::default());
+
+    assert!(!report.verified, "a lost camera angle passed");
+    assert_eq!(failed_names(&report), [STREAM_PARAMETERS_CHECK]);
+    assert_eq!(
+        check_named(&report, STREAM_PARAMETERS_CHECK).detail,
+        "Video stream count changed: 2 expected, 1 found"
+    );
+    // And it is not mistaken for cover art that went.
+    assert_eq!(report.cover_art_streams_removed, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The other direction: an output carrying a media stream the plan never
+/// promised is not the file that was asked for either. The expected streams
+/// all come first and match, so only an exact count comparison catches this --
+/// a check that looked for missing streams alone would pass it.
+#[test]
+fn an_extra_media_stream_fails_verification() {
+    let dir = scratch("negative-extra-stream");
+    let input = crate::testkit::sample_video(&dir, "one-audio.mp4");
+    let before = inspect(&input).unwrap();
+    assert_eq!(
+        before
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Audio)
+            .count(),
+        1,
+        "the fixture does not carry exactly one audio stream"
+    );
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Everything the cleaner does, plus the audio mapped a second time.
+    let output = out.join("extra-audio.mp4");
+    forge_output(
+        &input,
+        &output,
+        &[
+            "-map",
+            "0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-fflags",
+            "+bitexact",
+        ],
+    );
+    assert_eq!(
+        crate::testkit::stream_kinds(&output),
+        ["Video", "Audio", "Audio"],
+        "the forged output does not carry the extra stream"
+    );
+
+    let report = verify_against(&input, &output, CleaningOptions::default());
+
+    assert!(!report.verified, "an output with an extra stream passed");
+    assert_eq!(failed_names(&report), [STREAM_PARAMETERS_CHECK]);
+    assert_eq!(
+        check_named(&report, STREAM_PARAMETERS_CHECK).detail,
+        "Audio stream count changed: 1 expected, 2 found"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_output_that_gains_chapters_fails_even_when_the_original_had_none() {
+    let dir = scratch("negative-chapters-gained");
+    let input = crate::testkit::sample_video(&dir, "plain.mkv");
+    assert!(inspect(&input).unwrap().chapters.is_empty());
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let chapters = dir.join("untitled.ffmetadata");
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\n",
+    )
+    .unwrap();
+    let output = out.join("chaptered.mkv");
+    let built = crate::sidecar::ffmpeg()
+        .args(["-y", "-i"])
+        .arg(&input)
+        .arg("-i")
+        .arg(&chapters)
+        .args([
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-map_chapters",
+            "1",
+            "-fflags",
+            "+bitexact",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(!inspect(&output).unwrap().chapters.is_empty());
+
+    let report = verify_against(&input, &output, CleaningOptions::default());
+
+    assert!(!report.verified, "an output with chapters passed");
+    assert_eq!(failed_names(&report), ["Chapters removed"]);
+    assert_eq!(
+        check_named(&report, "Chapters removed").detail,
+        "1 chapter marker(s) remain"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_output_that_gains_a_non_media_track_fails_even_when_the_original_had_none() {
+    let dir = scratch("negative-track-gained");
+    let input = crate::testkit::sample_video(&dir, "plain.mkv");
+    assert_eq!(inspect(&input).unwrap().non_media_streams().count(), 0);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let font = dir.join("font.ttf");
+    std::fs::write(&font, ATTACHMENT_CANARY_ALPHA).unwrap();
+
+    let output = out.join("with-attachment.mkv");
+    let built = crate::sidecar::ffmpeg()
+        .args(["-y", "-i"])
+        .arg(&input)
+        .args([
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-fflags",
+            "+bitexact",
+            "-attach",
+        ])
+        .arg(&font)
+        .args(["-metadata:s:t:0", "mimetype=application/x-truetype-font"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let report = verify_against(&input, &output, CleaningOptions::default());
+
+    assert!(!report.verified, "an output with an attachment passed");
+    let track_check = check_named(&report, "Non-media tracks removed");
+    assert!(!track_check.passed);
+    assert_eq!(track_check.detail, "1 non-media track(s) remain");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Removing a stream renumbers every stream after it. A sensitive tag that
+/// survives on a stream whose index moved is still a survivor. Copyright is
+/// LOW, so check 4 cannot catch this: only check 3 stands behind it.
+#[test]
+fn a_surviving_stream_tag_is_caught_after_stream_indices_shift() {
+    let dir = scratch("negative-index-shift");
+    let subtitle = dir.join("shift.srt");
+    std::fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\nshift\n\n").unwrap();
+    let input = dir.join("shift.mkv");
+    let built = crate::sidecar::ffmpeg()
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=10:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-i",
+        ])
+        .arg(&subtitle)
+        // Video, then the subtitle, then audio: audio is input stream 2.
+        .args([
+            "-map",
+            "0:v",
+            "-map",
+            "2:s",
+            "-map",
+            "1:a",
+            "-c:v",
+            "mpeg4",
+            "-c:a",
+            "aac",
+            "-c:s",
+            "srt",
+            "-metadata:s:a:0",
+            "copyright=STREAM_COPYRIGHT_CANARY",
+        ])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let before = inspect(&input).unwrap();
+    let planted = before
+        .fields
+        .iter()
+        .find(|f| f.value == "STREAM_COPYRIGHT_CANARY")
+        .expect("the fixture lost its stream canary");
+    assert_eq!(planted.stream_index, Some(2));
+
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // Subtitles removed as asked, but tags copied through: the canary lands on
+    // audio, which is now stream 1. (`-map_metadata -1` would also stop the
+    // per-stream copy, so it is left out; the only global tag this fixture
+    // has is FFmpeg's versioned `encoder`, which `+bitexact` rewrites.)
+    let output = out.join("shifted.mkv");
+    forge_output(
+        &input,
+        &output,
+        &["-map", "0", "-sn", "-c", "copy", "-fflags", "+bitexact"],
+    );
+    let moved = inspect(&output)
+        .unwrap()
+        .fields
+        .into_iter()
+        .find(|f| f.value == "STREAM_COPYRIGHT_CANARY")
+        .expect("the forged output did not keep the canary");
+    assert_eq!(moved.stream_index, Some(1), "the index did not shift");
+
+    let report = verify_against(&input, &output, REMOVE_SUBTITLES);
+
+    assert!(!report.verified, "a shifted survivor passed");
+    assert!(failed_names(&report).contains(&"Sensitive metadata removed"));
+    assert!(
+        report
+            .residual
+            .iter()
+            .any(|f| f.source_key == "copyright" && f.stream_index == Some(2)),
+        "the shifted copyright was not reported: {:?}",
+        report.residual
+    );
+    // The subtitle really went, so the survivor is the reason, not a stray
+    // subtitle.
+    assert!(check_named(&report, SUBTITLE_REMOVAL_CHECK).passed);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

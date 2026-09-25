@@ -69,9 +69,10 @@ impl StreamKind {
         }
     }
 
-    /// Streams the cleaner keeps. Everything else is dropped payload and all,
-    /// which is why those tracks are a privacy concern and not a bookkeeping
-    /// detail. Two different arguments do the dropping and neither covers the
+    /// Media the user came for: kept by the cleaner, except detected cover art
+    /// (a video stream marked `attached_pic`) and, on request, subtitles.
+    /// Everything else is dropped payload and all, which is why those tracks
+    /// are a privacy concern and not a bookkeeping detail. Two different arguments do the dropping and neither covers the
     /// other: `-dn` removes data streams, `-map -0:t?` removes attachments.
     pub fn is_media(self) -> bool {
         matches!(
@@ -121,6 +122,14 @@ pub struct StreamSummary {
     /// telemetry tracks (`GoPro MET`) announce themselves.
     pub handler_name: Option<String>,
     pub tag_count: usize,
+    /// `disposition.attached_pic`: the container itself marks this stream as a
+    /// cover image. ffprobe reports such a picture as a video stream, so this
+    /// flag is the only thing telling it apart from footage.
+    ///
+    /// It is exactly that flag and nothing more. An image stored as an ordinary
+    /// video track -- a Matroska cover an earlier remux demoted, an AVI still --
+    /// carries no such mark and is `false` here, however short or still it is.
+    pub attached_pic: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -158,6 +167,18 @@ impl MetadataReport {
     pub fn media_streams(&self) -> impl Iterator<Item = &StreamSummary> {
         self.streams.iter().filter(|s| s.kind.is_media())
     }
+
+    /// Streams the container marks as attached cover art. The cleaner removes
+    /// these; nothing else is treated as cover art.
+    pub fn attached_pictures(&self) -> impl Iterator<Item = &StreamSummary> {
+        self.streams.iter().filter(|s| s.attached_pic)
+    }
+
+    pub fn subtitle_streams(&self) -> impl Iterator<Item = &StreamSummary> {
+        self.streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Subtitle)
+    }
 }
 
 // ------------------------------------------------------------ JSON helpers ---
@@ -180,6 +201,16 @@ fn as_f64(value: &Value, key: &str) -> Option<f64> {
     found
         .as_f64()
         .or_else(|| found.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// `disposition.attached_pic`. Anything other than a number that is not zero --
+/// no disposition, no such key, `0`, a value that is not numeric -- is `false`:
+/// a stream is only treated as cover art when ffprobe positively says so.
+fn attached_pic(stream: &Value) -> bool {
+    stream
+        .get("disposition")
+        .and_then(|disposition| as_u64(disposition, "attached_pic"))
+        .is_some_and(|flag| flag != 0)
 }
 
 /// A number that keeps its textual form, because the exact spelling is what gets
@@ -269,6 +300,7 @@ fn parse_report(file_name: String, root: &Value) -> MetadataReport {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 tag_count: fields.len() - before,
+                attached_pic: attached_pic(stream),
             });
         }
     }

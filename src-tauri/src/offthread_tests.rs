@@ -22,6 +22,7 @@ use serde_json::Value;
 use tauri::async_runtime::block_on;
 use tauri::AppHandle;
 
+use crate::plan::CleaningOptions;
 use crate::testkit::{sample_video, scratch};
 use crate::{
     clean_request, run_blocking, scan_request, write_settings, BatchGuard, BatchState, Settings,
@@ -33,6 +34,14 @@ use crate::{
 fn assert_async_command<F, Fut, T>(_: F)
 where
     F: FnOnce(AppHandle, Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+{
+}
+
+/// The same guarantee for Clean, which also carries the options for the batch.
+fn assert_async_clean<F, Fut, T>(_: F)
+where
+    F: FnOnce(AppHandle, Vec<String>, CleaningOptions) -> Fut,
     Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
 {
 }
@@ -49,7 +58,7 @@ where
 fn the_media_commands_are_async() {
     // Revert either one to a plain `fn` (the v0.4 freeze) and this stops building.
     assert_async_command(crate::scan_videos);
-    assert_async_command(crate::clean_videos);
+    assert_async_clean(crate::clean_videos);
     // Starts two processes while the window is first drawing, so it belongs on
     // the pool too. A plain `fn` here stops this building.
     assert_async_nullary(crate::check_ffmpeg);
@@ -197,6 +206,7 @@ fn batch_dirs(name: &str, prefix: &str) -> BatchDirs {
         &Settings {
             prefix: prefix.into(),
             output_directory: out.to_string_lossy().into_owned(),
+            ..Settings::default()
         },
     )
     .unwrap();
@@ -252,26 +262,39 @@ fn a_clean_on_the_worker_is_sequential_ordered_verified_and_unchanged() {
     // The same batch, once in the calling thread and once through the boundary.
     // A flag of its own: tests run in parallel and must not share the app's.
     static BUSY: BatchState = BatchState::new();
-    let direct = clean_request(&BUSY, &direct_dirs.app, &paths, |_| {}).unwrap();
+    let direct = clean_request(
+        &BUSY,
+        &direct_dirs.app,
+        &paths,
+        CleaningOptions::default(),
+        |_| {},
+    )
+    .unwrap();
 
     let caller = thread::current().id();
     let (tx, rx) = mpsc::channel();
     let (app, worker_paths) = (worker_dirs.app.clone(), paths.clone());
     let worker_out = worker_dirs.out.clone();
     let on_worker = block_on(run_blocking(CLEAN_INTERNAL_ERROR, move || {
-        clean_request(&BUSY, &app, &worker_paths, |progress| {
-            tx.send(Seen {
-                batch_id: progress.batch_id,
-                index: progress.index,
-                total: progress.total,
-                status: progress.status,
-                output_name: progress.output_name.clone(),
-                verified: progress.verification.as_ref().map(|v| v.verified),
-                thread: thread::current().id(),
-                on_disk: listing(&worker_out).into_iter().map(|(n, _)| n).collect(),
-            })
-            .unwrap();
-        })
+        clean_request(
+            &BUSY,
+            &app,
+            &worker_paths,
+            CleaningOptions::default(),
+            |progress| {
+                tx.send(Seen {
+                    batch_id: progress.batch_id,
+                    index: progress.index,
+                    total: progress.total,
+                    status: progress.status,
+                    output_name: progress.output_name.clone(),
+                    verified: progress.verification.as_ref().map(|v| v.verified),
+                    thread: thread::current().id(),
+                    on_disk: listing(&worker_out).into_iter().map(|(n, _)| n).collect(),
+                })
+                .unwrap();
+            },
+        )
     }))
     .unwrap();
     let seen: Vec<Seen> = rx.into_iter().collect();
@@ -359,9 +382,13 @@ fn clean_request_without_an_output_folder_touches_nothing() {
     static BUSY: BatchState = BatchState::new();
     let root = scratch("offthread-no-folder");
     let mut called = false;
-    let error = clean_request(&BUSY, &root, &["whatever.mp4".to_string()], |_| {
-        called = true
-    })
+    let error = clean_request(
+        &BUSY,
+        &root,
+        &["whatever.mp4".to_string()],
+        CleaningOptions::default(),
+        |_| called = true,
+    )
     .expect_err("a batch ran with no output folder");
     assert_eq!(error, "Choose an output folder first.");
     assert!(
@@ -414,7 +441,9 @@ fn a_panic_inside_a_clean_batch_still_frees_the_guard() {
     let app = dirs.app.clone();
 
     let result = block_on(run_blocking(CLEAN_INTERNAL_ERROR, move || {
-        clean_request(&BUSY, &app, &paths, |_| panic!("mid-batch"))
+        clean_request(&BUSY, &app, &paths, CleaningOptions::default(), |_| {
+            panic!("mid-batch")
+        })
     }));
 
     assert_eq!(result.unwrap_err(), CLEAN_INTERNAL_ERROR);
@@ -451,7 +480,7 @@ fn a_second_clean_while_one_runs_is_refused_and_touches_nothing() {
     let (app, paths) = (dirs.app.clone(), first_batch.clone());
     let first = tauri::async_runtime::spawn(run_blocking(CLEAN_INTERNAL_ERROR, move || {
         let mut paused = false;
-        clean_request(&BUSY, &app, &paths, |_| {
+        clean_request(&BUSY, &app, &paths, CleaningOptions::default(), |_| {
             if !paused {
                 paused = true;
                 started_tx.send(()).unwrap();
@@ -475,7 +504,13 @@ fn a_second_clean_while_one_runs_is_refused_and_touches_nothing() {
     let out_before = listing(&dirs.out);
 
     let mut second_reported = false;
-    let refused = clean_request(&BUSY, &dirs.app, &later_batch, |_| second_reported = true);
+    let refused = clean_request(
+        &BUSY,
+        &dirs.app,
+        &later_batch,
+        CleaningOptions::default(),
+        |_| second_reported = true,
+    );
     assert_eq!(refused.unwrap_err(), CLEAN_BUSY);
     assert!(!second_reported, "the refused batch reported progress");
     assert!(
@@ -497,7 +532,14 @@ fn a_second_clean_while_one_runs_is_refused_and_touches_nothing() {
     assert_eq!((first.completed, first.verified, first.errors), (2, 2, 0));
 
     // Released on success: the next batch runs, in the same folder and registry.
-    let later = clean_request(&BUSY, &dirs.app, &later_batch, |_| {}).unwrap();
+    let later = clean_request(
+        &BUSY,
+        &dirs.app,
+        &later_batch,
+        CleaningOptions::default(),
+        |_| {},
+    )
+    .unwrap();
     assert_eq!((later.completed, later.verified, later.errors), (2, 2, 0));
 
     let names: Vec<&String> = first
