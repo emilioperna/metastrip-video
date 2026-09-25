@@ -208,3 +208,47 @@ fn a_real_fixture_is_inspected_through_the_bundled_ffprobe() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `attached_pic` is read from ffprobe's `disposition` object and nowhere else,
+/// and only a positive number sets it. Everything the verifier and the cleaner
+/// call "detected cover art" rests on this one flag.
+#[test]
+fn attached_pic_is_read_from_the_disposition_and_defaults_to_false() {
+    let raw = r#"{"streams":[
+        {"index":0,"codec_type":"video","codec_name":"h264","disposition":{"default":1,"attached_pic":0}},
+        {"index":1,"codec_type":"video","codec_name":"mjpeg","disposition":{"default":0,"attached_pic":1}},
+        {"index":2,"codec_type":"video","codec_name":"png"},
+        {"index":3,"codec_type":"video","codec_name":"mjpeg","disposition":{}},
+        {"index":4,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":"yes"}},
+        {"index":5,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":null}},
+        {"index":6,"codec_type":"video","codec_name":"mjpeg","disposition":"attached_pic"},
+        {"index":7,"codec_type":"audio","codec_name":"aac","disposition":{"attached_pic":0}}
+    ]}"#;
+    let report = parse_ffprobe_json("x.mp4", raw).unwrap();
+    let flags: Vec<bool> = report.streams.iter().map(|s| s.attached_pic).collect();
+
+    // 0: normal video. 1: a cover. 2: no disposition. 3: no such key.
+    // 4-6: values that are not a number. 7: audio.
+    assert_eq!(
+        flags,
+        [false, true, false, false, false, false, false, false]
+    );
+    assert_eq!(report.attached_pictures().count(), 1);
+    assert_eq!(report.attached_pictures().next().unwrap().index, 1);
+    // A cover is still a video stream; the flag is what tells it apart.
+    assert_eq!(report.streams[1].kind, StreamKind::Video);
+}
+
+/// ffprobe emits a full `disposition` object for every stream, so a real file
+/// with no cover must read false throughout rather than failing to parse.
+#[test]
+fn a_real_file_without_cover_art_has_no_attached_picture() {
+    let dir = scratch("inspect-no-cover");
+    let input = sample_for_format(&dir, "mp4");
+
+    let report = inspect(&input).unwrap();
+    assert!(report.streams.iter().all(|s| !s.attached_pic));
+    assert_eq!(report.attached_pictures().count(), 0);
+    assert_eq!(report.subtitle_streams().count(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

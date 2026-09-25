@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -27,7 +28,7 @@ mod offthread_tests;
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
 
-use plan::CleaningPlan;
+use plan::CleaningOptions;
 use privacy::{PrivacyFinding, PrivacySummary};
 use sidecar::{ffmpeg, ffmpeg_available, FFMPEG_MISSING, FFPROBE_MISSING};
 use verify::{OriginalFingerprint, VerificationReport};
@@ -197,12 +198,31 @@ const MAX_BATCH: usize = 100;
 
 // -------------------------------------------------------------- Settings ---
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// What `settings.json` holds.
+///
+/// Every v0.5.0 install already has one of these on disk, written before
+/// `cleaning` existed, and an update must not cost anyone their prefix or
+/// output folder. Two things make sure of it:
+///
+/// * `default` on the struct: a key that is missing takes its default instead
+///   of failing the whole document.
+/// * `lenient` on `cleaning`: a value this version cannot read -- `null`, a
+///   string, a number, an object of the wrong shape, one written by some later
+///   version -- becomes the default options instead of failing the whole
+///   document, which would throw away the prefix and folder beside it.
+///
+/// Unknown keys are ignored, so a downgrade reads what it understands.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct Settings {
     prefix: String,
     /// Empty until the user picks one.
     output_directory: String,
+    /// The user's standing choice. A batch never reads it from here: the page
+    /// sends the options with the Clean request, so what runs is what the user
+    /// saw when they clicked, not whatever the file says by then.
+    #[serde(deserialize_with = "lenient")]
+    cleaning: CleaningOptions,
 }
 
 impl Default for Settings {
@@ -210,8 +230,19 @@ impl Default for Settings {
         Settings {
             prefix: DEFAULT_PREFIX.to_string(),
             output_directory: String::new(),
+            cleaning: CleaningOptions::default(),
         }
     }
+}
+
+/// Reads a value, or its default when the value is there but unusable.
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// What the UI needs: the stored values plus whether the folder is still usable.
@@ -221,6 +252,7 @@ struct SettingsView {
     prefix: String,
     output_directory: String,
     output_directory_valid: bool,
+    cleaning: CleaningOptions,
 }
 
 impl From<Settings> for SettingsView {
@@ -230,6 +262,7 @@ impl From<Settings> for SettingsView {
             prefix: s.prefix,
             output_directory: s.output_directory,
             output_directory_valid: valid,
+            cleaning: s.cleaning,
         }
     }
 }
@@ -251,12 +284,47 @@ fn load_settings(app_dir: &Path) -> Settings {
         .unwrap_or_default()
 }
 
+/// Written next to `settings.json` and renamed over it once complete.
+const SETTINGS_TEMP: &str = "settings.json.tmp";
+
+/// Writes the whole file to a temporary sibling, flushes it to disk, then
+/// renames it over the real one. A crash part-way leaves the previous
+/// `settings.json` intact rather than a truncated one, which `load_settings`
+/// would read as corrupt and replace with defaults. On Windows the rename
+/// replaces the existing file in one step.
 fn write_settings(app_dir: &Path, settings: &Settings) -> Result<(), String> {
     std::fs::create_dir_all(app_dir)
         .map_err(|e| format!("Could not create the settings folder: {e}"))?;
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(settings_path(app_dir), json)
-        .map_err(|e| format!("Could not save settings: {e}"))
+    let temp = app_dir.join(SETTINGS_TEMP);
+    let written = std::fs::File::create(&temp)
+        .and_then(|mut file| {
+            file.write_all(json.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, settings_path(app_dir)));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("Could not save settings: {e}")
+    })
+}
+
+/// Held for each read-modify-write of `settings.json`, so two saves in quick
+/// succession cannot each start from the same old file and lose the other's
+/// change.
+static SETTINGS_WRITE: Mutex<()> = Mutex::new(());
+
+/// Change the stored settings through `edit`, keeping everything it does not
+/// touch. Every save goes through here: rebuilding the file from only the
+/// fields one command knows about is how a new setting gets silently erased.
+fn update_settings(app_dir: &Path, edit: impl FnOnce(&mut Settings)) -> Result<Settings, String> {
+    let _guard = SETTINGS_WRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut settings = load_settings(app_dir);
+    edit(&mut settings);
+    write_settings(app_dir, &settings)?;
+    Ok(settings)
 }
 
 /// Keeps the prefix to something that can only ever be part of a file name:
@@ -400,6 +468,11 @@ struct CleanSummary {
     technical_fields_removed: usize,
     chapters_removed: usize,
     data_streams_removed: usize,
+    /// Streams the containers marked as attached cover art, removed.
+    cover_art_streams_removed: usize,
+    subtitle_streams_removed: usize,
+    /// The options this batch actually ran with, as received at the click.
+    options: CleaningOptions,
     results: Vec<FileResult>,
 }
 
@@ -408,6 +481,7 @@ fn ffmpeg_args(
     output: &Path,
     format: FormatProfile,
     attempt: MuxAttempt,
+    options: CleaningOptions,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         // -n, not -y: we already guarantee the target is free, so an existing file
@@ -435,16 +509,22 @@ fn ffmpeg_args(
         // the user happens. The `?` keeps the negative map inert on every
         // container that cannot carry one.
         //
-        // Cover art that FFmpeg reports as a video stream (`attached_pic`) is
-        // not an attachment, so this never selects it and the output is what
-        // it would be without it. What survives is the muxer's doing, not this
-        // map's: MP4 and M4V keep the image as cover art, Matroska writes it
-        // back as an ordinary one-frame video track, and MOV does not keep it.
         // A Matroska cover under a mimetype FFmpeg cannot map to an image codec
         // really is an attachment and goes with the rest, which is the right
         // outcome for an opaque embedded file.
         "-map".into(),
         "-0:t?".into(),
+        // Cover art FFmpeg reports as a video stream marked `attached_pic` is
+        // not an attachment, so the map above never selects it. It is an image
+        // copied byte for byte, EXIF and all -- a phone photo used as a cover
+        // carries its camera and location -- so it goes too. Selected by that
+        // mark and nothing else: never by index, which could name a real
+        // second camera angle, and never by codec or frame count, which cannot
+        // tell a still from footage. An image the container does not mark is
+        // kept as the video it claims to be. A negative map that matches
+        // nothing is inert, so no `?` is needed.
+        "-map".into(),
+        "-0:disp:attached_pic".into(),
         "-c".into(),
         "copy".into(),
         // Global metadata, per-stream metadata and chapters all dropped.
@@ -459,9 +539,12 @@ fn ffmpeg_args(
         // and all. Data streams only -- attachments are handled by the negative
         // map above.
         "-dn".into(),
-        "-fflags".into(),
-        "+bitexact".into(),
     ]);
+    if options.remove_subtitles {
+        // Only on request: subtitles are media, kept by default.
+        args.push("-sn".into());
+    }
+    args.extend(["-fflags".into(), "+bitexact".into()]);
     if attempt == MuxAttempt::FastStart {
         debug_assert_eq!(format.container, ContainerProfile::IsoBmff);
         args.push("-movflags".into());
@@ -604,6 +687,7 @@ fn clean_one(
     input: &Path,
     output_dir: &Path,
     prefix: &str,
+    options: CleaningOptions,
     registry: &mut IdRegistry,
 ) -> Result<String, String> {
     let format = validate_input(input)?;
@@ -622,7 +706,7 @@ fn clean_one(
 
     let run = |attempt: MuxAttempt| {
         ffmpeg()
-            .args(ffmpeg_args(input, &temp_path, format, attempt))
+            .args(ffmpeg_args(input, &temp_path, format, attempt, options))
             .output()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -682,12 +766,16 @@ struct ScanView {
     findings: Vec<PrivacyFinding>,
     container: Option<String>,
     duration_seconds: Option<f64>,
+    /// Video streams that are footage: detected cover art is counted apart.
     video_streams: usize,
     audio_streams: usize,
+    subtitle_streams: usize,
+    /// Streams the container marks as attached cover art, and only those. Not
+    /// a count of every picture the file might hold.
+    cover_images: usize,
     other_streams: usize,
     chapter_count: usize,
     field_count: usize,
-    plan: Option<CleaningPlan>,
 }
 
 fn failed_scan(path: &str, name: String, error: String) -> ScanView {
@@ -702,10 +790,11 @@ fn failed_scan(path: &str, name: String, error: String) -> ScanView {
         duration_seconds: None,
         video_streams: 0,
         audio_streams: 0,
+        subtitle_streams: 0,
+        cover_images: 0,
         other_streams: 0,
         chapter_count: 0,
         field_count: 0,
-        plan: None,
     }
 }
 
@@ -718,18 +807,16 @@ fn scan_one(raw: &str) -> ScanView {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| raw.to_string());
 
-    let format = match validate_input(&path) {
-        Ok(format) => format,
-        Err(error) => return failed_scan(raw, name, error),
-    };
+    if let Err(error) = validate_input(&path) {
+        return failed_scan(raw, name, error);
+    }
     let report = match inspect::inspect(&path) {
         Ok(report) => report,
         Err(error) => return failed_scan(raw, name, error),
     };
 
     let findings = privacy::classify(&report);
-    let (video, audio, other) = privacy::stream_kind_counts(&report);
-    let plan = plan::plan_for(&report, &findings, format);
+    let counts = privacy::stream_counts(&report);
 
     ScanView {
         path: raw.to_string(),
@@ -740,12 +827,13 @@ fn scan_one(raw: &str) -> ScanView {
         findings,
         container: report.container.clone(),
         duration_seconds: report.duration_seconds,
-        video_streams: video,
-        audio_streams: audio,
-        other_streams: other,
+        video_streams: counts.video,
+        audio_streams: counts.audio,
+        subtitle_streams: counts.subtitle,
+        cover_images: counts.cover_art,
+        other_streams: counts.other,
         chapter_count: report.chapters.len(),
         field_count: report.fields.len(),
-        plan: Some(plan),
     }
 }
 
@@ -777,13 +865,16 @@ fn clean_and_verify(
     input: &Path,
     output_dir: &Path,
     prefix: &str,
+    options: CleaningOptions,
     registry: &mut IdRegistry,
 ) -> (Result<String, String>, Option<VerificationReport>) {
     let fingerprint = OriginalFingerprint::capture(input);
     let before = inspect::inspect(input).ok();
     let before_findings = before.as_ref().map(privacy::classify);
 
-    let cleaned = clean_one(input, output_dir, prefix, registry);
+    // The options drive FFmpeg directly, so this runs whether or not the file
+    // could be inspected. The plan below exists only to check the result.
+    let cleaned = clean_one(input, output_dir, prefix, options, registry);
     let Ok(output_name) = &cleaned else {
         return (cleaned, None);
     };
@@ -793,11 +884,7 @@ fn clean_and_verify(
         // unverified rather than quietly treated as verified.
         return (cleaned, None);
     };
-    let Ok(format) = validate_input(input) else {
-        return (cleaned, None);
-    };
-
-    let plan = plan::plan_for(before, before_findings, format);
+    let plan = plan::plan_for(before, options);
     let report = verify::verify(
         input,
         &output_dir.join(output_name),
@@ -813,12 +900,14 @@ fn clean_and_verify(
 
 /// The whole batch, with progress pushed through a callback so this stays
 /// independent of Tauri and testable on its own.
+#[allow(clippy::too_many_arguments)]
 fn run_batch(
     paths: &[String],
     prefix: &str,
     output_dir: &Path,
     app_dir: &Path,
     batch_id: u64,
+    options: CleaningOptions,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<CleanSummary, String> {
     if paths.is_empty() {
@@ -847,6 +936,7 @@ fn run_batch(
     let (mut fields_removed, mut chapters_removed, mut data_streams_removed) =
         (0usize, 0usize, 0usize);
     let (mut privacy_fields_removed, mut technical_fields_removed) = (0usize, 0usize);
+    let (mut cover_art_streams_removed, mut subtitle_streams_removed) = (0usize, 0usize);
 
     for (index, raw) in paths.iter().enumerate() {
         let input = PathBuf::from(raw);
@@ -866,7 +956,8 @@ fn run_batch(
             verification: None,
         });
 
-        let (outcome, verification) = clean_and_verify(&input, output_dir, prefix, &mut registry);
+        let (outcome, verification) =
+            clean_and_verify(&input, output_dir, prefix, options, &mut registry);
 
         if let Some(report) = &verification {
             if report.verified {
@@ -879,6 +970,8 @@ fn run_batch(
             technical_fields_removed += report.technical_fields_removed;
             chapters_removed += report.chapters_removed;
             data_streams_removed += report.data_streams_removed;
+            cover_art_streams_removed += report.cover_art_streams_removed;
+            subtitle_streams_removed += report.subtitle_streams_removed;
         }
 
         let (status, output_name, message) = match outcome {
@@ -932,6 +1025,9 @@ fn run_batch(
         technical_fields_removed,
         chapters_removed,
         data_streams_removed,
+        cover_art_streams_removed,
+        subtitle_streams_removed,
+        options,
         results,
     })
 }
@@ -1055,8 +1151,24 @@ fn save_settings(
     prefix: String,
     output_directory: String,
 ) -> Result<SettingsView, String> {
-    let dir = app_dir(&app)?;
-    let prefix = sanitize_prefix(&prefix)?;
+    Ok(store_output_settings(&app_dir(&app)?, &prefix, &output_directory)?.into())
+}
+
+/// Store the user's standing cleaning choice, leaving prefix and folder alone.
+/// Separate from `save_settings` so neither control has to send the other's
+/// value to avoid wiping it.
+#[tauri::command]
+fn save_cleaning_options(app: AppHandle, options: CleaningOptions) -> Result<SettingsView, String> {
+    Ok(store_cleaning_options(&app_dir(&app)?, options)?.into())
+}
+
+/// Everything `save_settings` does, minus Tauri. Keeps the cleaning options.
+fn store_output_settings(
+    app_dir: &Path,
+    prefix: &str,
+    output_directory: &str,
+) -> Result<Settings, String> {
+    let prefix = sanitize_prefix(prefix)?;
 
     let output_directory = output_directory.trim().to_string();
     if !output_directory.is_empty() {
@@ -1070,12 +1182,17 @@ fn save_settings(
             .map_err(|e| format!("Could not use that output folder: {e}"))?;
     }
 
-    let settings = Settings {
-        prefix,
-        output_directory,
-    };
-    write_settings(&dir, &settings)?;
-    Ok(settings.into())
+    update_settings(app_dir, |settings| {
+        settings.prefix = prefix;
+        settings.output_directory = output_directory;
+    })
+}
+
+/// Everything `save_cleaning_options` does, minus Tauri. Keeps prefix and folder.
+fn store_cleaning_options(app_dir: &Path, options: CleaningOptions) -> Result<Settings, String> {
+    update_settings(app_dir, |settings| {
+        settings.cleaning = options;
+    })
 }
 
 // Shown instead of a panic message, which can carry file paths.
@@ -1344,20 +1461,26 @@ fn clean_request(
     state: &'static BatchState,
     app_dir: &Path,
     paths: &[String],
+    options: CleaningOptions,
     on_progress: impl FnMut(Progress),
 ) -> Result<CleanSummary, String> {
     let batch = BatchGuard::try_acquire(state).map_err(str::to_string)?;
-    clean_with(batch, app_dir, paths, on_progress)
+    clean_with(batch, app_dir, paths, options, on_progress)
 }
 
 /// Everything `clean_videos` does once it holds the app and knows the app data
 /// folder. The guard comes in by value and is held until the last file is
 /// verified, so nothing here can run while the app looks idle to the close
 /// button, the updater or another Clean.
+///
+/// `options` is the value the page sent with the click and is used for every
+/// file. The stored preference in `settings.json` is not consulted: it may
+/// have been changed, or be mid-save, by the time the batch runs.
 fn clean_with(
     batch: BatchGuard,
     app_dir: &Path,
     paths: &[String],
+    options: CleaningOptions,
     on_progress: impl FnMut(Progress),
 ) -> Result<CleanSummary, String> {
     let settings = load_settings(app_dir);
@@ -1372,6 +1495,7 @@ fn clean_with(
         &output_dir,
         app_dir,
         batch.id,
+        options,
         on_progress,
     )
 }
@@ -1385,11 +1509,15 @@ fn clean_with(
 /// read the app as idle and let the window go while the worker was starting
 /// FFmpeg. Only the claim is early: every heavy step still runs on the pool.
 #[tauri::command]
-async fn clean_videos(app: AppHandle, paths: Vec<String>) -> Result<CleanSummary, String> {
+async fn clean_videos(
+    app: AppHandle,
+    paths: Vec<String>,
+    options: CleaningOptions,
+) -> Result<CleanSummary, String> {
     let batch = BatchGuard::try_acquire(&CLEAN_STATE).map_err(str::to_string)?;
     run_blocking(CLEAN_INTERNAL_ERROR, move || {
         let dir = app_dir(&app)?;
-        clean_with(batch, &dir, &paths, |progress| {
+        clean_with(batch, &dir, &paths, options, |progress| {
             let _ = app.emit("clean-progress", progress);
         })
     })
@@ -1477,6 +1605,7 @@ pub fn run() {
             get_supported_formats,
             get_settings,
             save_settings,
+            save_cleaning_options,
             get_processing_state,
             reserve_update_install,
             release_update_install,
@@ -1668,7 +1797,14 @@ Conversion failed!\n";
         let source_video_hash = stream_payload_hash(&input, "0:v:0");
         let source_audio_hash = stream_payload_hash(&input, "0:a:0");
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-        let output_name = clean_one(&input, &out, "CLIP", &mut registry).unwrap();
+        let output_name = clean_one(
+            &input,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .unwrap();
         let cleaned = out.join(&output_name);
 
         // C/D/J: a finished, readable output exists with the same extension.
@@ -1803,13 +1939,52 @@ Conversion failed!\n";
 
     #[test]
     fn ffmpeg_options_are_container_specific_and_never_transcode() {
+        let every_option = [
+            CleaningOptions::default(),
+            CleaningOptions {
+                remove_subtitles: true,
+            },
+        ];
         for profile in FORMAT_PROFILES {
-            for attempt in profile.mux_attempts() {
+            for (attempt, options) in profile
+                .mux_attempts()
+                .iter()
+                .flat_map(|attempt| every_option.map(|options| (attempt, options)))
+            {
                 let args = ffmpeg_args(
                     Path::new("input.video"),
                     Path::new("output.video"),
                     profile,
                     *attempt,
+                    options,
+                );
+                // Detected cover art goes on every profile and with every
+                // option; subtitles only when asked. Neither is ever selected
+                // by index or by a broad video remap.
+                assert_eq!(
+                    args.windows(2)
+                        .filter(|pair| pair[0] == "-map" && pair[1] == "-0:disp:attached_pic")
+                        .count(),
+                    1,
+                    "{}: detected cover art is not excluded exactly once",
+                    profile.extension
+                );
+                assert_eq!(
+                    args.iter().any(|arg| arg == "-sn"),
+                    options.remove_subtitles,
+                    "{}: subtitle removal does not follow the option",
+                    profile.extension
+                );
+                let maps: Vec<&String> = args
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-map")
+                    .map(|pair| &pair[1])
+                    .collect();
+                assert_eq!(
+                    maps,
+                    ["0", "-0:t?", "-0:disp:attached_pic"],
+                    "{}: unexpected stream selection",
+                    profile.extension
                 );
                 let movflags = args.iter().position(|arg| arg == "-movflags");
                 assert_eq!(
@@ -1845,6 +2020,16 @@ Conversion failed!\n";
 
                 let codec = args.iter().position(|arg| arg == "-c").unwrap();
                 assert_eq!(args[codec + 1], "copy");
+                // `-c copy` is the only codec operation: no per-stream codec,
+                // no second `-c`, nothing an encoder could hide behind.
+                assert_eq!(
+                    args.iter()
+                        .filter(|arg| arg.starts_with("-c") || arg.ends_with("codec"))
+                        .count(),
+                    1,
+                    "{}: more than one codec argument",
+                    profile.extension
+                );
                 let muxer = args.iter().position(|arg| arg == "-f").unwrap();
                 assert_eq!(args[muxer + 1], profile.output_muxer);
                 assert!(!args.iter().any(|arg| {
@@ -1858,6 +2043,85 @@ Conversion failed!\n";
         assert_eq!(format_profile("m4v").unwrap().output_muxer, "mp4");
     }
 
+    /// The upgrade contract, literally: the default argument list is exactly
+    /// v0.5.0's plus the one pair that removes detected cover art, placed after
+    /// the attachment exclusion. Anything else changing here changes what every
+    /// existing user's files come out as.
+    #[test]
+    fn the_default_argv_is_v050_plus_detected_cover_art_removal() {
+        let v050 = |format: &str, avi: bool, faststart: bool| {
+            let mut args: Vec<&str> = vec!["-n"];
+            if avi {
+                args.push("-ignore_unknown");
+            }
+            args.extend([
+                "-i",
+                "input.video",
+                "-map",
+                "0",
+                "-map",
+                "-0:t?",
+                "-c",
+                "copy",
+                "-map_metadata",
+                "-1",
+                "-map_metadata:s",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-dn",
+                "-fflags",
+                "+bitexact",
+            ]);
+            if faststart {
+                args.extend(["-movflags", "+faststart"]);
+            }
+            args.extend(["-f", format, "output.video"]);
+            args.into_iter().map(str::to_string).collect::<Vec<_>>()
+        };
+        let with_cover_removal = |mut args: Vec<String>| {
+            let at = args.iter().position(|arg| arg == "-0:t?").unwrap() + 1;
+            args.insert(at, "-0:disp:attached_pic".into());
+            args.insert(at, "-map".into());
+            args
+        };
+
+        for profile in FORMAT_PROFILES {
+            for attempt in profile.mux_attempts() {
+                let expected = with_cover_removal(v050(
+                    profile.output_muxer,
+                    profile.container == ContainerProfile::Avi,
+                    *attempt == MuxAttempt::FastStart,
+                ));
+                let args = ffmpeg_args(
+                    Path::new("input.video"),
+                    Path::new("output.video"),
+                    profile,
+                    *attempt,
+                    CleaningOptions::default(),
+                );
+                assert_eq!(args, expected, "{} {attempt:?}", profile.extension);
+
+                // Subtitle removal adds `-sn` and nothing else.
+                let mut with_subtitles_removed = ffmpeg_args(
+                    Path::new("input.video"),
+                    Path::new("output.video"),
+                    profile,
+                    *attempt,
+                    CleaningOptions {
+                        remove_subtitles: true,
+                    },
+                );
+                let sn = with_subtitles_removed
+                    .iter()
+                    .position(|arg| arg == "-sn")
+                    .unwrap();
+                with_subtitles_removed.remove(sn);
+                assert_eq!(with_subtitles_removed, expected, "{}", profile.extension);
+            }
+        }
+    }
+
     #[test]
     fn unsupported_error_is_generated_from_the_real_matrix() {
         let dir = scratch("unsupported");
@@ -1867,7 +2131,14 @@ Conversion failed!\n";
         std::fs::write(&input, b"not inspected because the extension is rejected").unwrap();
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
 
-        let error = clean_one(&input, &out, "CLIP", &mut registry).unwrap_err();
+        let error = clean_one(
+            &input,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .unwrap_err();
 
         assert_eq!(
             error,
@@ -1894,7 +2165,14 @@ Conversion failed!\n";
         let before = std::fs::read(&input).unwrap();
 
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-        let error = clean_one(&input, &out, "CLIP", &mut registry).unwrap_err();
+        let error = clean_one(
+            &input,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .unwrap_err();
 
         assert!(
             error.contains("Stream copy failed for this WebM file"),
@@ -1942,7 +2220,14 @@ Conversion failed!\n";
         let before = std::fs::read(&input).unwrap();
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
 
-        let error = clean_one(&input, &out, "CLIP", &mut registry).unwrap_err();
+        let error = clean_one(
+            &input,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .unwrap_err();
 
         assert!(
             error.contains("Unsupported M4V variant"),
@@ -2068,11 +2353,29 @@ Conversion failed!\n";
     fn batch_size_is_enforced_by_the_backend() {
         let dir = scratch("limit");
         let over: Vec<String> = (0..MAX_BATCH + 1).map(|i| format!("v{i}.mp4")).collect();
-        let err = run_batch(&over, "CLIP", &dir, &dir, 1, |_| {}).unwrap_err();
+        let err = run_batch(
+            &over,
+            "CLIP",
+            &dir,
+            &dir,
+            1,
+            CleaningOptions::default(),
+            |_| {},
+        )
+        .unwrap_err();
         assert!(err.contains("101"), "unexpected message: {err}");
         assert!(err.contains(&MAX_BATCH.to_string()));
 
-        let err = run_batch(&[], "CLIP", &dir, &dir, 1, |_| {}).unwrap_err();
+        let err = run_batch(
+            &[],
+            "CLIP",
+            &dir,
+            &dir,
+            1,
+            CleaningOptions::default(),
+            |_| {},
+        )
+        .unwrap_err();
         assert_eq!(err, "No videos selected");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2086,12 +2389,26 @@ Conversion failed!\n";
         let before = std::fs::read(&input).unwrap();
 
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-        let name = clean_one(&input, &out, "CLIP", &mut registry).unwrap();
+        let name = clean_one(
+            &input,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .unwrap();
 
         assert!(name.starts_with("CLIP_") && name.ends_with(".mp4"));
 
         // The shipped default produces the documented shape too.
-        let defaulted = clean_one(&input, &out, DEFAULT_PREFIX, &mut registry).unwrap();
+        let defaulted = clean_one(
+            &input,
+            &out,
+            DEFAULT_PREFIX,
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .unwrap();
         assert!(defaulted.starts_with("VIDEO_") && defaulted.ends_with(".mp4"));
         assert_eq!(defaulted.len(), "VIDEO_".len() + 10 + ".mp4".len());
         assert!(out.join(&defaulted).is_file());
@@ -2138,7 +2455,14 @@ Conversion failed!\n";
         );
 
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-        let name = clean_one(&input, &out, "CLIP", &mut registry).unwrap();
+        let name = clean_one(
+            &input,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry,
+        )
+        .unwrap();
         let cleaned = out.join(&name);
 
         // The data track is gone; video and audio are not.
@@ -2213,7 +2537,14 @@ Conversion failed!\n";
         std::fs::write(&broken, b"this is not a video").unwrap();
 
         let mut registry = IdRegistry::open(&dir.join("used-ids.txt")).unwrap();
-        assert!(clean_one(&broken, &out, "CLIP", &mut registry).is_err());
+        assert!(clean_one(
+            &broken,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry
+        )
+        .is_err());
 
         assert_eq!(
             std::fs::read_dir(&out).unwrap().count(),
@@ -2273,11 +2604,19 @@ Conversion failed!\n";
             .collect();
 
         let mut seen_processing = 0;
-        let summary = run_batch(&paths, "CLIP", &out, &dir, 1, |p| {
-            if p.status == "processing" {
-                seen_processing += 1;
-            }
-        })
+        let summary = run_batch(
+            &paths,
+            "CLIP",
+            &out,
+            &dir,
+            1,
+            CleaningOptions::default(),
+            |p| {
+                if p.status == "processing" {
+                    seen_processing += 1;
+                }
+            },
+        )
         .unwrap();
 
         assert_eq!(summary.completed, 6, "{:?}", summary.results);
@@ -2386,6 +2725,7 @@ Conversion failed!\n";
         let stored = Settings {
             prefix: "REEL".into(),
             output_directory: root.to_string_lossy().into_owned(),
+            ..Settings::default()
         };
         write_settings(&legacy, &stored).unwrap();
         std::fs::write(
@@ -2419,6 +2759,7 @@ Conversion failed!\n";
         let newer = Settings {
             prefix: "CLIP".into(),
             output_directory: root.to_string_lossy().into_owned(),
+            ..Settings::default()
         };
         write_settings(&current, &newer).unwrap();
         std::fs::write(
@@ -2462,6 +2803,7 @@ Conversion failed!\n";
         let stored = Settings {
             prefix: "REELS".into(),
             output_directory: dir.to_string_lossy().into_owned(),
+            ..Settings::default()
         };
         write_settings(&dir, &stored).unwrap();
         let read_back = load_settings(&dir);
@@ -2473,6 +2815,7 @@ Conversion failed!\n";
         let gone = Settings {
             prefix: "REELS".into(),
             output_directory: dir.join("nope").to_string_lossy().into_owned(),
+            ..Settings::default()
         };
         write_settings(&dir, &gone).unwrap();
         assert!(!SettingsView::from(load_settings(&dir)).output_directory_valid);
@@ -2480,6 +2823,172 @@ Conversion failed!\n";
         // Corrupt file: defaults rather than a crash.
         std::fs::write(settings_path(&dir), "{ not json").unwrap();
         assert_eq!(load_settings(&dir).prefix, DEFAULT_PREFIX);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------------------ v0.5.1 settings ---
+
+    /// Exactly what a v0.5.0 install has on disk: `to_string_pretty` of the old
+    /// two-field struct.
+    const V050_SETTINGS: &str =
+        "{\n  \"prefix\": \"VIDEO\",\n  \"outputDirectory\": \"D:\\\\Clean videos\"\n}";
+
+    #[test]
+    fn a_literal_v050_settings_file_keeps_its_prefix_and_folder() {
+        let dir = scratch("settings-v050");
+        std::fs::write(settings_path(&dir), V050_SETTINGS).unwrap();
+
+        let loaded = load_settings(&dir);
+
+        assert_eq!(loaded.prefix, "VIDEO");
+        assert_eq!(loaded.output_directory, r"D:\Clean videos");
+        assert!(!loaded.cleaning.remove_subtitles);
+        assert_eq!(loaded.cleaning, CleaningOptions::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_bad_cleaning_value_never_costs_the_prefix_or_folder() {
+        let dir = scratch("settings-bad-cleaning");
+        for cleaning in [
+            "null",
+            "\"x\"",
+            "7",
+            "true",
+            "[]",
+            "{\"removeSubtitles\": \"yes\"}",
+            "{\"removeSubtitles\": 1}",
+            "{\"removeSubtitles\": null}",
+        ] {
+            std::fs::write(
+                settings_path(&dir),
+                format!(
+                    "{{\"prefix\": \"REELS\", \"outputDirectory\": \"D:\\\\Out\", \"cleaning\": {cleaning}}}"
+                ),
+            )
+            .unwrap();
+
+            let loaded = load_settings(&dir);
+
+            assert_eq!(loaded.prefix, "REELS", "cleaning = {cleaning}");
+            assert_eq!(loaded.output_directory, r"D:\Out", "cleaning = {cleaning}");
+            assert_eq!(
+                loaded.cleaning,
+                CleaningOptions::default(),
+                "cleaning = {cleaning}"
+            );
+        }
+
+        // A value from a later version: the part this one understands is
+        // kept, and so is the rest of the file, unknown keys included.
+        std::fs::write(
+            settings_path(&dir),
+            r#"{"prefix":"REELS","outputDirectory":"D:\\Out","cleaning":{"removeSubtitles":true,"futureChoice":3},"futureSetting":"x"}"#,
+        )
+        .unwrap();
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.prefix, "REELS");
+        assert!(loaded.cleaning.remove_subtitles);
+
+        // A document that is not JSON at all still falls back whole, as v0.5.0 did.
+        std::fs::write(settings_path(&dir), "{ not json").unwrap();
+        assert_eq!(load_settings(&dir).prefix, DEFAULT_PREFIX);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn each_save_keeps_what_it_does_not_change() {
+        let root = scratch("settings-preserve");
+        let app = root.join("app");
+        let folder = root.join("out");
+        let other_folder = root.join("elsewhere");
+        let remove_subtitles = CleaningOptions {
+            remove_subtitles: true,
+        };
+
+        store_output_settings(&app, "REELS", &folder.to_string_lossy()).unwrap();
+        store_cleaning_options(&app, remove_subtitles).unwrap();
+
+        // Changing the prefix keeps the cleaning choice and the folder.
+        let saved = store_output_settings(&app, "CLIPS", &folder.to_string_lossy()).unwrap();
+        assert!(saved.cleaning.remove_subtitles);
+        let loaded = load_settings(&app);
+        assert_eq!(loaded.prefix, "CLIPS");
+        assert!(
+            loaded.cleaning.remove_subtitles,
+            "a prefix save erased the option"
+        );
+
+        // Changing the folder keeps it too.
+        store_output_settings(&app, "CLIPS", &other_folder.to_string_lossy()).unwrap();
+        let loaded = load_settings(&app);
+        assert_eq!(loaded.output_directory, other_folder.to_string_lossy());
+        assert!(
+            loaded.cleaning.remove_subtitles,
+            "a folder save erased the option"
+        );
+
+        // Changing the cleaning choice keeps prefix and folder.
+        store_cleaning_options(&app, CleaningOptions::default()).unwrap();
+        let loaded = load_settings(&app);
+        assert_eq!(loaded.prefix, "CLIPS");
+        assert_eq!(loaded.output_directory, other_folder.to_string_lossy());
+        assert!(!loaded.cleaning.remove_subtitles);
+
+        // What the page is shown carries the choice as well.
+        let view = SettingsView::from(loaded);
+        assert!(view.output_directory_valid);
+        assert!(!view.cleaning.remove_subtitles);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn settings_are_replaced_whole_and_leave_no_temporary_file() {
+        let dir = scratch("settings-atomic");
+        // A leftover from a write that died part-way must not get in the way.
+        std::fs::write(dir.join(SETTINGS_TEMP), "{ half a fi").unwrap();
+        std::fs::write(settings_path(&dir), V050_SETTINGS).unwrap();
+
+        let saved = store_cleaning_options(
+            &dir,
+            CleaningOptions {
+                remove_subtitles: true,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !dir.join(SETTINGS_TEMP).exists(),
+            "the temporary file was left"
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(settings_path(&dir)).unwrap()).unwrap();
+        assert_eq!(on_disk["prefix"], "VIDEO");
+        assert_eq!(on_disk["outputDirectory"], r"D:\Clean videos");
+        assert_eq!(on_disk["cleaning"]["removeSubtitles"], true);
+        assert_eq!(load_settings(&dir).output_directory, saved.output_directory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The counts the page builds its warnings from: detected cover art apart
+    /// from footage, subtitles counted, and no execution plan in the scan.
+    #[test]
+    fn the_scan_counts_subtitles_and_detected_cover_art() {
+        let dir = scratch("scan-counts");
+        let cover = cover_jpeg(&dir, false);
+        let input = sample_with_cover(&dir, "mp4", &cover);
+
+        let view = scan_one(&input.to_string_lossy());
+
+        assert!(view.ok, "{:?}", view.error);
+        assert_eq!(view.video_streams, 1, "the cover was counted as footage");
+        assert_eq!(view.cover_images, 1);
+        assert_eq!(view.subtitle_streams, 1);
+        assert_eq!(view.audio_streams, 1);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["coverImages"], 1);
+        assert_eq!(json["subtitleStreams"], 1);
+        assert!(json.get("plan").is_none(), "the scan still sends a plan");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

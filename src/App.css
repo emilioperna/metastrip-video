@@ -659,6 +659,76 @@ button:disabled {
   line-height: 1.2;
 }
 
+/* The cleaning row spans both columns, under folder and naming. */
+.setting-block--cleaning {
+  grid-column: 1 / -1;
+  padding-top: 11px;
+  padding-bottom: 11px;
+  align-items: center;
+  border-top: 1px solid var(--border);
+}
+
+.setting-block--cleaning::before {
+  display: none;
+}
+
+.cleaning-floor {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.cleaning-option {
+  max-width: 340px;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+.cleaning-option input {
+  margin: 1px 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  cursor: inherit;
+}
+
+.cleaning-option:has(input:disabled) {
+  cursor: default;
+  opacity: 0.48;
+}
+
+.cleaning-option__copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cleaning-option__label {
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 560;
+}
+
+.cleaning-option__help {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.removal-warnings {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.4;
+  list-style: none;
+}
+
 .compact-button,
 .primary-button {
   border: 1px solid transparent;
@@ -1413,6 +1483,14 @@ button:disabled {
   color: var(--text-secondary);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+/* Wraps rather than ellipsizing like the other completion lines: every count on
+   it is a measured result, and at the minimum window width the later ones --
+   subtitle tracks, technical fields -- would otherwise be cut off. */
+.completion-copy .completion-stats {
+  line-height: 1.45;
+  white-space: normal;
 }
 
 @media (prefers-reduced-motion: reduce) {

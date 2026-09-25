@@ -73,6 +73,7 @@ never have to know FFmpeg is involved.
 src/                  React UI
   App.tsx             the whole window
   privacy.ts          scan types + aggregation, no Tauri imports, unit-tested
+  cleaning.ts         cleaning option, warnings and cleaning copy, unit-tested
   updater.ts          update state machine, no Tauri imports, unit-tested
   useUpdater.ts       the hook that talks to the updater plugin
 src-tauri/src/
@@ -80,7 +81,7 @@ src-tauri/src/
   sidecar.rs          bundled ffmpeg/ffprobe resolution
   inspect.rs          ffprobe JSON -> typed MetadataReport
   privacy.rs          deterministic privacy classification
-  plan.rs             CleaningPlan, derived from a report
+  plan.rs             CleaningOptions + the clean-time CleaningPlan
   verify.rs           post-clean verification
   testkit.rs          synthetic fixtures shared by the test modules
 scripts/              FFmpeg fetch, version consistency check
@@ -179,20 +180,23 @@ and a verification behind it:
 
 ```
 media file → Inspector → MetadataReport → PrivacyClassifier → PrivacyFindings
-           → CleaningPlan → existing cleaner → Verifier → VerificationReport
+
+CleaningOptions ──────────────→ ffmpeg_args → stream-copy cleaner → output
+fresh MetadataReport + options → CleaningPlan ─→ Verifier → VerificationReport
 ```
 
 Each stage is a module under `src-tauri/src/`, and each one is a plain function
 over plain data — no traits, no registries, no injection. The cleaner in the
-middle is the v0.4 stream-copy cleaner; the only change to its FFmpeg arguments is
-`-map -0:t?`, which drops attachment tracks.
+middle is the v0.4 stream-copy cleaner. v0.5 added `-map -0:t?`, which drops
+attachment tracks; v0.5.1 added `-map -0:disp:attached_pic`, which drops detected
+cover art, and `-sn` when the user asks for subtitles to go.
 
 | Module | Job |
 | --- | --- |
 | `sidecar.rs` | Resolves the bundled `ffmpeg` / `ffprobe` |
 | `inspect.rs` | ffprobe JSON → `MetadataReport` |
 | `privacy.rs` | `MetadataReport` → `Vec<PrivacyFinding>` |
-| `plan.rs` | What the cleaner is about to do, as data |
+| `plan.rs` | The user's cleaning option, and what a cleaned file must look like |
 | `verify.rs` | Output + original → `VerificationReport` |
 | `testkit.rs` | Synthetic fixtures shared by every test module |
 
@@ -218,6 +222,15 @@ absent. An unrecognised `codec_type` becomes `StreamKind::Unknown`, which still
 counts as a non-media track, so the verifier expects it gone. Which argument
 removes it depends on the kind: `-dn` covers data streams, `-map -0:t?` covers
 attachments, and neither covers the other.
+
+`StreamSummary.attached_pic` is `disposition.attached_pic` and nothing else: true
+only when ffprobe reports a non-zero number there. Absent, `0` or not a number is
+false. This one flag is what the whole app means by "detected cover art" -- the
+cleaner removes by it, the verifier checks by it, the scan counts by it. There
+are deliberately no heuristics on top (one-frame video, image codecs, AVI stills,
+Matroska covers an earlier remux demoted to plain video): each of those can be
+real footage, and removing footage is the worse mistake. The frontend never sees
+the raw disposition, only the `coverImages` count in `ScanView`.
 
 ### Classifier
 
@@ -272,44 +285,79 @@ Both are written by the muxer on the way out and cannot be removed by
 `duration` is Matroska's per-stream tag. Classifying them as Device or Unknown
 made verification fail on every MOV and MKV for no privacy gain.
 
-### Cleaning plan
+### Cleaning options and the clean-time plan
 
-`CleaningPlan` describes what the cleaner will do to one specific file:
-metadata scopes, whether chapters and non-media tracks actually exist to remove,
-the container strategy, the streams that must survive and the guarantees the
-product makes about the run. Two of its fields are load-bearing today --
-`remove_chapters` and `remove_data_streams` gate verifier checks 5 and 6 -- and
-the rest are descriptive.
+Cleaning has a fixed privacy floor and one choice.
 
-It is **derived, never chosen**. v0.5 exposes no way to edit it; it exists so the
-verifier has something concrete to check against and so a later Cleaning Profiles
-feature has a model to attach to. If a plan ever disagreed with `ffmpeg_args`,
-the plan is the thing that is wrong.
+- **The floor** is not an option and has no field anywhere: global and per-stream
+  metadata, chapters, data / attachment / unknown tracks and detected cover art
+  always go.
+- **`CleaningOptions { remove_subtitles }`** is the choice. It is `false` by
+  default, and it drives `ffmpeg_args` directly: `-sn` when set, nothing when not.
+  A file that cannot be inspected is therefore still cleaned exactly as asked.
+
+`CleaningPlan` is the verifier's contract for one file and nothing else. It is
+built at clean time from the **fresh** pre-clean report and the batch's options:
+
+- `remove_subtitles` -- whether check 8 must prove no subtitle remains;
+- `expected_media` -- every media stream that must survive, in input order: the
+  input's video, audio and subtitle streams, minus detected cover art, minus
+  subtitles when they are being removed. Each entry carries its kind, its
+  `StreamIdentity` and its `attached_pic` flag.
+
+The scan sends no plan: options can change after a file was scanned, and a plan
+the scan computed would describe a run that is not going to happen. The v0.5
+descriptive fields (`container_strategy`, `guarantees`, `preserved_streams`, the
+expected counts) were read by nothing and are gone.
+
+There is no preset enum. One boolean does not need one, and a stored preset name
+whose meaning changed in an update would silently change what existing users'
+files come out as.
 
 ### Verifier
 
 After a file is cleaned it is inspected again and checked against the input.
-**Ten checks, all of which must pass** before the word "verified" is used
-anywhere in the UI:
+**Every check must pass** before the word "verified" is used anywhere in the UI:
 
 1. the output exists;
 2. the output can be read back (a failure here stops the run rather than letting
    later checks pass vacuously);
 3. no disclosure from the input survives;
 4. nothing at MEDIUM or above is present in the output;
-5. chapters are gone, where the input had any;
-6. data and attachment tracks are gone, where the input had any;
-7. video, audio and subtitle streams are still present and their media stream
-   parameters match (a parameter comparison, not packet identity);
-8. the original is unchanged;
-9. the extension is preserved;
-10. no temporary file is left in the output folder.
+5. the output has no chapters -- whatever the input had;
+6. the output has no data, attachment or unknown track -- whatever the input had;
+7. "Detected cover art removed": no output stream is marked `attached_pic`;
+8. "Subtitle tracks removed", only when the batch asked for it: no subtitle remains;
+9. "Kept stream parameters match": the output's media streams are exactly
+   `plan.expected_media` -- same count, same order, same kind, same
+   `StreamIdentity`, same `attached_pic` (a parameter comparison, not packet
+   identity);
+10. the original is unchanged;
+11. the extension is preserved;
+12. no temporary file is left in the output folder.
 
-Check 3 compares key, scope, stream index **and value**. A muxer rewriting its
-own tag is not a surviving disclosure: `encoder` goes from `Lavf62.12.102`, which
-pins the exact build, to the bare `Lavf` that `-fflags +bitexact` produces. Check
-4 independently rejects anything sensitive appearing under any value, so a
-partial rewrite cannot slip between the two.
+Checks 5, 6 and 7 are the **floor** and never read the plan: an output that gained
+chapters or a track is not clean just because the input had none to remove. Only
+checks 8 and 9 read the plan.
+
+Check 9 compares counts before it pairs streams, so a missing stream can never be
+skipped by `zip` stopping at the shorter list, and it reports which kind moved: a
+lost second camera angle reads "Video stream count changed: 2 expected, 1 found",
+never as cover art that went.
+
+Check 3 compares key, scope **and value**, on any stream. It deliberately ignores
+the stream index: removing a stream renumbers everything after it, and a
+disclosure that survived on input stream 2 turns up on output stream 1. Ignoring
+the index can only find more survivors, never fewer. A muxer rewriting its own tag
+is not a surviving disclosure: `encoder` goes from `Lavf62.12.102`, which pins the
+exact build, to the bare `Lavf` that `-fflags +bitexact` produces. Check 4
+independently rejects anything sensitive appearing under any value, so a partial
+rewrite cannot slip between the two.
+
+Nothing checks what a kept stream contains. The text of a subtitle, the picture
+and the sound are copied, not inspected, and the UI says so; that is also why a
+cover image -- which carries its own EXIF, GPS included, inside the picture -- is
+removed rather than kept and trusted.
 
 Structural findings are excluded from check 3 because a muxer has to write
 `major_brand`, `handler_name` and `vendor_id` back. Matroska and WebM also
@@ -327,14 +375,15 @@ Not re-encoding is a property of the pipeline: every cleaning invocation uses
 `-c copy`, and there is no transcoding path to fall back to. What is checked, and
 where, is split on purpose.
 
-- **Runtime**, in `verify.rs`, check "Media stream parameters match": codec name,
+- **Runtime**, in `verify.rs`, check "Kept stream parameters match": codec name,
   codec tag, profile, dimensions, pixel format, sample rate, channels and layout
-  are compared between input and output. One ffprobe run, constant time in the
-  file size. It catches a missing stream or one that came out as a different
-  codec or format. It does **not** prove the packets are bit-for-bit the same,
-  and on its own it cannot rule out a re-encode that kept every parameter. The
-  UI therefore says only "stream copy used", "no transcoding" and "media stream
-  parameters match" — never bit-for-bit or byte-identical.
+  are compared between input and output for every stream the plan keeps. One
+  ffprobe run, constant time in the file size. It catches a missing stream or one
+  that came out as a different codec or format. It does **not** prove the packets
+  are bit-for-bit the same, and on its own it cannot rule out a re-encode that
+  kept every parameter. The UI therefore says only "stream copy", "no
+  transcoding" and "matching codec parameters" — never bit-for-bit or
+  byte-identical.
 - **Regression**, in the tests only: `deep_regression_encoded_payloads_are_byte_identical`
   hashes every stream's encoded packets with FFmpeg's `md5` muxer and asserts
   byte equality across all six containers. This, together with
@@ -401,7 +450,7 @@ wording honest without driving the whole app.
 ## Stored state
 
 ```
-%APPDATA%\com.metastrip.video\settings.json    prefix + output folder
+%APPDATA%\com.metastrip.video\settings.json    prefix + output folder + cleaning choice
 %APPDATA%\com.metastrip.video\used-ids.txt     one ID per line, append-only
 ```
 
@@ -412,6 +461,27 @@ forking the app moves this folder on its own.
 Plain files, no database. A missing or corrupt `settings.json` falls back to defaults
 instead of refusing to start. If the saved output folder has been deleted, the app says
 so and disables cleaning until a new one is chosen.
+
+`settings.json` is read leniently, because every v0.5.0 install already has one
+without a `cleaning` key and an update must not cost anyone their prefix or folder.
+`#[serde(default)]` on the struct fills in a missing key; the `lenient` deserialiser
+on `cleaning` turns a value this version cannot read (`null`, a string, a number, an
+object of the wrong shape) into the default options instead of failing the whole
+document. Unknown keys are ignored. Only a document that is not JSON at all falls
+back to defaults whole, as in v0.5.0.
+
+Every save is read-modify-write through `update_settings`: `save_settings` changes
+prefix and folder, `save_cleaning_options` changes the cleaning choice, and neither
+can erase the other's value. Writes go to `settings.json.tmp`, are flushed to disk,
+and are renamed over the real file, so a crash mid-write leaves the previous file
+intact.
+
+The stored cleaning choice is a preference, not what a batch runs with. The page
+snapshots the checkbox at the click and sends it with `clean_videos(paths,
+options)`; the backend uses that value for every file of the batch, never re-reads
+`settings.json` for it, and echoes it back in `CleanSummary.options`. The checkbox
+is disabled while the pipeline is busy (cleaning or installing an update). It stays
+enabled while files are scanning: nothing the scan finds depends on it.
 
 Installations from v0.2.0 and earlier stored the same two files under the previous
 identifier, `com.aurevm.videocleaner`. On startup the app copies them across once if the

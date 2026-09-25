@@ -29,13 +29,14 @@ and checks every copy before calling it verified.
    each with a LOW, MEDIUM or HIGH severity. Container bookkeeping such as
    `major_brand` or `handler_name` is listed separately as technical metadata and is
    not counted as a privacy finding.
-2. **Clean.** Metadata, chapters, data tracks and attachments are dropped while the
-   video and audio are stream-copied (`-c copy`). Nothing is re-encoded, and there is
-   no transcoding fallback: a file that cannot be stream-copied fails.
+2. **Clean.** Metadata, chapters, data tracks, attachments and detected cover art are
+   dropped while the video and audio are stream-copied (`-c copy`). Subtitle tracks are
+   kept unless you choose to remove them. Nothing is re-encoded, and there is no
+   transcoding fallback: a file that cannot be stream-copied fails.
 3. **Verify.** The output is inspected again and checked against the input: sensitive
-   metadata gone, chapters and non-media tracks gone, video, audio and subtitle stream
-   parameters unchanged, original unchanged. Only a file that passes every check is
-   marked verified; a failed check is reported, never hidden.
+   metadata gone, chapters, non-media tracks and detected cover art gone, every kept
+   stream still there with the same stream parameters, original unchanged. Only a file
+   that passes every check is marked verified; a failed check is reported, never hidden.
 
 - **Your videos never leave your computer.** No upload, no cloud, no server.
 - **No account**, no sign-in.
@@ -75,7 +76,9 @@ And it is inspectable — the FFmpeg strategy is documented
 - Removes chapters where the container exposes them
 - Removes data and unknown metadata streams where the container exposes them
 - Removes attachment tracks (embedded fonts and files in Matroska)
-- Keeps subtitle tracks, and checks they survive
+- Removes **detected cover art**: images the container marks as attached cover pictures
+- Keeps subtitle tracks by default, and checks they survive
+- Optionally removes subtitle tracks too
 - **Verified Cleaning**: every output is re-inspected, with a before/after view per file
 - **No video re-encoding**
 - **No audio re-encoding**
@@ -102,7 +105,8 @@ Prefer to build it yourself? See [Building from source](#building-from-source).
 ## How to use
 
 1. Install MetaStrip Video.
-2. Choose an output folder, and a file-name prefix if you want one.
+2. Choose an output folder, and a file-name prefix if you want one. Subtitle tracks are
+   kept unless you tick **Also remove subtitle tracks**; the choice is remembered.
 3. Drop your videos onto the window, or press **Select videos**. Each one is scanned
    straight away; open a row to see its privacy findings and technical metadata.
 4. Press **Clean**.
@@ -129,16 +133,27 @@ Not every container or input carries every structure listed below.
 | Chapters | chapter names and the text track carrying them |
 | Data tracks | GoPro `gpmd` telemetry, iPhone `mebx`, other timed-metadata streams |
 | Attachments | fonts and other files embedded in Matroska |
+| Detected cover art | a cover image the container marks as an attached picture: MP4/M4V `covr`, Matroska image attachments |
+| Subtitle tracks (optional) | only when **Also remove subtitle tracks** is ticked |
 
 Data tracks are worth calling out: stripping the tags around such a track leaves the
 track itself, payload and all. MetaStrip drops those tracks when the container exposes
 them as data or unknown metadata streams.
 
+Cover art is removed for a similar reason. A cover is an image copied into the file
+byte for byte, and a photo used as a cover carries its own EXIF — camera, time, often a
+GPS position — that no container tag reveals. MetaStrip removes a cover only when the
+container marks it as an attached picture. An image stored as an ordinary video track
+cannot be told apart from footage and is kept as video (see
+[Limitations](#limitations)).
+
 ## What stays untouched?
 
 - **The video bitstream.** Stream-copied, not re-encoded.
 - **The audio bitstream.** Same.
-- **Subtitle tracks.** Stream-copied like video and audio.
+- **Subtitle tracks.** Stream-copied like video and audio, unless you choose to remove
+  them. Captions burned into the picture or carried inside the video stream are part of
+  the video and are never removed.
 - **Your original files.** Never modified, never deleted, never moved.
 - **Picture quality.** There is no quality setting because nothing is re-compressed.
 
@@ -154,14 +169,20 @@ After cleaning, MetaStrip inspects the output with `ffprobe` and compares it wit
 input. A file is marked **Verified** only if every check passes:
 
 - the output exists and can be read back;
-- no privacy finding from the input survives with its original value, and nothing at
-  MEDIUM or above is present in the output;
-- chapters are gone, where the input had any;
-- data and attachment tracks are gone, where the input had any;
-- the video, audio and subtitle streams are all still there, with matching stream
-  parameters (codec, codec tag, profile, dimensions, pixel format, sample rate, channels
-  and layout);
+- no privacy finding from the input survives with its original value, on any stream,
+  and nothing at MEDIUM or above is present in the output;
+- the output has no chapters and no data, attachment or unknown tracks — whatever the
+  input had;
+- the output has no stream marked as attached cover art;
+- when **Also remove subtitle tracks** is ticked, the output has no subtitle track;
+- every video, audio and subtitle stream that was meant to be kept is still there, in
+  order, with matching stream parameters (codec, codec tag, profile, dimensions, pixel
+  format, sample rate, channels and layout), and nothing else is;
 - the original is unchanged, the extension is preserved, and no temporary file is left.
+
+Verified is a statement about the file's metadata and structure. The contents of the
+kept streams — the picture, the sound, the text of a subtitle — are copied as they are
+and are not inspected.
 
 If any check fails, the output is kept but the row reads **Verification failed** and
 lists what failed. A file that cannot be inspected is still cleaned, but reported as
@@ -197,7 +218,8 @@ An update never interrupts your work: if a batch is being processed the download
 happens, but the installer waits until the last video is done. If GitHub cannot be
 reached, the check is skipped silently.
 
-Your settings survive updates — the prefix, output folder and used-ID registry live in
+Your settings survive updates — the prefix, output folder, cleaning choice and used-ID
+registry live in
 `%APPDATA%\com.metastrip.video\` and no install touches them.
 
 ## Supported formats
@@ -228,11 +250,12 @@ For each file, MetaStrip invokes the bundled FFmpeg with this common stream-copy
 
 ```
 ffmpeg -n -i INPUT \
-  -map 0 -map -0:t? -c copy \
+  -map 0 -map -0:t? -map -0:disp:attached_pic -c copy \
   -map_metadata -1 \
   -map_metadata:s -1 \
   -map_chapters -1 \
   -dn \
+  [-sn] \
   -fflags +bitexact \
   ...container-specific options... \
   OUTPUT
@@ -240,7 +263,8 @@ ffmpeg -n -i INPUT \
 
 - `-c copy` copies the encoded streams instead of re-encoding them. This is why nothing
   is re-compressed, and why cleaning is typically much faster than transcoding.
-  Subtitle streams are selected by `-map 0` and copied the same way.
+  Subtitle streams are selected by `-map 0` and copied the same way, unless `-sn` is
+  added because **Also remove subtitle tracks** is ticked.
 - `-map_metadata -1 -map_metadata:s -1 -map_chapters -1` drop file-level metadata,
   per-stream metadata and chapters.
 - `-dn` drops data tracks. `-map 0` would otherwise copy them, and a data track is
@@ -249,13 +273,11 @@ ffmpeg -n -i INPUT \
   which Matroska can carry. `-dn` does not reach them, and once metadata is
   stripped such a track lacks the `filename` tag its muxer requires, which would
   fail the whole file.
-- Cover art that FFmpeg reports as a video stream (`attached_pic`) is not an
-  attachment, so `-map -0:t?` never selects it and the output is what it would be
-  without that argument. What that output keeps depends on the container: MP4 and
-  M4V keep the image as cover art, Matroska keeps it as an ordinary one-frame video
-  track, and MOV output does not keep it. A Matroska cover under a mimetype FFmpeg
-  cannot map to an image codec is an attachment stream and is removed with the
-  rest, which is the right outcome for an opaque embedded file.
+- `-map -0:disp:attached_pic` drops detected cover art: every stream FFmpeg reports
+  with the `attached_pic` disposition, and nothing else. Streams are never selected by
+  index, so a genuine second video stream is always kept. A Matroska cover under a
+  mimetype FFmpeg cannot map to an image codec is an attachment stream instead, and
+  `-map -0:t?` removes it with the rest.
 - `-fflags +bitexact` keeps FFmpeg from stamping its own version into the output.
 
 Container-specific behaviour is explicit:
@@ -294,7 +316,13 @@ registry, stored state — is in
   and the muxer regenerates some technical metadata of its own.
 - When processing succeeds, video and audio streams remain encoded as-is.
 - The Privacy Scan classifies the metadata `ffprobe` exposes. It does not look inside
-  the picture, the sound or opaque payloads.
+  the picture, the sound, subtitle text or opaque payloads.
+- Cover art is removed only when the container marks it as an attached picture. An
+  image stored as an ordinary video track is kept as video: a Matroska cover that an
+  earlier remux turned into a one-frame video track (MetaStrip v0.5.0 did this), a
+  still image in an AVI, or any container that cannot mark covers at all.
+- **Also remove subtitle tracks** removes separate subtitle tracks only. Captions burned
+  into the picture or carried inside the video stream are untouched.
 - Verification checks stream parameters, not per-file packet hashes.
 
 ## Roadmap

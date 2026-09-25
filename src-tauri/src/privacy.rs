@@ -815,21 +815,32 @@ impl PrivacySummary {
     }
 }
 
-/// Which stream kinds a container actually exposed, for the report's format
-/// matrix. Kept here rather than in the UI so the counts have one definition.
-pub fn stream_kind_counts(report: &MetadataReport) -> (usize, usize, usize) {
-    let video = report
-        .streams
-        .iter()
-        .filter(|s| s.kind == StreamKind::Video)
-        .count();
-    let audio = report
-        .streams
-        .iter()
-        .filter(|s| s.kind == StreamKind::Audio)
-        .count();
-    let other = report.non_media_streams().count();
-    (video, audio, other)
+/// How many streams of each kind a file carries, as the scan reports them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamCounts {
+    /// Footage: video streams not marked as attached cover art.
+    pub video: usize,
+    pub audio: usize,
+    pub subtitle: usize,
+    /// Streams the container marks as attached cover art, and only those.
+    pub cover_art: usize,
+    /// Data, attachment and unknown tracks.
+    pub other: usize,
+}
+
+/// Which streams a container actually exposed. Kept here rather than in the UI
+/// so the counts have one definition.
+pub fn stream_counts(report: &MetadataReport) -> StreamCounts {
+    let count = |keep: &dyn Fn(&crate::inspect::StreamSummary) -> bool| {
+        report.streams.iter().filter(|s| keep(s)).count()
+    };
+    StreamCounts {
+        video: count(&|s| s.kind == StreamKind::Video && !s.attached_pic),
+        audio: count(&|s| s.kind == StreamKind::Audio),
+        subtitle: count(&|s| s.kind == StreamKind::Subtitle),
+        cover_art: count(&|s| s.attached_pic),
+        other: report.non_media_streams().count(),
+    }
 }
 
 #[cfg(test)]

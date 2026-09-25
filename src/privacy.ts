@@ -37,19 +37,6 @@ export type PrivacySummary = {
   technical: number;
 };
 
-export type CleaningPlan = {
-  removeFormatMetadata: boolean;
-  removeStreamMetadata: boolean;
-  removeChapters: boolean;
-  removeDataStreams: boolean;
-  containerStrategy: string;
-  expectedRemovedFields: number;
-  sensitiveFindings: number;
-  expectedRemovedChapters: number;
-  expectedRemovedDataStreams: number;
-  guarantees: string[];
-};
-
 export type ScanView = {
   path: string;
   name: string;
@@ -59,12 +46,18 @@ export type ScanView = {
   findings: PrivacyFinding[];
   container: string | null;
   durationSeconds: number | null;
+  /** Footage only: detected cover art is counted in `coverImages`. */
   videoStreams: number;
   audioStreams: number;
+  subtitleStreams: number;
+  /**
+   * Streams the container marks as attached cover art, and only those. Not a
+   * count of every picture the file might hold.
+   */
+  coverImages: number;
   otherStreams: number;
   chapterCount: number;
   fieldCount: number;
-  plan: CleaningPlan | null;
 };
 
 export type VerificationCheck = {
@@ -90,6 +83,8 @@ export type VerificationReport = {
   technicalFieldsRemoved: number;
   chaptersRemoved: number;
   dataStreamsRemoved: number;
+  coverArtStreamsRemoved: number;
+  subtitleStreamsRemoved: number;
   residual: PrivacyFinding[];
   beforeAfter: BeforeAfterRow[];
 };
@@ -247,10 +242,6 @@ export function groupFindings(findings: PrivacyFinding[]): FindingGroup[] {
 export const STREAM_COPY_NOTE =
   "Metadata is removed locally. Video and audio use stream copy, with no transcoding.";
 
-/** Tooltip for the "Verified cleaning" badge: exactly what the checks cover. */
-export const VERIFIED_CLEANING_DETAIL =
-  "Every check passed: sensitive metadata removed, stream copy used and media stream parameters match, original not modified, no temporary files left.";
-
 /**
  * Completion headline. Deliberately refuses the word "verified" unless every
  * cleaned file actually passed, and names the shortfall when it did not.
@@ -312,19 +303,32 @@ export function formatDuration(seconds: number | null): string | null {
  * that distinction again.
  */
 export function detailFacts(
-  scan: Pick<ScanView, "durationSeconds" | "videoStreams" | "audioStreams" | "otherStreams" | "chapterCount">,
+  scan: Pick<
+    ScanView,
+    | "durationSeconds"
+    | "videoStreams"
+    | "audioStreams"
+    | "subtitleStreams"
+    | "coverImages"
+    | "otherStreams"
+    | "chapterCount"
+  >,
 ): string[] {
   const facts: string[] = [];
   const duration = formatDuration(scan.durationSeconds);
   if (duration) facts.push(duration);
   facts.push(
     `${scan.videoStreams} video · ${scan.audioStreams} audio` +
+      (scan.subtitleStreams > 0 ? ` · ${scan.subtitleStreams} subtitle` : "") +
       // "other", not "data": this bucket is every non-media stream the file
       // carries, which for a Matroska is typically an attachment rather than a
       // data track. Calling an embedded font a data track states something the
       // file does not contain.
       (scan.otherStreams > 0 ? ` · ${scan.otherStreams} other` : ""),
   );
+  if (scan.coverImages > 0) {
+    facts.push(`${scan.coverImages} detected cover art`);
+  }
   if (scan.chapterCount > 0) facts.push(`${scan.chapterCount} chapters`);
   return facts;
 }

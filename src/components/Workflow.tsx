@@ -15,8 +15,15 @@ import {
   type ScanView,
   type Severity,
   type VerificationReport,
-  VERIFIED_CLEANING_DETAIL,
 } from "../privacy";
+import {
+  ALWAYS_REMOVED_NOTE,
+  REMOVE_SUBTITLES_HELP,
+  REMOVE_SUBTITLES_LABEL,
+  completionStats,
+  verifiedCleaningDetail,
+  type CleaningOptions,
+} from "../cleaning";
 
 export type Status = "ready" | "processing" | "completed" | "error";
 
@@ -38,6 +45,8 @@ export type Settings = {
   prefix: string;
   outputDirectory: string;
   outputDirectoryValid: boolean;
+  /** The stored choice. A batch uses what the page sends with the click. */
+  cleaning: CleaningOptions;
 };
 
 export type Summary = {
@@ -51,6 +60,10 @@ export type Summary = {
   technicalFieldsRemoved: number;
   chaptersRemoved: number;
   dataStreamsRemoved: number;
+  coverArtStreamsRemoved: number;
+  subtitleStreamsRemoved: number;
+  /** What the batch actually ran with, echoed by the backend. */
+  options: CleaningOptions;
 };
 
 type IconName =
@@ -596,9 +609,12 @@ type OutputSettingsProps = {
   previewName: string;
   prefixValid: boolean;
   running: boolean;
+  cleaning: CleaningOptions;
+  cleaningLocked: boolean;
   onChooseFolder: () => void;
   onPrefixChange: (value: string) => void;
   onPrefixCommit: () => void;
+  onRemoveSubtitlesChange: (removeSubtitles: boolean) => void;
 };
 
 export function OutputSettings({
@@ -607,9 +623,12 @@ export function OutputSettings({
   previewName,
   prefixValid,
   running,
+  cleaning,
+  cleaningLocked,
   onChooseFolder,
   onPrefixChange,
   onPrefixCommit,
+  onRemoveSubtitlesChange,
 }: OutputSettingsProps) {
   const folderReady = settings?.outputDirectoryValid === true;
   const folderText = settings?.outputDirectory || "Choose an output folder";
@@ -671,6 +690,28 @@ export function OutputSettings({
           }}
         />
       </div>
+
+      <div className="setting-block setting-block--cleaning">
+        <div className="setting-copy">
+          <span className="setting-label">Cleaning</span>
+          <span className="cleaning-floor">{ALWAYS_REMOVED_NOTE}</span>
+        </div>
+        <label className="cleaning-option">
+          <input
+            type="checkbox"
+            checked={cleaning.removeSubtitles}
+            disabled={cleaningLocked}
+            aria-describedby="remove-subtitles-help"
+            onChange={(event) => onRemoveSubtitlesChange(event.target.checked)}
+          />
+          <span className="cleaning-option__copy">
+            <span className="cleaning-option__label">{REMOVE_SUBTITLES_LABEL}</span>
+            <span className="cleaning-option__help" id="remove-subtitles-help">
+              {REMOVE_SUBTITLES_HELP}
+            </span>
+          </span>
+        </label>
+      </div>
     </section>
   );
 }
@@ -699,33 +740,9 @@ export function CompletionSummary({ summary, onOpenFolder, onReset }: Completion
   // when verification did not succeed.
   const isWarning = hasErrors || !verified;
 
-  const stats: string[] = [];
   // Privacy metadata leads; technical container fields follow and are never
   // folded into the privacy figure.
-  if (summary.privacyFieldsRemoved > 0) {
-    stats.push(
-      `${summary.privacyFieldsRemoved} privacy ${summary.privacyFieldsRemoved === 1 ? "field" : "fields"} removed`,
-    );
-  }
-  if (summary.dataStreamsRemoved > 0) {
-    // "other", for the same reason the scan line says it: this counter is every
-    // non-media track removed, and for a Matroska that is typically an embedded
-    // font rather than a data track. This line shows on a passing run, so the
-    // noun has to be one the file can actually justify.
-    stats.push(
-      `${summary.dataStreamsRemoved} other ${summary.dataStreamsRemoved === 1 ? "track" : "tracks"} removed`,
-    );
-  }
-  if (summary.chaptersRemoved > 0) {
-    stats.push(
-      `${summary.chaptersRemoved} chapter ${summary.chaptersRemoved === 1 ? "marker" : "markers"} removed`,
-    );
-  }
-  if (summary.technicalFieldsRemoved > 0) {
-    stats.push(
-      `${summary.technicalFieldsRemoved} technical ${summary.technicalFieldsRemoved === 1 ? "field" : "fields"} removed`,
-    );
-  }
+  const stats = completionStats(summary);
 
   return (
     <section
@@ -738,7 +755,7 @@ export function CompletionSummary({ summary, onOpenFolder, onReset }: Completion
       <div className="completion-copy">
         <h2>{title}</h2>
         {verified ? (
-          <p className="completion-verified" title={VERIFIED_CLEANING_DETAIL}>
+          <p className="completion-verified" title={verifiedCleaningDetail(summary.options)}>
             <Icon name="shield" size={14} />
             Verified cleaning
           </p>
