@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
+mod edit;
 mod inspect;
 mod plan;
 mod privacy;
