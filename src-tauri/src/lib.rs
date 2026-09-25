@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 mod edit;
+mod edit_plan;
 mod inspect;
 mod plan;
 mod privacy;
