@@ -184,13 +184,16 @@ ffmpeg -n -i INPUT \
 - `-dn` drops data tracks. `-map 0` would otherwise copy them, and a data track is
   metadata in its own right.
 - `-map -0:t?` drops attachment tracks: embedded subtitle fonts and similar files,
-  which Matroska can carry. `-dn` does not reach them, and stripping per-stream
-  metadata would leave such a track without the `filename` tag its muxer requires,
-  failing the whole file. Cover art is unaffected wherever FFmpeg reports the
-  embedded image as a video stream (`attached_pic`): MP4 and MOV `covr`, and
-  Matroska covers whose mimetype maps to an image codec. A Matroska cover
-  attached under some other mimetype is an attachment stream and is removed with
-  the rest, which is the right outcome for an opaque embedded file.
+  which Matroska can carry. `-dn` does not reach them, and once metadata is
+  stripped such a track lacks the `filename` tag its muxer requires, which would
+  fail the whole file.
+- Cover art that FFmpeg reports as a video stream (`attached_pic`) is not an
+  attachment, so `-map -0:t?` never selects it and the output is what it would be
+  without that argument. What that output keeps depends on the container: MP4 and
+  M4V keep the image as cover art, Matroska keeps it as an ordinary one-frame video
+  track, and MOV output does not keep it. A Matroska cover under a mimetype FFmpeg
+  cannot map to an image codec is an attachment stream and is removed with the
+  rest, which is the right outcome for an opaque embedded file.
 - `-fflags +bitexact` keeps FFmpeg from stamping its own version into the output.
 
 Container-specific behaviour is explicit:

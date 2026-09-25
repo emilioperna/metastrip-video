@@ -428,16 +428,21 @@ fn ffmpeg_args(
         // `-map 0` selects attachment streams as well, and `-dn` does not reach
         // them: it drops data streams only. Matroska is the one supported
         // container that can carry an attachment -- an embedded subtitle font,
-        // typically -- and `-map_metadata:s -1` below strips the `filename` and
-        // `mimetype` tags its muxer requires for one, so leaving an attachment
-        // mapped fails the whole file at header write. Excluding it removes the
-        // embedded payload, which is what the scan already tells the user
-        // happens. The `?` keeps the negative map inert on every container that
-        // cannot carry one. Cover art is untouched wherever FFmpeg reports the
-        // embedded image as a video stream: MP4 and MOV `covr`, and Matroska
-        // covers whose mimetype maps to an image codec. A Matroska cover under
-        // any other mimetype really is an attachment and goes with the rest,
-        // which is the right outcome for an opaque embedded file.
+        // typically -- and the metadata stripping below removes the `filename`
+        // and `mimetype` tags its muxer requires for one, so leaving an
+        // attachment mapped fails the whole file at header write. Excluding it
+        // removes the embedded payload, which is what the scan already tells
+        // the user happens. The `?` keeps the negative map inert on every
+        // container that cannot carry one.
+        //
+        // Cover art that FFmpeg reports as a video stream (`attached_pic`) is
+        // not an attachment, so this never selects it and the output is what
+        // it would be without it. What survives is the muxer's doing, not this
+        // map's: MP4 and M4V keep the image as cover art, Matroska writes it
+        // back as an ordinary one-frame video track, and MOV does not keep it.
+        // A Matroska cover under a mimetype FFmpeg cannot map to an image codec
+        // really is an attachment and goes with the rest, which is the right
+        // outcome for an opaque embedded file.
         "-map".into(),
         "-0:t?".into(),
         "-c".into(),
@@ -508,9 +513,10 @@ fn strip_component_prefix(line: &str) -> &str {
 /// The most useful single line FFmpeg wrote, made safe to show.
 ///
 /// One line, never the whole of stderr: the rest is the banner, the input
-/// report and the stream mapping, none of which means anything here. The paths
-/// this app handed FFmpeg are replaced by what they are, because the message is
-/// shown beside the file's own name and an absolute path adds nothing to it.
+/// report and the stream mapping, none of which means anything here. The output
+/// paths -- the temporary file, its name and its folder -- are replaced by what
+/// they are, because the message is shown beside the file's own name and an
+/// absolute path adds nothing to it.
 fn last_ffmpeg_error(stderr: &[u8], output: &Path, output_dir: &Path) -> String {
     let text = String::from_utf8_lossy(stderr);
     let lines: Vec<&str> = text
