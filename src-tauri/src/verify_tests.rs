@@ -1158,6 +1158,64 @@ fn a_lost_second_video_stream_fails_verification() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The other direction: an output carrying a media stream the plan never
+/// promised is not the file that was asked for either. The expected streams
+/// all come first and match, so only an exact count comparison catches this --
+/// a check that looked for missing streams alone would pass it.
+#[test]
+fn an_extra_media_stream_fails_verification() {
+    let dir = scratch("negative-extra-stream");
+    let input = crate::testkit::sample_video(&dir, "one-audio.mp4");
+    let before = inspect(&input).unwrap();
+    assert_eq!(
+        before
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Audio)
+            .count(),
+        1,
+        "the fixture does not carry exactly one audio stream"
+    );
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Everything the cleaner does, plus the audio mapped a second time.
+    let output = out.join("extra-audio.mp4");
+    forge_output(
+        &input,
+        &output,
+        &[
+            "-map",
+            "0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-fflags",
+            "+bitexact",
+        ],
+    );
+    assert_eq!(
+        crate::testkit::stream_kinds(&output),
+        ["Video", "Audio", "Audio"],
+        "the forged output does not carry the extra stream"
+    );
+
+    let report = verify_against(&input, &output, CleaningOptions::default());
+
+    assert!(!report.verified, "an output with an extra stream passed");
+    assert_eq!(failed_names(&report), [STREAM_PARAMETERS_CHECK]);
+    assert_eq!(
+        check_named(&report, STREAM_PARAMETERS_CHECK).detail,
+        "Audio stream count changed: 1 expected, 2 found"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn an_output_that_gains_chapters_fails_even_when_the_original_had_none() {
     let dir = scratch("negative-chapters-gained");

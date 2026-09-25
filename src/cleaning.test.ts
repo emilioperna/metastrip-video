@@ -244,3 +244,54 @@ describe("no stale cleaning plan", () => {
     }
   });
 });
+
+describe("the Clean click uses the checkbox, not the stored preference", () => {
+  // App.tsx has no component-test harness, so this pins the source contract the
+  // way the CleaningPlan check above does. The invariant: the options a batch
+  // runs with are the ones the checkbox shows when Clean is pressed -- never
+  // rebuilt from the persisted `settings.cleaning`, which can lag behind a save
+  // still in flight or a save that failed.
+  const sources = import.meta.glob(["./App.tsx", "./components/Workflow.tsx"], {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  }) as Record<string, string>;
+  const app = sources["./App.tsx"];
+  const workflow = sources["./components/Workflow.tsx"];
+
+  /** The source of one top-level function in App, braces matched. */
+  function functionBody(source: string, name: string): string {
+    const start = source.indexOf(`function ${name}(`);
+    expect(start, `${name} not found`).toBeGreaterThanOrEqual(0);
+    const open = source.indexOf("{", source.indexOf(")", start));
+    let depth = 0;
+    for (let i = open; i < source.length; i++) {
+      if (source[i] === "{") depth++;
+      if (source[i] === "}" && --depth === 0) return source.slice(open, i + 1);
+    }
+    throw new Error(`${name} has no closing brace`);
+  }
+
+  it("builds the request from the checkbox state at the click", () => {
+    const click = functionBody(app, "cleanVideos");
+    expect(click).toMatch(
+      /const request = cleanRequest\(\s*files\.map\(\(file\) => file\.path\),\s*snapshotOptions\(cleaning\),?\s*\)/,
+    );
+    expect(click).not.toMatch(/settings/);
+  });
+
+  it("sends exactly that request, and nothing rebuilds it from settings", () => {
+    const run = functionBody(app, "runBatch");
+    expect(run).toMatch(/invoke<Summary>\("clean_videos", request\)/);
+    expect(run).not.toMatch(/settings\??\.cleaning/);
+    expect(app.match(/"clean_videos"/g)).toHaveLength(1);
+    expect(app).not.toMatch(/snapshotOptions\([^)]*settings/);
+    expect(app).not.toMatch(/cleanRequest\([^;]*settings/);
+  });
+
+  it("the checkbox renders the same state the click snapshots", () => {
+    expect(app).toMatch(/const \[cleaning, setCleaning\] = useState<CleaningOptions>/);
+    expect(app).toMatch(/cleaning=\{cleaning\}/);
+    expect(workflow).toMatch(/checked=\{cleaning\.removeSubtitles\}/);
+  });
+});

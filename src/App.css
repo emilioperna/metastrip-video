@@ -988,6 +988,12 @@ button:disabled {
     gap: var(--space-3);
   }
 
+  /* The queue gives up height first, so messages, the cleaning row and the
+     removal warnings can never push the Clean button below the window. */
+  .workflow-stage {
+    min-height: 96px;
+  }
+
   .product-intro {
     margin-top: 14px;
   }
