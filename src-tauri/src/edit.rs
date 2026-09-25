@@ -635,23 +635,43 @@ impl NormalizedGlobals {
     }
 }
 
+/// The fields this file's edits actually change: those whose operation does
+/// not resolve to [`FieldChange::Keep`] against the field's current value.
+///
+/// Being named in the request is not enough. `FillIfMissing` on a field that
+/// already holds a value keeps it, so that field is untouched and must
+/// survive the remux like any other.
+pub fn changed_fields(
+    globals: &NormalizedGlobals,
+    edits: &[MetadataEdit],
+) -> BTreeSet<EditableField> {
+    edits
+        .iter()
+        .filter(|edit| edit.operation.resolve(globals.current(edit.field)) != FieldChange::Keep)
+        .map(|edit| edit.field)
+        .collect()
+}
+
 /// Untouched, meaningful container-level keys an Edit remux of this file
 /// would lose or cannot be trusted to keep: every normalised key the muxer is
-/// not known to preserve, plus every ambiguous key, minus the fields the
-/// request edits (those change on purpose). A non-empty answer means the file
+/// not known to preserve, plus every ambiguous key, minus the fields the edits
+/// actually change (see [`changed_fields`]). A non-empty answer means the file
 /// cannot be edited without losing something the user did not ask to change.
 pub fn unpreserved_keys(
     globals: &NormalizedGlobals,
     muxer: EditMuxer,
     edits: &[MetadataEdit],
 ) -> BTreeSet<String> {
-    let edited: BTreeSet<&str> = edits.iter().map(|edit| edit.field.key()).collect();
+    let changed: BTreeSet<&str> = changed_fields(globals, edits)
+        .into_iter()
+        .map(EditableField::key)
+        .collect();
     globals
         .fields
         .keys()
         .filter(|key| !muxer.preserves_global_key(key))
         .chain(globals.ambiguous.iter())
-        .filter(|key| !edited.contains(key.as_str()))
+        .filter(|key| !changed.contains(key.as_str()))
         .cloned()
         .collect()
 }

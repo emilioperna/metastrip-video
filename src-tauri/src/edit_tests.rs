@@ -958,3 +958,91 @@ fn an_ambiguous_key_is_never_claimed_to_survive() {
     )
     .is_empty());
 }
+
+// ------------------------------------- Only a real change exempts a field ---
+
+fn lost(globals: &NormalizedGlobals, muxer: EditMuxer, edits: &[MetadataEdit]) -> Vec<String> {
+    unpreserved_keys(globals, muxer, edits)
+        .into_iter()
+        .collect()
+}
+
+/// Title reported twice with two different values.
+fn ambiguous_title() -> NormalizedGlobals {
+    let input = report(&[("TITLE", "One"), ("title", "Two")]);
+    let globals = NormalizedGlobals::from_report(&input, EditMuxer::Matroska);
+    assert!(globals.ambiguous().contains("title"));
+    globals
+}
+
+#[test]
+fn set_on_an_ambiguous_title_settles_it() {
+    let globals = ambiguous_title();
+    let edits = [set(EditableField::Title, "New")];
+    assert_eq!(
+        changed_fields(&globals, &edits),
+        [EditableField::Title].into()
+    );
+    assert!(lost(&globals, EditMuxer::Matroska, &edits).is_empty());
+}
+
+#[test]
+fn remove_on_an_ambiguous_title_settles_it() {
+    let globals = ambiguous_title();
+    let edits = [remove(EditableField::Title)];
+    assert_eq!(
+        changed_fields(&globals, &edits),
+        [EditableField::Title].into()
+    );
+    assert!(lost(&globals, EditMuxer::Matroska, &edits).is_empty());
+}
+
+#[test]
+fn fill_on_a_present_ambiguous_title_leaves_it_unpreserved() {
+    // Present, so Fill keeps it: the field is untouched, and which of its two
+    // values a remux would keep is still unknown.
+    let globals = ambiguous_title();
+    let edits = [fill(EditableField::Title, "New")];
+    assert!(changed_fields(&globals, &edits).is_empty());
+    assert_eq!(lost(&globals, EditMuxer::Matroska, &edits), ["title"]);
+}
+
+#[test]
+fn fill_on_a_present_title_does_not_hide_another_lost_key() {
+    let input = report(&[("title", "Orig"), ("make", "TestCam")]);
+    let globals = NormalizedGlobals::from_report(&input, EditMuxer::Mp4);
+    let edits = [fill(EditableField::Title, "New")];
+    assert!(changed_fields(&globals, &edits).is_empty());
+    assert_eq!(lost(&globals, EditMuxer::Mp4, &edits), ["make"]);
+}
+
+#[test]
+fn fill_on_a_missing_title_is_a_change() {
+    let input = report(&[("make", "TestCam")]);
+    let globals = NormalizedGlobals::from_report(&input, EditMuxer::Mp4);
+    let edits = [fill(EditableField::Title, "New")];
+    assert_eq!(
+        changed_fields(&globals, &edits),
+        [EditableField::Title].into()
+    );
+    assert_eq!(lost(&globals, EditMuxer::Mp4, &edits), ["make"]);
+}
+
+#[test]
+fn fill_on_an_empty_title_is_a_change() {
+    let input = report(&[("title", "   "), ("comment", "Kept")]);
+    let globals = NormalizedGlobals::from_report(&input, EditMuxer::Avi);
+    let edits = [fill(EditableField::Title, "New")];
+    assert_eq!(
+        changed_fields(&globals, &edits),
+        [EditableField::Title].into()
+    );
+    assert!(lost(&globals, EditMuxer::Avi, &edits).is_empty());
+}
+
+#[test]
+fn a_remove_of_an_absent_field_changes_nothing() {
+    let input = report(&[("title", "T")]);
+    let globals = NormalizedGlobals::from_report(&input, EditMuxer::Mov);
+    assert!(changed_fields(&globals, &[remove(EditableField::Comment)]).is_empty());
+}
