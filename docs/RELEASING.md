@@ -5,13 +5,14 @@ Cutting a release is pushing a tag. `.github/workflows/release.yml` does the res
 ## Steps
 
 1. Bump the version in `package.json`, `src-tauri/Cargo.toml` and
-   `src-tauri/tauri.conf.json`. All three must agree — `node scripts/check-version.mjs`
-   checks this, and CI refuses to build on a mismatch.
-2. Commit.
-3. Tag it: `git tag v0.3.1`
-4. Push the tag: `git push origin v0.3.1`
+   `src-tauri/tauri.conf.json`, and let the tooling refresh the lock files
+   (`package-lock.json`, `src-tauri/Cargo.lock`). All three must agree —
+   `node scripts/check-version.mjs` checks this, and CI refuses to build on a mismatch.
+2. Commit, and merge the version bump to `main`.
+3. Tag `main`: `git tag v<VERSION>` (for example `git tag v0.5.0`)
+4. Push the tag: `git push origin v<VERSION>`
 5. The workflow builds, signs, and opens a **draft** release with the installer, its
-   `.sig` and `latest.json`. Publish the draft when it looks right.
+   `.sig` and `latest.json`. Validate the draft, then publish it by hand.
 
 Installed copies pick the update up from there. Until the draft is published, GitHub
 does not treat it as the latest release, so the updater endpoint keeps returning the
@@ -26,7 +27,7 @@ Windows binary. Adding another target means adding a sidecar for it first.
 checkout → node → rust → cache → npm ci
   → check version matches the tag
   → npm run setup:ffmpeg      (fetches the pinned FFmpeg, verifies SHA-256)
-  → verify the sidecar is in place
+  → verify the sidecars are in place (ffmpeg, ffprobe)
   → npm run build → npm test → cargo test
   → tauri-action                (build, sign, draft release, upload)
 ```

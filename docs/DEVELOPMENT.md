@@ -89,7 +89,8 @@ scripts/              FFmpeg fetch, version consistency check
 `lib.rs` was one file through v0.4, when the whole backend was a few hundred
 lines. v0.5 splits the new pipeline into a module per stage, because those stages
 are independently testable and a single file would no longer be navigable. The
-cleaning pipeline, the ID registry and the settings stayed in `lib.rs` untouched.
+cleaning pipeline, the ID registry and the settings stayed in `lib.rs`; sidecar
+resolution moved out to `sidecar.rs`.
 
 ## Bundled FFmpeg
 
@@ -109,7 +110,9 @@ Pin an **end-of-month** autobuild tag. BtbN keeps daily builds for roughly two w
 one build per month after that, so a mid-month tag stops resolving within weeks and every
 clean clone and CI run then fails at `npm run setup:ffmpeg`.
 
-At runtime `ffmpeg_program()` in `src-tauri/src/lib.rs` resolves FFmpeg in this order:
+At runtime `ffmpeg_program()` and `ffprobe_program()` in `src-tauri/src/sidecar.rs`
+resolve each tool the same way, in this order (shown for `ffmpeg`; `ffprobe` is
+identical):
 
 1. `ffmpeg.exe` next to the running executable. This covers both the installed layout
    and `tauri dev`: `tauri_build::build()`, called from `build.rs`, copies every
@@ -122,10 +125,10 @@ At runtime `ffmpeg_program()` in `src-tauri/src/lib.rs` resolves FFmpeg in this 
 A release build never falls back to the PATH: if its own sidecar is missing that means
 a broken install, and the app says so rather than silently using some other FFmpeg.
 
-`ffprobe.exe` is bundled by the same `externalBin` mechanism and lands in the same
-folder, but nothing in the Rust code resolves or runs it yet — it ships ahead of the
-inspection work that will use it. See
-[`../THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md) for which build is used and why.
+`ffmpeg` runs the cleaner. `ffprobe` is invoked by `inspect.rs`, and both the privacy
+scan and the verifier depend on it: without it a file cannot be scanned or verified.
+See [`../THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md) for which build is used
+and why.
 
 ## The cleaning pipeline
 
@@ -181,7 +184,8 @@ media file → Inspector → MetadataReport → PrivacyClassifier → PrivacyFin
 
 Each stage is a module under `src-tauri/src/`, and each one is a plain function
 over plain data — no traits, no registries, no injection. The cleaner in the
-middle is the v0.4 code, unchanged.
+middle is the v0.4 stream-copy cleaner; the only change to its FFmpeg arguments is
+`-map -0:t?`, which drops attachment tracks.
 
 | Module | Job |
 | --- | --- |
@@ -441,7 +445,7 @@ version and must agree; the updater compares against the one in `tauri.conf.json
 
 ```
 node scripts/check-version.mjs          # check the three agree
-node scripts/check-version.mjs v0.3.1   # also check they match a tag
+node scripts/check-version.mjs v0.5.0   # also check they match a tag
 ```
 
 CI runs the second form on a release tag and refuses to build on a mismatch.

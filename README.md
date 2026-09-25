@@ -1,9 +1,9 @@
 # MetaStrip Video — Video Metadata Remover
 
-> Fast, offline video metadata remover for Windows.
-> Strip metadata, chapters and data tracks without re-encoding.
+> See what privacy metadata a video contains, remove it locally without re-encoding,
+> and verify the result. Offline, for Windows.
 >
-> **Supported:** MP4 · MOV · M4V · MKV · WebM · AVI
+> **Scan → Clean → Verify** · MP4 · MOV · M4V · MKV · WebM · AVI
 
 [![Latest release](https://img.shields.io/github/v/release/emilioperna/metastrip-video?label=latest&color=2ea043)](https://github.com/emilioperna/metastrip-video/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -20,12 +20,27 @@ Windows x86_64 · signed installer · FFmpeg bundled · no account
 <!-- Demo GIF goes here once recorded:
      ![Cleaning five videos with MetaStrip Video](docs/assets/demo.gif) -->
 
-Drop up to 100 videos, press one button, get clean copies.
+Drop up to 100 videos. MetaStrip shows what each one discloses, writes clean copies,
+and checks every copy before calling it verified.
+
+1. **Scan.** Each file is inspected with the bundled `ffprobe` as soon as it is added.
+   What it finds is classified by fixed rules into categories — location, device,
+   timestamp, software, creator identity, telemetry, identifier, copyright, unknown —
+   each with a LOW, MEDIUM or HIGH severity. Container bookkeeping such as
+   `major_brand` or `handler_name` is listed separately as technical metadata and is
+   not counted as a privacy finding.
+2. **Clean.** Metadata, chapters, data tracks and attachments are dropped while the
+   video and audio are stream-copied (`-c copy`). Nothing is re-encoded, and there is
+   no transcoding fallback: a file that cannot be stream-copied fails.
+3. **Verify.** The output is inspected again and checked against the input: sensitive
+   metadata gone, chapters and non-media tracks gone, video, audio and subtitle stream
+   parameters unchanged, original unchanged. Only a file that passes every check is
+   marked verified; a failed check is reported, never hidden.
 
 - **Your videos never leave your computer.** No upload, no cloud, no server.
 - **No account**, no sign-in.
 - **No telemetry**, no analytics, no crash reporting.
-- **No video or audio re-encoding.** The streams are copied, bit for bit.
+- **No video or audio re-encoding.** The encoded streams are copied, not transcoded.
 - **Your originals are never modified** or deleted.
 - **Signed automatic updates**, verified against a key compiled into the app.
 - **FFmpeg is bundled** — nothing else to install.
@@ -37,9 +52,12 @@ camera model and the time. An editor leaves its name. A GoPro writes a whole GPS
 telemetry track. Publish the file and you publish all of it.
 
 Most tools that strip this re-encode the video to do it, which costs quality and time.
-MetaStrip copies the media streams across bit for bit and rebuilds the container without
+MetaStrip stream-copies the encoded video and audio and rebuilds the container without
 the metadata. Because the streams are copied rather than transcoded, cleaning is
 typically much faster than re-encoding, and the result looks exactly like the original.
+
+It also shows its work: what a file disclosed before cleaning, and whether each of those
+fields is gone afterwards.
 
 It is deliberately small: one window, one button, no project files and no settings page.
 And it is inspectable — the FFmpeg strategy is documented
@@ -50,10 +68,15 @@ And it is inspectable — the FFmpeg strategy is documented
 
 - Batch up to **100 videos** at a time
 - **MP4, MOV, M4V, MKV, WebM and AVI**
+- **Privacy Scan** before cleaning: deterministic categories and severity, with
+  technical/container metadata shown separately from privacy findings
 - Removes global metadata
 - Removes per-stream metadata
 - Removes chapters where the container exposes them
 - Removes data and unknown metadata streams where the container exposes them
+- Removes attachment tracks (embedded fonts and files in Matroska)
+- Keeps subtitle tracks, and checks they survive
+- **Verified Cleaning**: every output is re-inspected, with a before/after view per file
 - **No video re-encoding**
 - **No audio re-encoding**
 - Original files are left untouched
@@ -80,9 +103,12 @@ Prefer to build it yourself? See [Building from source](#building-from-source).
 
 1. Install MetaStrip Video.
 2. Choose an output folder, and a file-name prefix if you want one.
-3. Drop your videos onto the window, or press **Select videos**.
+3. Drop your videos onto the window, or press **Select videos**. Each one is scanned
+   straight away; open a row to see its privacy findings and technical metadata.
 4. Press **Clean**.
-5. The cleaned copies are in the folder you chose.
+5. The cleaned copies are in the folder you chose. Each row reports **Verified**,
+   **Verification failed** (with the checks that failed) or **Not verified** (with the
+   reason).
 
 Every output is named `PREFIX_##########.<original-extension>`, where the ten digits
 are a random ID that is never reused — for example `VIDEO_0917283645.mkv`. The output
@@ -102,6 +128,7 @@ Not every container or input carries every structure listed below.
 | Per-stream metadata | track titles, handler names, stream language |
 | Chapters | chapter names and the text track carrying them |
 | Data tracks | GoPro `gpmd` telemetry, iPhone `mebx`, other timed-metadata streams |
+| Attachments | fonts and other files embedded in Matroska |
 
 Data tracks are worth calling out: stripping the tags around such a track leaves the
 track itself, payload and all. MetaStrip drops those tracks when the container exposes
@@ -109,13 +136,41 @@ them as data or unknown metadata streams.
 
 ## What stays untouched?
 
-- **The video bitstream.** Copied, not re-encoded — byte-identical to the source.
+- **The video bitstream.** Stream-copied, not re-encoded.
 - **The audio bitstream.** Same.
+- **Subtitle tracks.** Stream-copied like video and audio.
 - **Your original files.** Never modified, never deleted, never moved.
 - **Picture quality.** There is no quality setting because nothing is re-compressed.
 
 The container itself is rewritten by FFmpeg, so the output file is not a byte-for-byte
-copy of the input — the media inside it is.
+copy of the input. The muxer also writes some technical metadata of its own back —
+`major_brand`, `handler_name` or `vendor_id`, and a bare `encoder` tag in Matroska and
+WebM. The scan lists these as technical metadata, and the before/after view reports
+them as still present rather than hiding them.
+
+## What "verified" means
+
+After cleaning, MetaStrip inspects the output with `ffprobe` and compares it with the
+input. A file is marked **Verified** only if every check passes:
+
+- the output exists and can be read back;
+- no privacy finding from the input survives with its original value, and nothing at
+  MEDIUM or above is present in the output;
+- chapters are gone, where the input had any;
+- data and attachment tracks are gone, where the input had any;
+- the video, audio and subtitle streams are all still there, with matching stream
+  parameters (codec, codec tag, profile, dimensions, pixel format, sample rate, channels
+  and layout);
+- the original is unchanged, the extension is preserved, and no temporary file is left.
+
+If any check fails, the output is kept but the row reads **Verification failed** and
+lists what failed. A file that cannot be inspected is still cleaned, but reported as
+**Not verified**.
+
+Verification compares stream parameters; it does not hash the encoded packets of every
+file. That the packets themselves come through unchanged is a property of stream copy,
+and it is enforced by regression tests that hash every stream's encoded packets across
+all six containers — not re-proven at runtime for each video.
 
 ## Private by design
 
@@ -163,6 +218,11 @@ The current build targets Windows 10/11 on x86_64.
 
 ## How it works
 
+Files are inspected with the bundled `ffprobe` (`-show_format -show_streams
+-show_chapters`, JSON output): once when added, for the scan, and again after cleaning,
+when the verifier re-inspects the input and inspects the output. Nothing is parsed from
+FFmpeg's human-readable output.
+
 For each file, MetaStrip invokes the bundled FFmpeg with this common stream-copy core:
 
 ```
@@ -177,8 +237,9 @@ ffmpeg -n -i INPUT \
   OUTPUT
 ```
 
-- `-c copy` copies the encoded streams instead of re-encoding them. This is why the
-  media is bit-identical, and why cleaning is typically much faster than transcoding.
+- `-c copy` copies the encoded streams instead of re-encoding them. This is why nothing
+  is re-compressed, and why cleaning is typically much faster than transcoding.
+  Subtitle streams are selected by `-map 0` and copied the same way.
 - `-map_metadata -1 -map_metadata:s -1 -map_chapters -1` drop file-level metadata,
   per-stream metadata and chapters.
 - `-dn` drops data tracks. `-map 0` would otherwise copy them, and a data track is
@@ -213,7 +274,8 @@ exits successfully. An interrupted run can therefore leave a leftover temporary 
 but never a truncated video under a finished name. Leftovers are swept at the start of
 the next batch.
 
-More detail — the FFmpeg sidecar, the ID registry, stored state — is in
+More detail — the FFmpeg sidecars, the privacy classifier, the verifier, the ID
+registry, stored state — is in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Limitations
@@ -227,8 +289,12 @@ More detail — the FFmpeg sidecar, the ID registry, stored state — is in
 - MetaStrip is **not a forensic
   anonymisation tool**, and makes no claim that a cleaned file is unidentifiable:
   encoder characteristics, frame content and the container structure all remain.
-- The output container is rewritten, so the file is not byte-identical to the input.
+- The output container is rewritten, so the file is not byte-identical to the input,
+  and the muxer regenerates some technical metadata of its own.
 - When processing succeeds, video and audio streams remain encoded as-is.
+- The Privacy Scan classifies the metadata `ffprobe` exposes. It does not look inside
+  the picture, the sound or opaque payloads.
+- Verification checks stream parameters, not per-file packet hashes.
 
 ## Roadmap
 
@@ -283,6 +349,10 @@ update check.
 **Does it reduce quality?** No. Video and audio are copied, not re-encoded.
 
 **Does it overwrite my originals?** No. Originals are never modified or deleted.
+
+**What does "Verified" mean?** That the cleaned file was inspected again and passed
+every check listed in [What "verified" means](#what-verified-means). It does not mean
+the file is anonymous.
 
 **Do I need FFmpeg installed?** No, it is bundled with the app.
 
