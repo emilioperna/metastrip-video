@@ -692,6 +692,10 @@ fn validate_input(input: &Path) -> Result<FormatProfile, String> {
     Ok(format)
 }
 
+/// Shown when a partial output could not be cleared before an FFmpeg attempt.
+const CLEAN_TEMP_IN_THE_WAY: &str =
+    "A partial output could not be removed, so cleaning stopped for this file. Nothing was published.";
+
 /// Cleans one video. Returns the final file name on success.
 fn clean_one(
     input: &Path,
@@ -699,6 +703,22 @@ fn clean_one(
     prefix: &str,
     options: CleaningOptions,
     registry: &mut IdRegistry,
+) -> Result<String, String> {
+    clean_one_with(input, output_dir, prefix, options, registry, |args| {
+        ffmpeg().args(args).output()
+    })
+}
+
+/// `clean_one` with the FFmpeg launcher passed in, so a test can reach
+/// failures a real file cannot produce on demand. The launcher is handed the
+/// exact arguments to run and nothing else.
+fn clean_one_with(
+    input: &Path,
+    output_dir: &Path,
+    prefix: &str,
+    options: CleaningOptions,
+    registry: &mut IdRegistry,
+    mut launch: impl FnMut(&[String]) -> std::io::Result<std::process::Output>,
 ) -> Result<String, String> {
     let format = validate_input(input)?;
     let original_ext = input
@@ -714,21 +734,27 @@ fn clean_one(
     let final_path = output_dir.join(&final_name);
     let temp_path = output_dir.join(format!("{TEMP_PREFIX}{id}.{original_ext}"));
 
-    let run = |attempt: MuxAttempt| {
-        ffmpeg()
-            .args(ffmpeg_args(input, &temp_path, format, attempt, options))
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    FFMPEG_MISSING.to_string()
-                } else {
-                    format!("Could not start FFmpeg: {e}")
-                }
-            })
+    let mut run = |attempt: MuxAttempt| {
+        launch(&ffmpeg_args(input, &temp_path, format, attempt, options)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FFMPEG_MISSING.to_string()
+            } else {
+                format!("Could not start FFmpeg: {e}")
+            }
+        })
     };
 
     let mut last_error = "FFmpeg failed".to_string();
     for attempt in format.mux_attempts() {
+        // `-n` keeps FFmpeg from overwriting a file already at the temporary
+        // path, but the pinned FFmpeg then exits with status 0 having written
+        // nothing. A success proves this run wrote the file only if nothing
+        // was there before it, so a leftover -- a partial output the previous
+        // attempt could not remove -- stops the file here instead of being
+        // renamed into place by the next attempt's "success".
+        if temp_path.symlink_metadata().is_ok() {
+            return Err(CLEAN_TEMP_IN_THE_WAY.into());
+        }
         let result = match run(*attempt) {
             Ok(result) => result,
             Err(error) => {
@@ -748,8 +774,8 @@ fn clean_one(
 
         last_error = last_ffmpeg_error(&result.stderr, &temp_path, output_dir);
         // ISO-BMFF gets one retry without faststart. Other profiles have exactly
-        // one attempt. Removing the partial output is required because `-n` must
-        // keep protecting every invocation from overwrites.
+        // one attempt. The partial output goes before the next attempt, which
+        // must start from an absent path (see above).
         let _ = std::fs::remove_file(&temp_path);
     }
 
@@ -2605,6 +2631,149 @@ Conversion failed!\n";
             0,
             "a failed conversion left files in the output folder"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------------ A partial output is never kept ---
+    //
+    // The pinned FFmpeg exits with status 0 when `-n` refuses an existing
+    // output (pinned in `edit_batch_tests::a_partial_output_that_cannot_be_removed_stops_the_file`),
+    // so every attempt must start from an absent temporary path.
+
+    /// A run that dies part-way through: it leaves a partial file at the
+    /// temporary path and exits with a real failure status from the real FFmpeg.
+    fn dies_part_way(args: &[String]) -> std::io::Result<std::process::Output> {
+        std::fs::write(args.last().unwrap(), b"partial output").unwrap();
+        let failed = ffmpeg().arg("-no-such-option").output()?;
+        assert!(!failed.status.success());
+        Ok(failed)
+    }
+
+    fn ids_recorded(registry: &Path) -> usize {
+        std::fs::read_to_string(registry)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    }
+
+    /// The faststart attempt dies part-way and its partial output is removed.
+    /// The standard attempt then runs from an absent path on the same ID, with
+    /// Clean's own arguments, and the file it writes is the one published.
+    #[test]
+    fn a_cleared_faststart_failure_falls_back_under_the_same_id() {
+        let dir = scratch("clean-fallback");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = sample_for_format(&dir, "mp4");
+        let before = std::fs::read(&input).unwrap();
+        let registry_path = dir.join("used-ids.txt");
+        let mut registry = IdRegistry::open(&registry_path).unwrap();
+        let options = CleaningOptions::default();
+
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let name = clean_one_with(&input, &out, "CLIP", options, &mut registry, |args| {
+            assert!(
+                !Path::new(args.last().unwrap()).exists(),
+                "attempt {} started over an existing temporary file",
+                seen.len() + 1
+            );
+            seen.push(args.to_vec());
+            if seen.len() == 1 {
+                dies_part_way(args)
+            } else {
+                ffmpeg().args(args).output()
+            }
+        })
+        .unwrap();
+
+        // Both attempts ran Clean's own argv, on one temporary path.
+        let temp = out.join(format!("{TEMP_PREFIX}{}.mp4", &name["CLIP_".len()..][..10]));
+        let format = format_profile("mp4").unwrap();
+        assert_eq!(
+            seen,
+            [
+                ffmpeg_args(&input, &temp, format, MuxAttempt::FastStart, options),
+                ffmpeg_args(&input, &temp, format, MuxAttempt::Standard, options),
+            ]
+        );
+        assert_eq!(registry.used.len(), 1);
+        assert_eq!(
+            ids_recorded(&registry_path),
+            1,
+            "the retry spent a second ID"
+        );
+
+        let cleaned = out.join(&name);
+        let produced: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(produced, std::slice::from_ref(&name));
+        assert_ne!(std::fs::read(&cleaned).unwrap(), b"partial output");
+        assert_ffmpeg_can_read(&cleaned);
+        assert!(!ffmetadata(&cleaned).contains("global_secret"));
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The faststart attempt dies part-way and its partial output cannot be
+    /// removed -- held open without delete sharing, as a scanner might. The
+    /// standard attempt is never started: under `-n` it would have exited 0
+    /// having written nothing, and the partial file would have been renamed
+    /// into place as the cleaned output.
+    #[cfg(windows)]
+    #[test]
+    fn a_partial_output_that_cannot_be_removed_is_never_published() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = scratch("clean-held-partial");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = sample_for_format(&dir, "mp4");
+        let before = std::fs::read(&input).unwrap();
+        let registry_path = dir.join("used-ids.txt");
+        let mut registry = IdRegistry::open(&registry_path).unwrap();
+
+        let mut held = None;
+        let mut runs = 0;
+        let error = clean_one_with(
+            &input,
+            &out,
+            "CLIP",
+            CleaningOptions::default(),
+            &mut registry,
+            |args| {
+                runs += 1;
+                let result = dies_part_way(args);
+                held = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(args.last().unwrap())
+                        .unwrap(),
+                );
+                result
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, CLEAN_TEMP_IN_THE_WAY);
+        assert_eq!(runs, 1, "the standard attempt ran over a partial output");
+        drop(held);
+        assert_eq!(ids_recorded(&registry_path), 1);
+
+        // The partial is still there under its temporary name, with its own
+        // bytes, and nothing else: no final name was published. The next
+        // batch's sweep clears it.
+        let left = temp_files(&out);
+        assert_eq!(left.len(), 1);
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&left[0]).unwrap(), b"partial output");
+        remove_stale_temp_files(&out);
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&input).unwrap(), before);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
