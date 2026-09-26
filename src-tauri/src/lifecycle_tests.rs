@@ -18,12 +18,14 @@ use std::sync::mpsc;
 
 use tauri::async_runtime::block_on;
 
+use crate::edit::{EditOperation, EditRequest, EditableField, MetadataEdit};
+use crate::edit_batch::{edit_with, EditProgress, EditSummary};
 use crate::plan::CleaningOptions;
 use crate::testkit::{sample_for_format, sample_video, scratch, stream_kinds};
 use crate::{
-    clean_request, clean_with, cleaning_blocks_close, run_blocking, store_cleaning_options,
-    write_settings, BatchGuard, BatchState, CleanSummary, ProcessingState, Progress, Settings,
-    CLEAN_BUSY, CLEAN_INTERNAL_ERROR, CLEAN_UPDATING,
+    clean_request, clean_with, cleaning_blocks_close, edit_request, run_blocking,
+    store_cleaning_options, write_settings, BatchGuard, BatchState, CleanSummary, ProcessingState,
+    Progress, Settings, CLEAN_BUSY, CLEAN_INTERNAL_ERROR, CLEAN_UPDATING, EDIT_INTERNAL_ERROR,
 };
 
 /// A batch folder with its own app data dir and output folder, as the app has.
@@ -615,4 +617,253 @@ fn a_batch_runs_with_the_options_it_was_handed_from_first_file_to_last() {
         );
     }
     std::fs::remove_dir_all(&dirs.root).unwrap();
+}
+
+// ------------------------------------------------ Edit shares the claim ---
+//
+// Edit takes the app through the same word Clean does. There is no second
+// lock: whatever holds it -- a Clean, an Edit or an update install -- shuts
+// the other two out, and the close button reads a running Edit exactly as it
+// reads a running Clean.
+
+fn edit_of(paths: &[String]) -> EditRequest {
+    EditRequest {
+        paths: paths.to_vec(),
+        edits: vec![MetadataEdit {
+            field: EditableField::Title,
+            operation: EditOperation::Set("Edited".into()),
+        }],
+    }
+}
+
+/// The refusal names neither operation, because it answers both.
+#[test]
+fn the_busy_message_is_true_for_clean_and_edit_alike() {
+    assert_eq!(
+        CLEAN_BUSY,
+        "Another media operation is already running. Wait for it to finish."
+    );
+    assert!(!CLEAN_BUSY.to_lowercase().contains("clean"));
+    assert!(!EDIT_INTERNAL_ERROR.contains('\\') && !EDIT_INTERNAL_ERROR.contains('/'));
+}
+
+/// An Edit held still inside its first event: it reads as running, the window
+/// will not close, and another Edit, a Clean and an update install are all
+/// refused without disturbing it. Once it finishes, all of that is released.
+#[test]
+fn a_running_edit_shuts_out_edit_clean_the_updater_and_the_close_button() {
+    static STATE: BatchState = BatchState::new();
+    let dirs = batch_dirs("lifecycle-edit-running");
+    let inputs = dirs.root.join("inputs");
+    std::fs::create_dir_all(&inputs).unwrap();
+    let edit_paths = paths_of(&inputs, &["a.mp4"]);
+    let later_paths = paths_of(&inputs, &["b.mp4"]);
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let (app, request) = (dirs.app.clone(), edit_of(&edit_paths));
+    let running_edit = tauri::async_runtime::spawn(run_blocking(EDIT_INTERNAL_ERROR, move || {
+        let mut paused = false;
+        edit_request(&STATE, &app, request, |progress| {
+            if !paused {
+                paused = true;
+                started_tx.send(progress.batch_id).unwrap();
+                resume_rx.recv().unwrap();
+            }
+        })
+    }));
+    let live_id = started_rx.recv().expect("the Edit never started");
+
+    assert_eq!(STATE.snapshot(), running(live_id));
+    assert!(
+        cleaning_blocks_close(&STATE),
+        "the window would have closed on an Edit"
+    );
+
+    let mut reported = false;
+    let second_edit = edit_request(&STATE, &dirs.app, edit_of(&later_paths), |_| {
+        reported = true
+    });
+    assert_eq!(second_edit.unwrap_err(), CLEAN_BUSY);
+    let clean = clean_request(
+        &STATE,
+        &dirs.app,
+        &later_paths,
+        CleaningOptions::default(),
+        |_| reported = true,
+    );
+    assert_eq!(clean.unwrap_err(), CLEAN_BUSY);
+    assert!(
+        !STATE.try_reserve_install(),
+        "an update was installed over a running Edit"
+    );
+    assert!(!reported, "a refused batch reported progress");
+    assert_eq!(
+        STATE.snapshot(),
+        running(live_id),
+        "a refusal moved the state"
+    );
+
+    resume_tx.send(()).unwrap();
+    let finished: EditSummary = block_on(running_edit).unwrap().unwrap();
+    assert_eq!((finished.batch_id, finished.completed), (live_id, 1));
+
+    // Released on completion: the window closes and the next batch is the next id.
+    assert_eq!(STATE.snapshot(), idle(live_id));
+    assert!(!cleaning_blocks_close(&STATE));
+    let next = clean_request(
+        &STATE,
+        &dirs.app,
+        &later_paths,
+        CleaningOptions::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(next.batch_id, live_id + 1);
+    assert!(STATE.try_reserve_install());
+    STATE.release_install();
+
+    std::fs::remove_dir_all(&dirs.root).unwrap();
+}
+
+/// A running Clean refuses an Edit, and the refusal costs the Clean nothing.
+#[test]
+fn a_running_clean_shuts_edit_out() {
+    static STATE: BatchState = BatchState::new();
+    let dirs = batch_dirs("lifecycle-clean-blocks-edit");
+    let inputs = dirs.root.join("inputs");
+    std::fs::create_dir_all(&inputs).unwrap();
+    let clean_paths = paths_of(&inputs, &["a.mp4"]);
+    let edit_paths = paths_of(&inputs, &["b.mp4"]);
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let (app, paths) = (dirs.app.clone(), clean_paths.clone());
+    let running_clean =
+        tauri::async_runtime::spawn(run_blocking(CLEAN_INTERNAL_ERROR, move || {
+            let mut paused = false;
+            clean_request(
+                &STATE,
+                &app,
+                &paths,
+                CleaningOptions::default(),
+                |progress| {
+                    if !paused {
+                        paused = true;
+                        started_tx.send(progress.batch_id).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                },
+            )
+        }));
+    let live_id = started_rx.recv().expect("the Clean never started");
+
+    let mut reported = false;
+    let refused = edit_request(&STATE, &dirs.app, edit_of(&edit_paths), |_| reported = true);
+    assert_eq!(refused.unwrap_err(), CLEAN_BUSY);
+    assert!(!reported);
+    assert_eq!(STATE.snapshot(), running(live_id));
+
+    resume_tx.send(()).unwrap();
+    let cleaned = block_on(running_clean).unwrap().unwrap();
+    assert_eq!((cleaned.completed, cleaned.verified), (1, 1));
+
+    let edited = edit_request(&STATE, &dirs.app, edit_of(&edit_paths), |_| {}).unwrap();
+    assert_eq!((edited.batch_id, edited.completed), (live_id + 1, 1));
+    std::fs::remove_dir_all(&dirs.root).unwrap();
+}
+
+/// An update that has claimed the app refuses an Edit, told why, and the
+/// refusal spends no batch id.
+#[test]
+fn a_reserved_update_shuts_edit_out() {
+    static STATE: BatchState = BatchState::new();
+    assert!(STATE.try_reserve_install());
+
+    let mut reported = false;
+    let refused = edit_request(
+        &STATE,
+        Path::new("never-read"),
+        edit_of(&["never-read.mp4".to_string()]),
+        |_| reported = true,
+    );
+    assert_eq!(refused.unwrap_err(), CLEAN_UPDATING);
+    assert!(!reported);
+    assert_eq!(STATE.snapshot(), reserved(0));
+
+    STATE.release_install();
+    assert_eq!(BatchGuard::try_acquire(&STATE).unwrap().id, 1);
+}
+
+/// However an Edit ends before its files -- an invalid request, no output
+/// folder, a folder that has gone, a panic -- the app is free afterwards. An
+/// invalid request is refused before it claims anything, so it spends no
+/// batch id at all.
+#[test]
+fn an_edit_that_ends_badly_still_frees_the_app() {
+    static STATE: BatchState = BatchState::new();
+    let root = scratch("lifecycle-edit-errors");
+
+    let invalid = EditRequest {
+        paths: vec!["a.mp4".into()],
+        edits: Vec::new(),
+    };
+    let error = edit_request(&STATE, &root, invalid, |_| {}).unwrap_err();
+    assert_eq!(error, "Choose at least one field to edit.");
+    assert_eq!(
+        STATE.snapshot(),
+        idle(0),
+        "an invalid request claimed the app"
+    );
+
+    let error = edit_request(&STATE, &root, edit_of(&["a.mp4".into()]), |_| {}).unwrap_err();
+    assert_eq!(error, "Choose an output folder first.");
+    assert_eq!(STATE.snapshot(), idle(1));
+    assert!(!cleaning_blocks_close(&STATE));
+
+    let dirs = batch_dirs("lifecycle-edit-folder-gone");
+    std::fs::remove_dir_all(dirs.root.join("out")).unwrap();
+    let error = edit_request(&STATE, &dirs.app, edit_of(&["a.mp4".into()]), |_| {}).unwrap_err();
+    assert_eq!(
+        error,
+        "The output folder no longer exists. Choose a new one."
+    );
+    assert_eq!(STATE.snapshot(), idle(2));
+    std::fs::remove_dir_all(&dirs.root).unwrap();
+
+    let dirs = batch_dirs("lifecycle-edit-panic");
+    let app = dirs.app.clone();
+    let request = edit_of(&[dirs
+        .root
+        .join("never-read.mp4")
+        .to_string_lossy()
+        .into_owned()]);
+    let result = block_on(run_blocking(EDIT_INTERNAL_ERROR, move || {
+        edit_request(&STATE, &app, request, |_| panic!("mid-batch"))
+    }));
+    assert_eq!(result.unwrap_err(), EDIT_INTERNAL_ERROR);
+    assert_eq!(STATE.snapshot(), idle(3), "a panic left the app busy");
+    assert!(!cleaning_blocks_close(&STATE));
+    assert!(STATE.try_reserve_install());
+    STATE.release_install();
+
+    std::fs::remove_dir_all(&dirs.root).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Like `clean_with`, `edit_with` cannot be entered without the claim. This
+/// compiles only while it takes the guard by value.
+#[test]
+fn the_edit_pipeline_can_only_be_entered_with_the_app_claimed() {
+    fn assert_takes_the_guard<F>(_: F)
+    where
+        F: FnOnce(
+            BatchGuard,
+            &Path,
+            &crate::edit::ValidEditRequest,
+            fn(EditProgress),
+        ) -> Result<EditSummary, String>,
+    {
+    }
+    assert_takes_the_guard(edit_with);
 }

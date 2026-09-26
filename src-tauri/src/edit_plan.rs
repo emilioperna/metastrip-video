@@ -20,7 +20,8 @@
 //! Clean is untouched: it has its own options, plan, arguments and verifier,
 //! and none of them read anything here.
 
-// The batch runner that calls this lands in the next task.
+// The batch runner uses the plan's arguments; what the output must carry is
+// read only by the Edit verifier, which lands in the next task.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;

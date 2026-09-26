@@ -754,3 +754,46 @@ pub fn sample_with_two_videos(dir: &Path) -> PathBuf {
     );
     path
 }
+
+/// An AVI with nothing the edit cannot keep: the shared fixture carries an
+/// `Unknown` data stream on purpose, which Edit refuses.
+pub fn sample_plain_avi(dir: &Path) -> PathBuf {
+    let path = dir.join("plain.avi");
+    let built = ffmpeg()
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=10:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:v",
+            "mpeg4",
+            "-c:a",
+            "libmp3lame",
+            "-metadata",
+            "title=GLOBAL_SECRET",
+            "-metadata",
+            "comment=SENSITIVE_COMMENT",
+            "-metadata",
+            "artist=CREATOR_SECRET",
+            "-metadata",
+            "copyright=COPYRIGHT_SECRET",
+            "-metadata:s:v:0",
+            "title=STREAM_SECRET",
+            "-f",
+            "avi",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    path
+}

@@ -31,8 +31,8 @@
 //! been edited; getting it wrong the other way would publish a file that is
 //! missing metadata, so every list errs toward the first.
 
-// Nothing outside the tests calls into this module until the Edit planner
-// lands; the model is built and pinned first.
+// Parts of the model are read only by the Edit verifier, which lands in the
+// next task.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};

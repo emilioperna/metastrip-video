@@ -22,11 +22,12 @@ use serde_json::Value;
 use tauri::async_runtime::block_on;
 use tauri::AppHandle;
 
+use crate::edit::EditRequest;
 use crate::plan::CleaningOptions;
 use crate::testkit::{sample_video, scratch};
 use crate::{
     clean_request, run_blocking, scan_request, write_settings, BatchGuard, BatchState, Settings,
-    CLEAN_BUSY, CLEAN_INTERNAL_ERROR, SCAN_INTERNAL_ERROR, TEMP_PREFIX,
+    CLEAN_BUSY, CLEAN_INTERNAL_ERROR, EDIT_INTERNAL_ERROR, SCAN_INTERNAL_ERROR, TEMP_PREFIX,
 };
 
 /// Compiles only for a function that returns a future: a command whose body
@@ -46,6 +47,14 @@ where
 {
 }
 
+/// The same guarantee for Edit, which carries its whole request.
+fn assert_async_edit<F, Fut, T>(_: F)
+where
+    F: FnOnce(AppHandle, EditRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+{
+}
+
 /// The same guarantee for a command that takes no arguments.
 fn assert_async_nullary<F, Fut, T>(_: F)
 where
@@ -59,6 +68,7 @@ fn the_media_commands_are_async() {
     // Revert either one to a plain `fn` (the v0.4 freeze) and this stops building.
     assert_async_command(crate::scan_videos);
     assert_async_clean(crate::clean_videos);
+    assert_async_edit(crate::edit_videos);
     // Starts two processes while the window is first drawing, so it belongs on
     // the pool too. A plain `fn` here stops this building.
     assert_async_nullary(crate::check_ffmpeg);
@@ -101,7 +111,11 @@ fn run_blocking_runs_on_the_blocking_pool() {
 
 #[test]
 fn a_panic_becomes_the_fixed_internal_error_and_the_app_carries_on() {
-    for internal_error in [SCAN_INTERNAL_ERROR, CLEAN_INTERNAL_ERROR] {
+    for internal_error in [
+        SCAN_INTERNAL_ERROR,
+        CLEAN_INTERNAL_ERROR,
+        EDIT_INTERNAL_ERROR,
+    ] {
         // The panic message below is printed by the default hook; that is expected.
         let result = block_on(run_blocking(internal_error, || -> Result<(), String> {
             panic!("could not read C:\\Users\\someone\\secret-clip.mp4")

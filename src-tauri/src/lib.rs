@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 mod edit;
+mod edit_batch;
 mod edit_plan;
 mod inspect;
 mod plan;
@@ -30,6 +31,8 @@ mod offthread_tests;
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
 
+use edit::EditRequest;
+use edit_batch::{edit_with, EditSummary};
 use plan::CleaningOptions;
 use privacy::{PrivacyFinding, PrivacySummary};
 use sidecar::{ffmpeg, ffmpeg_available, FFMPEG_MISSING, FFPROBE_MISSING};
@@ -595,6 +598,25 @@ fn strip_component_prefix(line: &str) -> &str {
     rest[end + 2..].trim_start()
 }
 
+/// The one line of FFmpeg's stderr that names the problem, without its
+/// component prefix and before any redaction. `None` when it wrote nothing.
+fn ffmpeg_diagnostic(text: &str) -> Option<&str> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // Walk back over the closing summary rather than assuming it is one line.
+    // If every line is summary, its last line still beats saying nothing.
+    lines
+        .iter()
+        .rev()
+        .find(|line| !is_ffmpeg_run_summary(line))
+        .or_else(|| lines.last())
+        .map(|line| strip_component_prefix(line))
+}
+
 /// The most useful single line FFmpeg wrote, made safe to show.
 ///
 /// One line, never the whole of stderr: the rest is the banner, the input
@@ -604,23 +626,9 @@ fn strip_component_prefix(line: &str) -> &str {
 /// absolute path adds nothing to it.
 fn last_ffmpeg_error(stderr: &[u8], output: &Path, output_dir: &Path) -> String {
     let text = String::from_utf8_lossy(stderr);
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-
-    // Walk back over the closing summary rather than assuming it is one line.
-    // If every line is summary, its last line still beats saying nothing.
-    let message = lines
-        .iter()
-        .rev()
-        .find(|line| !is_ffmpeg_run_summary(line))
-        .or_else(|| lines.last())
-        .copied()
-        .unwrap_or("FFmpeg failed");
-
-    let mut message = strip_component_prefix(message).to_string();
+    let mut message = ffmpeg_diagnostic(&text)
+        .unwrap_or("FFmpeg failed")
+        .to_string();
     // Longest first: the folder is a prefix of the file. Bracketed so the
     // result reads as a redaction rather than as a strange file name.
     for (path, replacement) in [(output, "[output file]"), (output_dir, "[output folder]")] {
@@ -1202,6 +1210,8 @@ const TOOLS_INTERNAL_ERROR: &str = "The bundled tools could not be checked.";
 const SCAN_INTERNAL_ERROR: &str = "The privacy scan stopped because of an internal error.";
 const CLEAN_INTERNAL_ERROR: &str =
     "Cleaning stopped because of an internal error. Files finished before it are in the output folder.";
+const EDIT_INTERNAL_ERROR: &str =
+    "Editing stopped because of an internal error. Files finished before it are in the output folder.";
 
 /// Runs `work` on Tauri's blocking thread pool and waits for it to finish.
 ///
@@ -1268,10 +1278,13 @@ struct ScanProgress {
     view: ScanView,
 }
 
-const CLEAN_BUSY: &str = "A cleaning batch is already running. Wait for it to finish.";
+// Both refuse a Clean and an Edit alike: the two share one batch state, so
+// the busy message names neither.
+const CLEAN_BUSY: &str = "Another media operation is already running. Wait for it to finish.";
 const CLEAN_UPDATING: &str = "An update is being installed. Try again once that has finished.";
 
-/// Set while a Clean batch runs.
+/// Set while a Clean or an Edit batch runs. There is one of these for both, so
+/// the two are mutually exclusive with each other and with an update install.
 ///
 /// When the commands ran on the window's thread, that thread kept batches
 /// apart for free. Off it, a page reload mid-batch leaves the old batch running
@@ -1321,6 +1334,9 @@ const EXCLUSIVE: u64 = CLEANING | INSTALLING;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProcessingState {
+    /// A media batch -- Clean or Edit -- is running. Named for Clean because
+    /// the page already reads it under this name; kept until the page learns
+    /// about Edit.
     cleaning: bool,
     /// An update install is reserved. Nothing may start cleaning until it is
     /// released, which after a successful install means never, because the
@@ -1405,9 +1421,9 @@ impl BatchState {
 /// Holds the state for as long as it lives. Released by `Drop`, so a batch that
 /// ends in an error or a panic frees it too.
 ///
-/// Nothing can reach the cleaning pipeline without one: `clean_with` takes it
-/// by value, so "the app is marked as cleaning" is not a step that could be
-/// taken late or skipped, it is the ticket to the work.
+/// Nothing can reach the cleaning or editing pipeline without one: `clean_with`
+/// and `edit_with` take it by value, so "the app is marked as busy" is not a
+/// step that could be taken late or skipped, it is the ticket to the work.
 struct BatchGuard {
     state: &'static BatchState,
     id: u64,
@@ -1526,6 +1542,41 @@ async fn clean_videos(
     .await
 }
 
+/// `edit_videos` run inline, the way `clean_request` runs a Clean: validate,
+/// claim the app, edit. A request that fails validation never claims it.
+#[cfg(test)]
+fn edit_request(
+    state: &'static BatchState,
+    app_dir: &Path,
+    request: EditRequest,
+    on_progress: impl FnMut(edit_batch::EditProgress),
+) -> Result<EditSummary, String> {
+    let request = request.validate()?;
+    let batch = BatchGuard::try_acquire(state).map_err(str::to_string)?;
+    edit_with(batch, app_dir, &request, on_progress)
+}
+
+/// Edit a batch's metadata, one file after another, emitting `edit-progress`
+/// as each file starts and as each one finishes.
+///
+/// The request is validated first, so one the backend would refuse never
+/// claims the app or a batch id. Then the app is claimed here, before the work
+/// goes to the blocking pool, for the reason `clean_videos` gives: Clean and
+/// Edit share one state, so no gap may exist in which an accepted Edit looks
+/// idle to the close button, the updater or another batch.
+#[tauri::command]
+async fn edit_videos(app: AppHandle, request: EditRequest) -> Result<EditSummary, String> {
+    let request = request.validate()?;
+    let batch = BatchGuard::try_acquire(&CLEAN_STATE).map_err(str::to_string)?;
+    run_blocking(EDIT_INTERNAL_ERROR, move || {
+        let dir = app_dir(&app)?;
+        edit_with(batch, &dir, &request, |progress| {
+            let _ = app.emit("edit-progress", progress);
+        })
+    })
+    .await
+}
+
 /// Whether cleaning is running, straight from the pipeline own state.
 ///
 /// The page that started a batch forgets it on reload; this does not. Anything
@@ -1613,6 +1664,7 @@ pub fn run() {
             release_update_install,
             scan_videos,
             clean_videos,
+            edit_videos,
             open_folder
         ])
         .run(tauri::generate_context!())

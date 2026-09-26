@@ -3,7 +3,8 @@ use crate::edit::{EditOperation, EditRequest, MetadataEdit};
 use crate::format_profile;
 use crate::inspect::parse_ffprobe_json;
 use crate::testkit::{
-    cover_jpeg, sample_for_format, sample_with_cover, scratch, stream_payload_hash,
+    cover_jpeg, sample_for_format, sample_plain_avi, sample_with_cover, scratch,
+    stream_payload_hash,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -1204,55 +1205,12 @@ fn full_request() -> Vec<MetadataEdit> {
     ]
 }
 
-/// An AVI with nothing the edit cannot keep: the shared fixture carries an
-/// `Unknown` data stream on purpose, which Edit refuses.
-fn plain_avi(dir: &Path) -> PathBuf {
-    let path = dir.join("plain.avi");
-    let built = crate::sidecar::ffmpeg()
-        .args([
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x64:rate=10:duration=2",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=2",
-            "-c:v",
-            "mpeg4",
-            "-c:a",
-            "libmp3lame",
-            "-metadata",
-            "title=GLOBAL_SECRET",
-            "-metadata",
-            "comment=SENSITIVE_COMMENT",
-            "-metadata",
-            "artist=CREATOR_SECRET",
-            "-metadata",
-            "copyright=COPYRIGHT_SECRET",
-            "-metadata:s:v:0",
-            "title=STREAM_SECRET",
-            "-f",
-            "avi",
-        ])
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    path
-}
-
 #[test]
 fn the_planned_argv_edits_every_format_for_real() {
     for ext in ALL_EXTENSIONS {
         let dir = scratch(&format!("edit-plan-{ext}"));
         let input = if ext == "avi" {
-            plain_avi(&dir)
+            sample_plain_avi(&dir)
         } else {
             sample_for_format(&dir, ext)
         };
