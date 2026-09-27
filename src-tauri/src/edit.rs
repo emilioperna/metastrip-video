@@ -31,8 +31,8 @@
 //! been edited; getting it wrong the other way would publish a file that is
 //! missing metadata, so every list errs toward the first.
 
-// Parts of the model are read only by the Edit verifier, which lands in the
-// next task.
+// A few parts of the model (`from_key`, `expected_value`, `supports_field`)
+// are read only by the tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
@@ -350,7 +350,7 @@ pub enum FieldChange {
 
 /// A value that is missing, or present but empty once trimmed. `FillIfMissing`
 /// fills both.
-fn effective(current: Option<&str>) -> Option<&str> {
+pub(crate) fn effective(current: Option<&str>) -> Option<&str> {
     current.map(str::trim).filter(|value| !value.is_empty())
 }
 

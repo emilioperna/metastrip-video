@@ -10,6 +10,7 @@ use tauri_plugin_opener::OpenerExt;
 mod edit;
 mod edit_batch;
 mod edit_plan;
+mod edit_verify;
 mod inspect;
 mod plan;
 mod privacy;

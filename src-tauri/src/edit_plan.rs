@@ -20,8 +20,8 @@
 //! Clean is untouched: it has its own options, plan, arguments and verifier,
 //! and none of them read anything here.
 
-// The batch runner uses the plan's arguments; what the output must carry is
-// read only by the Edit verifier, which lands in the next task.
+// The batch runner uses the plan's arguments and the Edit verifier what the
+// output must carry; `format` and `changes_fields` are read only by the tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
@@ -425,7 +425,7 @@ fn is_iso(muxer: EditMuxer) -> bool {
 
 /// A stream's tags as the plan compares them. A key reported twice with two
 /// values is refused rather than guessed at.
-fn stream_tags(
+pub(crate) fn stream_tags(
     report: &MetadataReport,
     stream: &StreamSummary,
     muxer: EditMuxer,
@@ -456,7 +456,11 @@ fn stream_tags(
 }
 
 /// A stream tag's value, as the planner reads it.
-fn stream_tag<'a>(report: &'a MetadataReport, index: usize, key: &str) -> Option<&'a str> {
+pub(crate) fn stream_tag<'a>(
+    report: &'a MetadataReport,
+    index: usize,
+    key: &str,
+) -> Option<&'a str> {
     report
         .fields
         .iter()
@@ -465,12 +469,12 @@ fn stream_tag<'a>(report: &'a MetadataReport, index: usize, key: &str) -> Option
         .filter(|v| !v.is_empty())
 }
 
-fn is_chapter_track(stream: &StreamSummary) -> bool {
+pub(crate) fn is_chapter_track(stream: &StreamSummary) -> bool {
     stream.identity.codec_name.as_deref() == Some("bin_data")
         && stream.identity.codec_tag.as_deref() == Some("text")
 }
 
-fn is_timecode_track(stream: &StreamSummary) -> bool {
+pub(crate) fn is_timecode_track(stream: &StreamSummary) -> bool {
     stream.identity.codec_tag.as_deref() == Some("tmcd")
 }
 

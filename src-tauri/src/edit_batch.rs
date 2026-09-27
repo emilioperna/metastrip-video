@@ -1,21 +1,24 @@
 //! Running an Edit batch: one file after another, each inspected afresh and
-//! planned before it may cost anything, then written to a temporary name and
-//! published by rename.
+//! planned before it may cost anything, then written to a temporary name,
+//! published by rename and verified.
 //!
 //! Per file, in this order and no other:
 //!
 //! 1. the input is still there and in the support matrix ([`validate_input`]);
 //! 2. it is inspected now ([`FreshInspection::take`]);
 //! 3. it is planned ([`plan_edit`]), which refuses anything the edit would lose;
-//! 4. only then is an output ID reserved and persisted;
-//! 5. FFmpeg writes the temporary file, with the planner's own arguments;
-//! 6. a finished temporary file is renamed to its final name.
+//! 4. the original's size and modification time are taken;
+//! 5. only then is an output ID reserved and persisted;
+//! 6. FFmpeg writes the temporary file, with the planner's own arguments;
+//! 7. a finished temporary file is renamed to its final name;
+//! 8. the published file is verified against the inspection of step 2 and the
+//!    plan of step 3 ([`EditVerification`]).
 //!
 //! A file stopped at 1-3 is *skipped*: nothing was written and no ID was
-//! spent. A file stopped at 4-6 is an *error*: its ID stays spent, and no
-//! output under its final name exists. A file that reaches the end is
-//! *completed* -- written, not verified. Verification is a separate step that
-//! this module does not claim.
+//! spent. A file stopped at 5-7 is an *error*: its ID stays spent, and no
+//! output under its final name exists. A file that reaches step 8 is
+//! *completed* and carries its verification report, whichever way it came
+//! out: an output that failed verification stays on disk, and is not an error.
 //!
 //! Clean has its own runner in the crate root and shares nothing here beyond
 //! the ID registry, the temporary-file convention and the batch state.
@@ -27,7 +30,9 @@ use serde::Serialize;
 
 use crate::edit::{EditOperation, ValidEditRequest};
 use crate::edit_plan::{edit_temp_path, plan_edit, FreshInspection};
+use crate::edit_verify::{EditVerification, EditVerificationReport};
 use crate::sidecar::{ffmpeg, ffmpeg_available, FFMPEG_MISSING, FFPROBE_MISSING};
+use crate::verify::OriginalFingerprint;
 use crate::{
     ffmpeg_diagnostic, format_id, inspect, load_settings, remove_stale_temp_files, validate_input,
     BatchGuard, FormatProfile, IdRegistry,
@@ -44,7 +49,8 @@ pub(crate) const EDIT_TEMP_IN_THE_WAY: &str =
 
 /// One event of an Edit batch as the page receives it on `edit-progress`:
 /// once when a file starts, once when its outcome is known. File names only,
-/// never a path, a metadata value or anything FFmpeg printed unredacted.
+/// never a path or anything FFmpeg printed unredacted; metadata values only in
+/// the verification's before/after rows, which exist to show them.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditProgress {
@@ -56,6 +62,8 @@ pub(crate) struct EditProgress {
     /// `processing`, then one of `completed`, `skipped` or `error`.
     pub(crate) status: &'static str,
     pub(crate) message: Option<String>,
+    /// Present exactly when `status` is `completed`.
+    pub(crate) verification: Option<EditVerificationReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -65,6 +73,8 @@ pub(crate) struct EditFileResult {
     pub(crate) output_name: Option<String>,
     pub(crate) status: &'static str,
     pub(crate) message: Option<String>,
+    /// Present exactly when `status` is `completed`.
+    pub(crate) verification: Option<EditVerificationReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,8 +82,13 @@ pub(crate) struct EditFileResult {
 pub(crate) struct EditSummary {
     pub(crate) batch_id: u64,
     pub(crate) output_dir: String,
-    /// Outputs written and in place. Not a claim that they were verified.
+    /// Outputs written and in place, verified or not:
+    /// `verified + verification_failures == completed`.
     pub(crate) completed: usize,
+    /// Completed files whose every verification check passed.
+    pub(crate) verified: usize,
+    /// Completed files that did not verify. Their outputs stay on disk.
+    pub(crate) verification_failures: usize,
     /// Refused before an ID was reserved; nothing written.
     pub(crate) skipped: usize,
     /// Accepted, but no output was published.
@@ -82,32 +97,47 @@ pub(crate) struct EditSummary {
 }
 
 /// How one file ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum EditOutcome {
-    /// The output is in place under this name.
-    Completed(String),
+    /// The output is in place under this name, and this is what verifying it
+    /// found -- which may be a failure.
+    Completed(String, EditVerificationReport),
     /// Refused before an output ID was reserved.
     Skipped(String),
     /// Refused or failed after its ID was reserved. The ID stays spent.
     Failed(String),
 }
 
+/// One result row: status, output name, message and verification.
+type EditRow = (
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<EditVerificationReport>,
+);
+
 impl EditOutcome {
     fn status(&self) -> &'static str {
         match self {
-            EditOutcome::Completed(_) => "completed",
+            EditOutcome::Completed(..) => "completed",
             EditOutcome::Skipped(_) => "skipped",
             EditOutcome::Failed(_) => "error",
         }
     }
 
-    /// Status, output name and message, as a result row carries them.
-    fn into_row(self) -> (&'static str, Option<String>, Option<String>) {
+    /// The outcome as a result row carries it. A completed file that did not
+    /// verify is still completed; its message says which checks failed.
+    fn into_row(self) -> EditRow {
         let status = self.status();
         match self {
-            EditOutcome::Completed(name) => (status, Some(name), None),
+            EditOutcome::Completed(name, verification) => (
+                status,
+                Some(name),
+                verification.failure_message(),
+                Some(verification),
+            ),
             EditOutcome::Skipped(message) | EditOutcome::Failed(message) => {
-                (status, None, Some(message))
+                (status, None, Some(message), None)
             }
         }
     }
@@ -142,8 +172,9 @@ pub(crate) fn edit_one(
     edit_inspected(&fresh, format, request, output_dir, prefix, registry, run)
 }
 
-/// Everything after the fresh inspection: plan, reserve, write, publish. The
-/// file edited is the one that was inspected.
+/// Everything after the fresh inspection: plan, reserve, write, publish,
+/// verify. The file edited is the one that was inspected, and the output is
+/// verified against that inspection and the plan that wrote it.
 pub(crate) fn edit_inspected(
     fresh: &FreshInspection,
     format: FormatProfile,
@@ -160,6 +191,10 @@ pub(crate) fn edit_inspected(
 
     // Accepted: from here on the file costs an ID, whatever happens to it.
     let input = fresh.path();
+    // Before anything is written, so "the original is unchanged" is checked
+    // against the file as it was. A file whose size cannot be read here is
+    // still edited; its verification then fails that check.
+    let original = OriginalFingerprint::capture(input);
     // The source spelling (`.MOV` stays `.MOV`), as Clean keeps it. Always one
     // of the ASCII extensions in the support matrix, or validation failed.
     let extension = input
@@ -216,7 +251,19 @@ pub(crate) fn edit_inspected(
             }
         };
         if result.status.success() {
-            return publish(&temp_path, &final_path, final_name);
+            if let Err(message) = publish(&temp_path, &final_path) {
+                return EditOutcome::Failed(message);
+            }
+            let verification = EditVerification {
+                input,
+                output: &final_path,
+                temp: &temp_path,
+                before: fresh.report(),
+                plan: &plan,
+                original,
+            }
+            .run();
+            return EditOutcome::Completed(final_name, verification);
         }
         last_error = edit_ffmpeg_error(&result.stderr, input, &temp_path, output_dir, &values);
         // The partial output goes before the next attempt, which must start
@@ -233,23 +280,18 @@ pub(crate) fn edit_inspected(
 /// Give a finished temporary file its final name, and never over a file that
 /// is already there: the name was free when it was reserved, but a rename on
 /// Windows replaces an existing file, so it is checked again at the last step.
-fn publish(temp: &Path, final_path: &Path, final_name: String) -> EditOutcome {
+fn publish(temp: &Path, final_path: &Path) -> Result<(), String> {
     if final_path.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(temp);
-        return EditOutcome::Failed(
+        return Err(
             "The output name was taken while this file was being edited. Nothing was overwritten."
                 .into(),
         );
     }
-    match std::fs::rename(temp, final_path) {
-        Ok(()) => EditOutcome::Completed(final_name),
-        Err(error) => {
-            let _ = std::fs::remove_file(temp);
-            EditOutcome::Failed(format!(
-                "Could not move the edited file into place: {error}"
-            ))
-        }
-    }
+    std::fs::rename(temp, final_path).map_err(|error| {
+        let _ = std::fs::remove_file(temp);
+        format!("Could not move the edited file into place: {error}")
+    })
 }
 
 /// The line FFmpeg's failure is best described by, with nothing in it that
@@ -328,7 +370,30 @@ pub(crate) fn run_edit_batch(
     output_dir: &Path,
     app_dir: &Path,
     batch_id: u64,
+    on_progress: impl FnMut(EditProgress),
+) -> Result<EditSummary, String> {
+    run_edit_batch_with(
+        request,
+        prefix,
+        output_dir,
+        app_dir,
+        batch_id,
+        on_progress,
+        run_ffmpeg,
+    )
+}
+
+/// `run_edit_batch` with the FFmpeg launcher passed in, for the reason
+/// `edit_one` takes one: a test can reach, through the whole batch, an output
+/// a real file cannot produce on demand.
+pub(crate) fn run_edit_batch_with(
+    request: &ValidEditRequest,
+    prefix: &str,
+    output_dir: &Path,
+    app_dir: &Path,
+    batch_id: u64,
     mut on_progress: impl FnMut(EditProgress),
+    mut run: impl FnMut(&[String]) -> std::io::Result<Output>,
 ) -> Result<EditSummary, String> {
     if !output_dir.is_dir() {
         return Err("The output folder no longer exists. Choose a new one.".into());
@@ -350,6 +415,7 @@ pub(crate) fn run_edit_batch(
     let total = paths.len();
     let mut results = Vec::with_capacity(total);
     let (mut completed, mut skipped, mut errors) = (0usize, 0usize, 0usize);
+    let (mut verified, mut verification_failures) = (0usize, 0usize);
 
     for (index, raw) in paths.iter().enumerate() {
         let input = PathBuf::from(raw);
@@ -366,22 +432,23 @@ pub(crate) fn run_edit_batch(
             output_name: None,
             status: "processing",
             message: None,
+            verification: None,
         });
 
-        let outcome = edit_one(
-            &input,
-            request,
-            output_dir,
-            prefix,
-            &mut registry,
-            run_ffmpeg,
-        );
-        match outcome {
-            EditOutcome::Completed(_) => completed += 1,
+        let outcome = edit_one(&input, request, output_dir, prefix, &mut registry, &mut run);
+        match &outcome {
+            EditOutcome::Completed(_, verification) => {
+                completed += 1;
+                if verification.verified {
+                    verified += 1;
+                } else {
+                    verification_failures += 1;
+                }
+            }
             EditOutcome::Skipped(_) => skipped += 1,
             EditOutcome::Failed(_) => errors += 1,
         }
-        let (status, output_name, message) = outcome.into_row();
+        let (status, output_name, message, verification) = outcome.into_row();
 
         on_progress(EditProgress {
             batch_id,
@@ -391,12 +458,14 @@ pub(crate) fn run_edit_batch(
             output_name: output_name.clone(),
             status,
             message: message.clone(),
+            verification: verification.clone(),
         });
         results.push(EditFileResult {
             input_name,
             output_name,
             status,
             message,
+            verification,
         });
     }
 
@@ -404,6 +473,8 @@ pub(crate) fn run_edit_batch(
         batch_id,
         output_dir: output_dir.to_string_lossy().into_owned(),
         completed,
+        verified,
+        verification_failures,
         skipped,
         errors,
         results,

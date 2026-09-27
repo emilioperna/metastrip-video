@@ -117,7 +117,7 @@ impl OriginalFingerprint {
         })
     }
 
-    fn still_matches(&self, path: &Path) -> bool {
+    pub(crate) fn still_matches(&self, path: &Path) -> bool {
         match OriginalFingerprint::capture(path) {
             Some(now) => now.size == self.size && now.modified == self.modified,
             None => false,

@@ -755,6 +755,66 @@ pub fn sample_with_two_videos(dir: &Path) -> PathBuf {
     path
 }
 
+/// An ISO-BMFF file (`mov` or `mp4`) with the two data tracks an edit
+/// rebuilds: a timecode, which FFmpeg writes as a `tmcd` track and reports on
+/// the one video stream too, and chapters, written as a chapter text track.
+/// One video stream and no cover, the only shape whose timecode track the
+/// muxer is proven to rebuild.
+pub fn sample_with_timecode(dir: &Path, extension: &str) -> PathBuf {
+    let chapters = dir.join("timecode-chapters.ffmetadata");
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\ntitle=TIMECODE_FIXTURE\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1200\ntitle=CHAPTER_SECRET\n",
+    )
+    .unwrap();
+    let path = dir.join(format!("timecode.{extension}"));
+    let built = ffmpeg()
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=10:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-f",
+            "ffmetadata",
+            "-i",
+        ])
+        .arg(&chapters)
+        .args([
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-map_metadata",
+            "2",
+            "-map_chapters",
+            "2",
+            "-c:v",
+            "mpeg4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-timecode",
+            "01:00:00:00",
+            "-f",
+            extension,
+        ])
+        .arg(&path)
+        .output()
+        .expect("ffmpeg must be available for these tests");
+    assert!(
+        built.status.success(),
+        "could not build the {extension} timecode fixture: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    path
+}
+
 /// An AVI with nothing the edit cannot keep: the shared fixture carries an
 /// `Unknown` data stream on purpose, which Edit refuses.
 pub fn sample_plain_avi(dir: &Path) -> PathBuf {

@@ -148,20 +148,62 @@ fn strings_in(value: &Value) -> Vec<String> {
     }
 }
 
-/// Nothing the page receives may carry a path, a requested value or a claim
-/// of verification.
+/// The same value with every verification's before/after rows taken out:
+/// those rows exist to show metadata values, and nothing else may.
+fn without_change_rows(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(without_change_rows).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| {
+                    let mut item = without_change_rows(item);
+                    if key == "verification" {
+                        if let Some(report) = item.as_object_mut() {
+                            report.remove("changes");
+                        }
+                    }
+                    (key.clone(), item)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Every row or event object in a payload: anything with a `status`.
+fn rows_in(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
+    match value {
+        Value::Array(items) => items.iter().flat_map(rows_in).collect(),
+        Value::Object(map) if map.contains_key("status") => vec![map],
+        Value::Object(map) => map.values().flat_map(rows_in).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Nothing the page receives may carry a path or a temporary name, a
+/// requested value may appear only in a verification's before/after rows, and
+/// a verification comes with a completed file and with nothing else.
 fn assert_safe_for_the_page(value: &Value, root: &Path) {
     let root = root.to_string_lossy();
-    for text in strings_in(value) {
+    for text in strings_in(&without_change_rows(value)) {
         assert!(!text.contains(root.as_ref()), "a path leaked: {text}");
         assert!(!text.contains('\\'), "a path leaked: {text}");
         assert!(!text.contains(TEMP_PREFIX), "a temp name leaked: {text}");
         for canary in [SET_CANARY, FILL_CANARY] {
             assert!(!text.contains(canary), "a requested value leaked: {text}");
         }
-        assert!(
-            !text.to_ascii_lowercase().contains("verif"),
-            "Task 3 claimed verification: {text}"
+    }
+    for text in strings_in(value) {
+        assert!(!text.contains(root.as_ref()), "a path leaked: {text}");
+        assert!(!text.contains(TEMP_PREFIX), "a temp name leaked: {text}");
+    }
+    let rows = rows_in(value);
+    assert!(!rows.is_empty());
+    for row in rows {
+        assert_eq!(
+            row["status"] == "completed",
+            !row["verification"].is_null(),
+            "verification on a row that is not completed, or missing on one that is: {row:?}"
         );
     }
 }
@@ -409,9 +451,10 @@ fn an_ambiguous_requested_field_is_skipped_and_spends_no_id() {
         },
     );
 
-    assert_eq!(
-        outcome,
-        EditOutcome::Skipped(EditRefusal::AmbiguousField(EditableField::Title).message())
+    let refusal = EditRefusal::AmbiguousField(EditableField::Title).message();
+    assert!(
+        matches!(&outcome, EditOutcome::Skipped(message) if *message == refusal),
+        "{outcome:?}"
     );
     assert!(!launched, "FFmpeg ran for a refused file");
     assert!(registry.used.is_empty());
@@ -453,6 +496,16 @@ fn real_edits_publish_one_output_per_file() {
         "{:?}",
         summary.results
     );
+    assert_eq!(
+        (summary.verified, summary.verification_failures),
+        (4, 0),
+        "{:?}",
+        summary.results
+    );
+    assert!(summary
+        .results
+        .iter()
+        .all(|r| r.verification.as_ref().is_some_and(|v| v.verified)));
     assert_eq!(ids_spent(&app.join("used-ids.txt")), 4);
     assert!(temp_files(&out).is_empty(), "{:?}", listing(&out));
     assert_eq!(listing(&out).len(), 4, "{:?}", listing(&out));
@@ -522,11 +575,16 @@ fn a_no_op_edit_still_writes_a_new_copy() {
     .unwrap();
 
     assert_eq!((summary.completed, summary.skipped), (1, 0));
+    assert_eq!((summary.verified, summary.verification_failures), (1, 0));
     let result = &summary.results[0];
     assert_eq!(
         (result.status, result.message.as_deref()),
         ("completed", None)
     );
+    let verification = result.verification.as_ref().unwrap();
+    assert!(verification.verified, "{:?}", verification.checks);
+    assert_eq!(verification.fields_changed, 0);
+    assert!(verification.changes.iter().all(|row| !row.changed));
     let output = out.join(result.output_name.as_ref().unwrap());
     assert_ffmpeg_can_read(&output);
     assert_eq!(
@@ -590,9 +648,10 @@ fn a_failed_faststart_falls_back_under_the_same_id() {
         },
     );
 
-    let EditOutcome::Completed(name) = outcome else {
+    let EditOutcome::Completed(name, verification) = outcome else {
         panic!("the standard attempt did not complete the file: {outcome:?}");
     };
+    assert!(verification.verified, "{:?}", verification.checks);
     assert_eq!(attempts.len(), 2);
     assert!(attempts[0].iter().any(|a| a == "+faststart"));
     assert!(!attempts[1].iter().any(|a| a == "+faststart"));
@@ -720,7 +779,10 @@ fn a_partial_output_that_cannot_be_removed_stops_the_file() {
         },
     );
 
-    assert_eq!(outcome, EditOutcome::Failed(EDIT_TEMP_IN_THE_WAY.into()));
+    assert!(
+        matches!(&outcome, EditOutcome::Failed(message) if message == EDIT_TEMP_IN_THE_WAY),
+        "{outcome:?}"
+    );
     assert_eq!(runs, 1, "the standard attempt ran over a partial output");
     drop(held);
     assert_eq!(ids_spent(&registry_path), 1);
@@ -753,7 +815,10 @@ fn ffmpeg_that_cannot_start_is_an_error_after_the_id() {
         |_: &[String]| Err(std::io::ErrorKind::NotFound.into()),
     );
 
-    assert_eq!(outcome, EditOutcome::Failed(FFMPEG_MISSING.into()));
+    assert!(
+        matches!(&outcome, EditOutcome::Failed(message) if message == FFMPEG_MISSING),
+        "{outcome:?}"
+    );
     assert_eq!(ids_spent(&registry_path), 1);
     assert!(listing(&out).is_empty());
     std::fs::remove_dir_all(&root).unwrap();
@@ -975,10 +1040,17 @@ fn a_mixed_batch_reports_in_order_and_isolates_each_file() {
         assert_eq!(event.input_name, names[event.index]);
         match event.status {
             "processing" => {
-                assert_eq!((&event.output_name, &event.message), (&None, &None))
+                assert_eq!((&event.output_name, &event.message), (&None, &None));
+                assert!(event.verification.is_none());
             }
-            "completed" => assert!(event.output_name.is_some() && event.message.is_none()),
-            _ => assert!(event.output_name.is_none() && event.message.is_some()),
+            "completed" => {
+                assert!(event.output_name.is_some() && event.message.is_none());
+                assert!(event.verification.as_ref().is_some_and(|v| v.verified));
+            }
+            _ => {
+                assert!(event.output_name.is_none() && event.message.is_some());
+                assert!(event.verification.is_none());
+            }
         }
     }
     // The final events are the results, one for one.
@@ -998,6 +1070,10 @@ fn a_mixed_batch_reports_in_order_and_isolates_each_file() {
                 &result.message
             )
         );
+        assert_eq!(
+            serde_json::to_value(&event.verification).unwrap(),
+            serde_json::to_value(&result.verification).unwrap()
+        );
     }
 
     assert_eq!(summary.batch_id, 42);
@@ -1006,6 +1082,7 @@ fn a_mixed_batch_reports_in_order_and_isolates_each_file() {
         (summary.completed, summary.skipped, summary.errors),
         (2, 1, 1)
     );
+    assert_eq!((summary.verified, summary.verification_failures), (2, 0));
     assert_eq!(
         summary.results[1].message.as_deref(),
         Some(EditRefusal::CoverArt.message().as_str())
@@ -1041,7 +1118,7 @@ fn a_mixed_batch_reports_in_order_and_isolates_each_file() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-/// What goes on the wire: exactly these fields, and no verification.
+/// What goes on the wire: exactly these fields, in the IPC's camelCase.
 #[test]
 fn the_progress_and_summary_payloads_are_compact() {
     let progress = serde_json::to_value(EditProgress {
@@ -1052,6 +1129,7 @@ fn the_progress_and_summary_payloads_are_compact() {
         output_name: None,
         status: "processing",
         message: None,
+        verification: None,
     })
     .unwrap();
     let keys =
@@ -1065,14 +1143,35 @@ fn the_progress_and_summary_payloads_are_compact() {
             "message",
             "outputName",
             "status",
-            "total"
+            "total",
+            "verification"
         ]
     );
+    assert!(progress["verification"].is_null());
 
+    let report = EditVerificationReport {
+        verified: true,
+        checks: vec![crate::verify::VerificationCheck {
+            name: crate::edit_verify::OUTPUT_WRITTEN,
+            passed: true,
+            detail: "The edited file is on disk".into(),
+        }],
+        changes: vec![crate::edit_verify::FieldChangeRow {
+            field: EditableField::Title,
+            before: Some("Old".into()),
+            after: Some("New".into()),
+            changed: true,
+        }],
+        fields_changed: 1,
+        remaining_privacy_count: 0,
+        remaining_privacy_categories: Vec::new(),
+    };
     let summary = serde_json::to_value(EditSummary {
         batch_id: 1,
         output_dir: "out".into(),
         completed: 1,
+        verified: 1,
+        verification_failures: 0,
         skipped: 0,
         errors: 0,
         results: vec![EditFileResult {
@@ -1080,6 +1179,7 @@ fn the_progress_and_summary_payloads_are_compact() {
             output_name: Some("CLIP_0000000001.mp4".into()),
             status: "completed",
             message: None,
+            verification: Some(report),
         }],
     })
     .unwrap();
@@ -1091,13 +1191,147 @@ fn the_progress_and_summary_payloads_are_compact() {
             "errors",
             "outputDir",
             "results",
-            "skipped"
+            "skipped",
+            "verificationFailures",
+            "verified"
+        ]
+    );
+    let row = &summary["results"][0];
+    assert_eq!(
+        keys(row),
+        [
+            "inputName",
+            "message",
+            "outputName",
+            "status",
+            "verification"
+        ]
+    );
+    let verification = &row["verification"];
+    assert_eq!(
+        keys(verification),
+        [
+            "changes",
+            "checks",
+            "fieldsChanged",
+            "remainingPrivacyCategories",
+            "remainingPrivacyCount",
+            "verified"
         ]
     );
     assert_eq!(
-        keys(&summary["results"][0]),
-        ["inputName", "message", "outputName", "status"]
+        keys(&verification["checks"][0]),
+        ["detail", "name", "passed"]
     );
+    assert_eq!(
+        verification["changes"][0],
+        serde_json::json!({ "field": "title", "before": "Old", "after": "New", "changed": true })
+    );
+}
+
+/// An output that is published but cannot be read back: FFmpeg "succeeds"
+/// and leaves bytes that are not a video. The file is completed -- its output
+/// is on disk and stays there -- and it is a verification failure, not an
+/// error, counted as one in the summary, with a message that names what failed
+/// and nothing from the file. The next file of the batch is unaffected.
+#[test]
+fn an_unreadable_output_is_completed_unverified_and_kept() {
+    let root = scratch("edit-batch-unreadable");
+    let out = fixture_dir(&root, "out");
+    let app = fixture_dir(&root, "app");
+    let broken = sample_for_format(&fixture_dir(&root, "broken"), "mkv");
+    let fine = sample_for_format(&fixture_dir(&root, "fine"), "mkv");
+    let originals = [Original::of(&broken), Original::of(&fine)];
+
+    let mut events: Vec<EditProgress> = Vec::new();
+    let mut runs = 0;
+    let summary = run_edit_batch_with(
+        &request(&[&broken, &fine], the_edit()),
+        "CLIP",
+        &out,
+        &app,
+        7,
+        |progress| events.push(progress),
+        |args: &[String]| {
+            runs += 1;
+            if runs == 1 {
+                // A real, successful FFmpeg exit that wrote no video.
+                let ok = run_ffmpeg(&["-version".to_string()])?;
+                assert!(ok.status.success());
+                std::fs::write(args.last().unwrap(), b"not a video at all").unwrap();
+                Ok(ok)
+            } else {
+                run_ffmpeg(args)
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        (summary.completed, summary.skipped, summary.errors),
+        (2, 0, 0)
+    );
+    assert_eq!((summary.verified, summary.verification_failures), (1, 1));
+    assert_eq!(
+        summary.verified + summary.verification_failures,
+        summary.completed
+    );
+
+    let failed = &summary.results[0];
+    assert_eq!(failed.status, "completed");
+    let name = failed.output_name.as_ref().unwrap();
+    assert_eq!(
+        std::fs::read(out.join(name)).unwrap(),
+        b"not a video at all",
+        "the unverified output was not kept"
+    );
+    let report = failed.verification.as_ref().unwrap();
+    assert!(!report.verified);
+    let passed = |check: &str| {
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == check)
+            .unwrap_or_else(|| panic!("no {check} check"))
+            .passed
+    };
+    assert!(passed(crate::edit_verify::OUTPUT_WRITTEN));
+    assert!(!passed(crate::edit_verify::OUTPUT_READABLE));
+    assert!(report.changes.is_empty(), "rows without an after");
+    let message = failed.message.as_deref().unwrap();
+    assert!(
+        message.starts_with("Verification failed: The edited file could not be inspected"),
+        "{message}"
+    );
+    for leaked in [
+        SET_CANARY,
+        FILL_CANARY,
+        "GLOBAL_SECRET",
+        "SENSITIVE_COMMENT",
+    ] {
+        assert!(!message.contains(leaked), "{leaked} in {message}");
+    }
+
+    let fine_result = &summary.results[1];
+    assert_eq!(
+        (fine_result.status, fine_result.message.as_deref()),
+        ("completed", None)
+    );
+    assert!(fine_result.verification.as_ref().unwrap().verified);
+
+    let last: Vec<&EditProgress> = events.iter().filter(|e| e.status != "processing").collect();
+    assert_eq!(last.len(), 2);
+    assert!(last[0].verification.as_ref().is_some_and(|v| !v.verified));
+    assert_eq!(last[0].message.as_deref(), Some(message));
+    assert!(temp_files(&out).is_empty());
+    for original in &originals {
+        original.assert_untouched();
+    }
+    for event in &events {
+        assert_safe_for_the_page(&serde_json::to_value(event).unwrap(), &root);
+    }
+    assert_safe_for_the_page(&serde_json::to_value(&summary.results).unwrap(), &root);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// Batch-level preconditions fail the whole batch before any file is touched
